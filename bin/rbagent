@@ -7,7 +7,7 @@ require_relative "../lib/durable/tui"
 
 options = {
   storage: "jsonl",
-  model: ENV["RBAGENT_MODEL"] || "claude-opus-5",
+  model: ENV["RBAGENT_MODEL"] || "vllm",
   cwd: Dir.pwd,
   resume: false,
   continue: false,
@@ -17,7 +17,9 @@ options = {
 
 OptionParser.new do |o|
   o.banner = "usage: rbagent [options] [prompt]"
-  o.on("-m", "--model SPEC", "provider/model-id (default #{options[:model]})") { options[:model] = _1 }
+  o.on("-m", "--model SPEC", "provider, provider/model-id, or model-id (default #{options[:model]})") do
+    options[:model] = _1
+  end
   o.on("-s", "--session PATH", "session file (JSONL)") { options[:session] = _1 }
   o.on("-c", "--continue", "continue the newest session for this directory") { options[:continue] = true }
   o.on("-r", "--resume", "continue and immediately resume a suspended operation") do
