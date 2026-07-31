@@ -1,0 +1,129 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "optparse"
+require_relative "../lib/durable"
+require_relative "../lib/durable/tui"
+
+options = {
+  storage: "jsonl",
+  model: ENV["RBAGENT_MODEL"] || "claude-opus-5",
+  cwd: Dir.pwd,
+  resume: false,
+  continue: false,
+  print: nil,
+  session: nil
+}
+
+OptionParser.new do |o|
+  o.banner = "usage: rbagent [options] [prompt]"
+  o.on("-m", "--model SPEC", "provider/model-id (default #{options[:model]})") { options[:model] = _1 }
+  o.on("-s", "--session PATH", "session file (JSONL)") { options[:session] = _1 }
+  o.on("-c", "--continue", "continue the newest session for this directory") { options[:continue] = true }
+  o.on("-r", "--resume", "continue and immediately resume a suspended operation") do
+    options[:continue] = true
+    options[:resume] = true
+  end
+  o.on("-p", "--print PROMPT", "run one prompt non-interactively and exit") { options[:print] = _1 }
+  o.on("--memory", "keep the session in memory only") { options[:storage] = "memory" }
+  o.on("--list", "list sessions for this directory") { options[:list] = true }
+  o.on("-h", "--help") do
+    puts o
+    exit 0
+  end
+end.parse!
+
+prompt_arg = ARGV.join(" ") unless ARGV.empty?
+
+SESSION_ROOT = File.expand_path("~/.rbagent/sessions")
+slug = options[:cwd].gsub(%r{[/\\]}, "-").sub(/\A-/, "")
+dir = File.join(SESSION_ROOT, slug)
+
+if options[:list]
+  Dir.glob(File.join(dir, "*.jsonl")).sort.reverse.each do |f|
+    puts "#{File.mtime(f).strftime("%Y-%m-%d %H:%M")}  #{File.size(f).to_s.rjust(8)}  #{f}"
+  end
+  exit 0
+end
+
+path =
+  if options[:session]
+    File.expand_path(options[:session])
+  elsif options[:continue]
+    Dir.glob(File.join(dir, "*.jsonl")).max_by { File.mtime(_1) } ||
+      File.join(dir, "#{Time.now.strftime("%Y%m%dT%H%M%S")}.jsonl")
+  else
+    File.join(dir, "#{Time.now.strftime("%Y%m%dT%H%M%S")}.jsonl")
+  end
+
+harness, suspended = Durable::Harness.create(
+  storage: options[:storage], path: options[:storage] == "jsonl" ? path : nil,
+  model: options[:model], cwd: options[:cwd]
+)
+
+# A default policy hook: destructive tools outside the workspace need a reason.
+harness.on_hook("before_tool") do |ev|
+  target = ev.dig("args", "path")
+  if %w[write edit].include?(ev["toolName"]) && target &&
+     !File.expand_path(target).start_with?(options[:cwd]) && !ENV["RBAGENT_ALLOW_OUTSIDE"]
+    { "block" => { "reason" => "path is outside the workspace (#{options[:cwd]}); " \
+                               "set RBAGENT_ALLOW_OUTSIDE=1 to permit" } }
+  end
+end
+
+one_shot = options[:print] || prompt_arg
+
+# Resume-only: no prompt, just finish what the dead process started.
+if one_shot.nil? && options[:resume] && !$stdout.tty?
+  Thread.new do
+    w = harness.watch(nil)
+    w.each_event do |ev|
+      d = ev["event"]
+      print d["text"] if ev["type"] == "message_update" && d && d["type"] == "text_delta"
+      warn "  → #{ev["toolName"]}" if ev["type"] == "tool_start"
+      $stdout.flush
+    end
+  rescue Ractor::ClosedError
+    nil
+  end
+  if suspended.empty?
+    warn "nothing to resume"
+  else
+    suspended.each { |s| warn "· resuming #{s["kind"]} on #{s["lane"]} (#{s["reason"]})" }
+    results = suspended.map { |s| harness.lane(s["lane"]).resume }
+    puts
+    results.each { |r| warn "· #{r["ok"] ? "completed" : r["outcome"]}" }
+  end
+  harness.close
+  exit 0
+end
+
+if one_shot
+  # Non-interactive: stream to stdout, exit with the run's outcome.
+  Thread.new do
+    w = harness.watch(nil)
+    w.each_event do |ev|
+      case ev["type"]
+      when "message_update"
+        d = ev["event"]
+        print d["text"] if d && d["type"] == "text_delta"
+      when "tool_start" then warn "  → #{ev["toolName"]} #{ev["args"].inspect[0, 120]}"
+      end
+      $stdout.flush
+    end
+  rescue Ractor::ClosedError
+    nil
+  end
+  suspended.each { |s| harness.lane(s["lane"]).resume } if options[:resume]
+  result = harness.prompt(one_shot)
+  puts
+  warn "· #{result["ok"] ? "completed" : result["outcome"]}"
+  harness.close
+  exit(result["ok"] ? 0 : 1)
+end
+
+tui = Durable::TUI.new(harness, suspended)
+if options[:resume]
+  suspended.each { |s| Thread.new { harness.lane(s["lane"]).resume } }
+end
+tui.run
