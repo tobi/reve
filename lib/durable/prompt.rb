@@ -21,6 +21,7 @@ module Durable
 
     GUIDELINES = [
       "Investigate before acting: read the files you are about to change",
+      "bash already runs in the working directory — never prefix a command with `cd <cwd>`",
       "Use edit for targeted changes, write for new files, bash for everything else",
       "Batch independent tool calls in one message — they execute in parallel",
       "Verify APIs with grep/glob/read instead of guessing",
@@ -48,6 +49,10 @@ module Durable
 
         Guidelines:
         #{GUIDELINES.map { "- #{_1}" }.join("\n")}
+
+        The working directory is #{cwd}. Every tool already runs there: bash starts in it, and
+        relative paths in read/write/edit/ls/glob/grep resolve against it. Do not `cd` into it,
+        and prefer relative paths in what you show the user.
 
         About the harness you run in (mention it only when the user asks):
         - Every message, tool call and tool result is recorded before it happens, so an interrupted session resumes exactly where it stopped.
