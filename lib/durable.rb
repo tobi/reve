@@ -20,6 +20,9 @@ require_relative "durable/provider"
 require_relative "durable/tools"
 require_relative "durable/agent_loop"
 require_relative "durable/observer"
+require_relative "durable/frontmatter"
+require_relative "durable/agents_md"
+require_relative "durable/skills"
 
 module Durable
   VERSION = "0.1.0"
