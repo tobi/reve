@@ -110,6 +110,20 @@ Dir.mktmpdir do |dir|
     h.close
   end
 
+  group "the prompt announces shell mode as you type" do
+    model = fake_model(dir, [assistant_text("ok")])
+    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir, user_skills: false)
+    tui = Durable::TUI.new(h, [])
+    tui.instance_variable_set(:@busy, false)
+    eq "idle prompt", true, Durable::Term.visible(tui.prompt_for("")).include?("›")
+    tui.instance_variable_set(:@shell_mode, true)
+    eq "shell prompt is the marker itself", "! ", Durable::Term.visible(tui.prompt_for(""))
+    tui.instance_variable_set(:@shell_mode, false)
+    tui.instance_variable_set(:@busy, true)
+    eq "steering prompt while busy", true, Durable::Term.visible(tui.prompt_for("")).include?("steer")
+    h.close
+  end
+
   group "the editor splices a completion in at the token" do
     line = Durable::Term::Line.new
     "!cat lib/a".each_char { line.feed(_1) }

@@ -252,13 +252,40 @@ module Durable
       end
     end
 
+    # A finished turn should read like a receipt, not an announcement: the
+    # common case (it worked) says nothing on the left and puts the numbers
+    # that matter — time, output size, how full the context now is — quietly on
+    # the right. Only an unhappy outcome gets a word.
     def footer(ev)
-      u = ev.dig("finalMessage", "usage") || @usage
-      dur = @run_started ? "#{(Time.now - @run_started).round(1)}s" : nil
-      right = [dur, (u && u["input"] ? "#{u["input"]}in/#{u["output"]}out" : nil)].compact.join(" · ")
-      ok = ev["outcome"] == "completed"
-      Term.two_column("#{s(ok ? :dim : :yellow, "·")} #{s(ok ? :dim : :yellow, ev["outcome"])}",
-                      s(:dim, right), width)
+      u = ev.dig("finalMessage", "usage") || @usage || {}
+      bits = []
+      bits << "#{(Time.now - @run_started).round(1)}s" if @run_started
+      bits << "#{tok(u["output"])} out" if u["output"].to_i.positive?
+      bits << "ctx #{tok(context_used(u))}/#{tok(context_window)}" if context_used(u).positive?
+      right = s(:dim, bits.join(" · "))
+      left =
+        case ev["outcome"]
+        when "completed" then ""
+        when "aborted" then s(:yellow, "  aborted")
+        else s(:red, "  #{ev["outcome"]}#{ev.dig("error", "message") ? ": #{clip(ev.dig("error", "message"), width / 2)}" : ""}")
+        end
+      Term.two_column(left, right, width)
+    end
+
+    def tok(n)
+      n = n.to_i
+      return n.to_s if n < 1000
+      return "#{(n / 1000.0).round(1)}k" if n < 10_000
+
+      "#{(n / 1000.0).round}k"
+    end
+
+    def context_used(usage)
+      usage["input"].to_i + usage["cacheRead"].to_i + usage["cacheWrite"].to_i + usage["output"].to_i
+    end
+
+    def context_window
+      @context_window ||= (@h.model["contextWindow"] || 200_000)
     end
 
     # Single-width glyphs only: an ambiguous-width icon costs one cell of
@@ -368,6 +395,18 @@ module Durable
         char = $stdin.getc
         break if char.nil?
 
+        # A leading ! is a mode, not a character: it becomes the prompt.
+        if char == "!" && @line.buffer.empty? && !@shell_mode
+          @shell_mode = true
+          refresh_prompt
+          next
+        end
+        if @shell_mode && @line.buffer.empty? && ["\u007F", "\b"].include?(char)
+          @shell_mode = false
+          refresh_prompt
+          next
+        end
+
         action =
           if char == "\e"
             seq = read_escape
@@ -378,11 +417,13 @@ module Durable
         case action
         when :submit
           text = @line.take
+          shell_line = @shell_mode
+          @shell_mode = false
           @mutex.synchronize do
             @line.hide
             @out.flush
           end
-          break if submit(text) == :exit
+          break if submit(shell_line ? "!#{text}" : text) == :exit
         when :complete then complete!
         when :interrupt then handle_interrupt
         when :eof then break
@@ -416,7 +457,7 @@ module Durable
     # Tab completion. What can be completed depends on where the cursor is:
     # the command itself, that command's argument, or a path.
     def complete!
-      buffer = @line.buffer
+      buffer = @shell_mode ? "!#{@line.buffer}" : @line.buffer
       candidates, token, start = completion_for(buffer, @line.token.first, @line.token.last)
       return if candidates.nil? || candidates.empty?
 
@@ -456,7 +497,7 @@ module Durable
 
     # Paths, for `!command <tab>` and for naming files in a prompt.
     def path_candidates(token)
-      return [] if token.empty? && !@line.buffer.start_with?("!")
+      return [] if token.empty? && !@shell_mode
 
       expanded = token.start_with?("~") ? File.expand_path(token) : token
       dir = expanded.end_with?("/") ? expanded : File.dirname(expanded)
@@ -489,10 +530,19 @@ module Durable
 
     def refresh_prompt
       @mutex.synchronize do
-        @line.prompt = busy? ? s(:yellow, "steer › ") : s(:cyan, "› ")
+        @line.prompt = prompt_for(@line.buffer)
         @line.rprompt = status_rprompt
         @line.redraw
       end
+    end
+
+    # The prompt says what the line will do, and it says it the moment you
+    # type: a leading ! switches the line to a shell, and the marker moves into
+    # the prompt instead of sitting in the text you are editing.
+    def prompt_for(_buffer = nil)
+      return s(:red, "! ") if @shell_mode
+
+      busy? ? s(:yellow, "steer › ") : s(:cyan, "› ")
     end
 
     # Non-tty (pipes, CI): plain line reading, same command handling.
