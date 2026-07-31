@@ -24,6 +24,7 @@ require_relative "durable/frontmatter"
 require_relative "durable/agents_md"
 require_relative "durable/skills"
 require_relative "durable/prompt"
+require_relative "durable/compaction"
 
 module Durable
   VERSION = "0.1.0"
