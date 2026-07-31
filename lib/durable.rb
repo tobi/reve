@@ -23,6 +23,7 @@ require_relative "durable/observer"
 require_relative "durable/frontmatter"
 require_relative "durable/agents_md"
 require_relative "durable/skills"
+require_relative "durable/prompt"
 
 module Durable
   VERSION = "0.1.0"
