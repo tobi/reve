@@ -84,9 +84,11 @@ module Durable
         when "set_runtime" then update_runtime(arg)
         when "wait_idle" then wait_idle
         when "close"
+          # Detaching is not aborting (§8): an open operation stays open and
+          # restores as suspended, so `resume` can finish it. Wait only for an
+          # append that is already in flight.
           @closed = true
-          @abort = true
-          @worker&.join(2)
+          @worker&.join(0.3)
           true
         else raise ArgumentError, "unknown lane op #{op}"
         end

@@ -144,7 +144,13 @@ module Durable
         case char
         when "\r", "\n" then :submit
         when "\u0003" then :interrupt
-        when "\u0004" then @buffer.empty? ? :eof : nil
+        when "\u0004"
+          # Empty line: end of input. Otherwise the readline meaning: delete
+          # the character under the cursor.
+          return :eof if @buffer.empty?
+
+          @buffer.slice!(@cursor) if @cursor < @buffer.length
+          nil
         when "\u007F", "\b"
           if @cursor.positive?
             @buffer.slice!(@cursor - 1)

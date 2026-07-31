@@ -53,6 +53,13 @@ module Durable
         req.body = JSON.generate(body)
 
         acc = Accumulator.new(model)
+        Durable::Provider.run_abortable(abort_check, acc) do
+          perform(http, req, acc, abort_check, &on_event)
+        end
+      end
+
+      # The blocking part, so it can be run in a killable thread.
+      def perform(http, req, acc, abort_check, &on_event)
         begin
           http.request(req) do |res|
             unless res.code.to_i == 200

@@ -156,6 +156,35 @@ group "every tool survives being run inside a Ractor" do
   end
 end
 
+group "ctrl-c and ctrl-d escalate the way a terminal user expects" do
+  t = Durable::TUI.allocate
+  i = ->(**kw) { t.interrupt_decision(**{ shell_running: false, busy: false, aborting: false,
+                                          has_text: false, repeat: false }.merge(kw)) }
+  eq "^C with text on the line clears it", :clear_line, i.call(has_text: true)
+  eq "^C during a run aborts it", :abort_run, i.call(busy: true)
+  eq "^C again while aborting quits", :force_quit, i.call(busy: true, aborting: true, repeat: true)
+  eq "^C while aborting, but not a repeat, just aborts again", :abort_run,
+     i.call(busy: true, aborting: true, repeat: false)
+  eq "^C during a ! command cancels the command", :cancel_shell, i.call(shell_running: true, busy: true)
+  eq "^C on an empty idle line asks first", :hint_quit, i.call
+  eq "^C twice exits", :quit, i.call(repeat: true)
+
+  d = ->(**kw) { t.eof_decision(**{ busy: false, has_text: false, repeat: false }.merge(kw)) }
+  eq "^D mid-line deletes a character", :delete_char, d.call(has_text: true)
+  eq "^D on an empty idle line exits", :quit, d.call
+  eq "^D during a run warns first", :hint_leave, d.call(busy: true)
+  eq "^D twice leaves the run open", :leave_running, d.call(busy: true, repeat: true)
+end
+
+group "the editor's own ctrl-d" do
+  l = Durable::Term::Line.new
+  eq "empty line reports eof", :eof, l.feed("\u0004")
+  "abc".each_char { l.feed(_1) }
+  l.feed("\u0001")
+  eq "with text it deletes forward", nil, l.feed("\u0004")
+  eq "and the character is gone", "bc", l.buffer
+end
+
 group "big output spills to a file instead of the context window" do
   r = Durable::Tools.invoke("bash", { "command" => "seq 1 5000" }, Dir.pwd)
   text = r["content"][0]["text"]

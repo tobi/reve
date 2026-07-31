@@ -239,4 +239,31 @@ Dir.mktmpdir do |dir|
   end
 end
 
+group "detaching is not aborting: an open operation stays resumable" do
+  Dir.mktmpdir do |dir|
+    session = File.join(dir, "detach.jsonl")
+    script = File.join(dir, "detach.json")
+    File.write(script, JSON.generate({ "responses" => [
+                                        { "role" => "assistant",
+                                          "content" => [{ "type" => "text", "text" => "slow" }],
+                                          "stopReason" => "stop", "sleep" => 30 },
+                                        assistant_text("finished after resume")
+                                      ] }))
+    ENV["DURABLE_FAKE_SCRIPT"] = script
+    h, = open_session(session)
+    Thread.new { h.prompt("start something slow") }
+    sleep 1.0
+    h.close      # the harness-v2 close(): detach, do not abort
+
+    records = File.readlines(session).map { JSON.parse(_1) }.select { _1["kind"] == "record" }
+    eq "no abort was recorded", false, records.any? { _1["type"] == "abort_requested" }
+    eq "the operation is still open", false, records.any? { _1["type"] == "operation_finished" }
+
+    h2, susp = open_session(session)
+    eq "it restores as suspended", 1, susp.size
+    eq "and resume finishes it", true, h2.resume["ok"]
+    h2.close
+  end
+end
+
 done

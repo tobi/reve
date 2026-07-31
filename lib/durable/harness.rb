@@ -170,11 +170,23 @@ module Durable
 
     def available_models = Provider::Models.list(@models_config)
 
+    # Tolerant of a second call and of Ractors that already went away: shutdown
+    # paths race by nature, and a failure here would be the last thing a user
+    # sees.
     def close
+      return if @closed
+
+      @closed = true
       @lanes.each_value(&:close)
-      IPC.cast(@hub, "close")
-      @session.close
+      quietly { IPC.cast(@hub, "close") }
+      quietly { @session.close }
       @host_thread&.kill
+      nil
+    end
+
+    def quietly
+      yield
+    rescue Ractor::ClosedError, Ractor::Error, Durable::RemoteError
       nil
     end
 

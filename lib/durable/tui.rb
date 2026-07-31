@@ -247,6 +247,7 @@ module Durable
       when "run_abort" then emit(s(:yellow, "  ! aborting…"))
       when "run_end"
         flush_text
+        @aborting_since = nil
         @busy = false if ev["lane"] == @lane
         stop_spinner
         emit(footer(ev), "")
@@ -446,9 +447,27 @@ module Durable
 
       Term.cbreak!
       @input_active = true
-      trap("INT") { handle_interrupt }
+      # A trap handler may not take a mutex, and every screen write does. So
+      # the trap only pokes a pipe; the key loop selects on it and handles the
+      # interrupt in ordinary thread context.
+      @int_r, @int_w = IO.pipe
+      trap("INT") do
+        @int_w.write_nonblock("!")
+      rescue StandardError
+        nil
+      end
       refresh_prompt
       loop do
+        ready = IO.select([$stdin, @int_r], nil, nil, nil)
+        if ready && ready[0].include?(@int_r)
+          begin
+            @int_r.read_nonblock(64)
+          rescue StandardError
+            nil
+          end
+          handle_interrupt
+          next
+        end
         char = $stdin.getc
         break if char.nil?
 
@@ -484,7 +503,7 @@ module Durable
         when :complete then complete!
         when :expand then expand_last_output
         when :interrupt then handle_interrupt
-        when :eof then break
+        when :eof then (break if handle_eof == :exit)
         when :clear
           @mutex.synchronize { @out.print("\e[2J\e[H") }
         end
@@ -641,11 +660,13 @@ module Durable
       return emit(s(:dim, "  usage: !<command>")) if command.empty?
 
       emit(s(:blue, "$ ") + command)
+      @shell_running = command.split.first
+      @shell_cancel = false
       Thread.new do
         started = Time.now
         printed = 0
         limit = @verbose ? 2000 : 40
-        r = Durable::Tools.exec_stream(command, Dir.pwd, timeout: 600) do |chunk|
+        r = Durable::Tools.exec_stream(command, Dir.pwd, timeout: 600, cancel: -> { @shell_cancel }) do |chunk|
           chunk.each_line do |l|
             printed += 1
             emit(s(:gray, "  #{clip(l.rstrip, width - 4)}")) if printed <= limit
@@ -659,10 +680,12 @@ module Durable
         end
         emit(Term.two_column("  #{code.zero? ? s(:green, "ok") : s(:red, "exit #{code}")}",
                              s(:dim, "#{(Time.now - started).round(1)}s"), width))
-        res = lane_handle.append_bash(command, Durable::Tools.clip(r["output"]), code)
+        res = lane_handle.append_bash(command, Durable::Tools.overspill(r["output"], "bash").first, code)
         emit(s(:dim, "  (queued for the next checkpoint)")) if busy? && res["ok"]
       rescue StandardError => e
         emit(s(:red, "  #{e.class}: #{e.message}"))
+      ensure
+        @shell_running = nil
       end
       nil
     end
@@ -691,21 +714,88 @@ module Durable
       end
     end
 
+    # Ctrl-C and Ctrl-D, with the escalation a terminal user expects: the first
+    # press does the least destructive useful thing, a second press within a
+    # couple of seconds means "I meant it".
+    REPEAT_WINDOW = 2.0
+
+    # Pure decision table, so the escalation can be tested without a terminal.
+    def interrupt_decision(shell_running:, busy:, aborting:, has_text:, repeat:)
+      return :cancel_shell if shell_running
+      return :force_quit if busy && aborting && repeat
+      return :abort_run if busy
+      return :clear_line if has_text
+      return :quit if repeat
+
+      :hint_quit
+    end
+
+    def eof_decision(busy:, has_text:, repeat:)
+      return :delete_char if has_text
+      return :leave_running if busy && repeat
+      return :hint_leave if busy
+
+      :quit
+    end
+
     def handle_interrupt
-      if busy?
+      repeat = @last_interrupt && (Time.now - @last_interrupt) < REPEAT_WINDOW
+      @last_interrupt = Time.now
+      action = interrupt_decision(shell_running: !@shell_running.nil?, busy: busy?,
+                                  aborting: !@aborting_since.nil?, has_text: !@line.buffer.empty?,
+                                  repeat: repeat)
+      case action
+      when :cancel_shell
+        @shell_cancel = true
+        emit(s(:yellow, "^C") + s(:dim, "  cancelling #{@shell_running}"))
+      when :abort_run
+        @aborting_since = Time.now
         Thread.new { lane_handle.abort! }
-      else
+        emit(s(:yellow, "^C") + s(:dim, "  aborting — ctrl-c again to quit"))
+      when :force_quit
+        emit(s(:yellow, "^C") + s(:dim, "  quitting; the operation stays resumable (rbagent -r)"))
+        Term.restore!
+        exit!(130)
+      when :clear_line
+        @line.reset
+        emit(s(:dim, "^C"))
+        refresh_prompt
+      when :hint_quit
+        emit(s(:dim, "^C  press ctrl-c again to exit"))
+        refresh_prompt
+      when :quit
         emit(s(:dim, "bye"))
         shutdown
         exit 0
       end
     end
 
+    def handle_eof
+      repeat = @last_eof && (Time.now - @last_eof) < REPEAT_WINDOW
+      @last_eof = Time.now
+      case eof_decision(busy: busy?, has_text: !@line.buffer.empty?, repeat: repeat)
+      when :hint_leave
+        emit(s(:dim, "  a run is in progress — ctrl-d again to leave it running (resumable)"))
+        :continue
+      when :leave_running
+        emit(s(:dim, "  leaving the run open; resume it with rbagent -r"))
+        @leave_running = true
+        :exit
+      else
+        :exit
+      end
+    end
+
+    # Idempotent: quitting from a key handler calls this and then exits, which
+    # unwinds through run's ensure and would otherwise close everything twice.
     def shutdown
+      return if @shutdown
+
+      @shutdown = true
       @input_active = false
       Term.restore!
-      if @run_thread&.alive?
-        emit(s(:dim, "waiting for the current run to finish (Ctrl-C aborts)…"))
+      if @run_thread&.alive? && !@leave_running
+        emit(s(:dim, "waiting for the current run to finish (ctrl-c aborts)…"))
         @run_thread.join
       end
       @h.close
