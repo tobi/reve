@@ -1,0 +1,169 @@
+# frozen_string_literal: true
+
+require_relative "provider"
+require_relative "tools"
+require_relative "records"
+
+module Durable
+  # The building blocks of harness-v2 §14. They own no durable state and know
+  # nothing about sessions, records or lanes. The harness composes them and
+  # inserts its durability writes between their phases.
+  module AgentLoop
+    module_function
+
+    # One provider request. Emits streaming events through `emit`; returns the
+    # final assistant message. Provider errors are in-band (stopReason
+    # "error" | "aborted" | "deferred"). Does not persist anything.
+    def stream_assistant(messages, config, emit = nil)
+      ctx = config[:transform_context] ? config[:transform_context].call(messages) : messages
+      emit&.call({ "type" => "message_start", "message" => { "role" => "assistant", "content" => [] } })
+      final = Provider.stream(
+        model: config[:model],
+        messages: ctx,
+        system: config[:system_prompt],
+        tools: config[:tools] || [],
+        thinking: config[:thinking_level],
+        max_tokens: config[:max_tokens],
+        abort_check: config[:abort_check]
+      ) do |ev|
+        emit&.call({ "type" => "message_update", "event" => ev })
+      end
+      final
+    end
+
+    def tool_calls(assistant)
+      (assistant["content"] || []).select { _1["type"] == "toolCall" }
+    end
+
+    # Phase 1 — clearance. Tool lookup, validation, before_tool (may block),
+    # abort checks. No effect starts here.
+    def prepare_tool_call(call, active, callbacks, abort_check = nil)
+      name = call["name"]
+      return immediate(call, "Aborted before execution.") if abort_check&.call
+      return immediate(call, "unknown tool: #{name}") unless active.include?(name) && Tools.spec(name)
+
+      args = call["arguments"] || {}
+      if (err = Tools.validate(name, args))
+        return immediate(call, err)
+      end
+
+      hook = callbacks[:before_tool]&.call(call, args)
+      if hook && hook["block"]
+        return immediate(call, "blocked: #{hook.dig("block", "reason")}")
+      end
+
+      args = hook["args"] if hook && hook["args"]
+      { kind: "prepared", call: call, name: name, args: args, replay: Tools.replay_of(name) }
+    end
+
+    def immediate(call, text)
+      { kind: "immediate", call: call,
+        result: { "content" => [{ "type" => "text", "text" => text }], "isError" => true } }
+    end
+
+    # Phase 2 — the effect, in its own Ractor.
+    def execute_tool_call(prepared, cwd, emit = nil)
+      emit&.call({ "type" => "tool_start", "toolCallId" => prepared[:call]["id"],
+                   "toolName" => prepared[:name], "args" => prepared[:args] })
+      r = Tools.spawn(prepared[:name], prepared[:args], cwd)
+      result = IPC.decode(r.value)
+      { "content" => result["content"], "isError" => !!result["isError"], "details" => result["details"] }
+    end
+
+    # Phase 3 — after_tool patch, field by field.
+    def finalize_tool_call(prepared, executed, callbacks)
+      patch = begin
+        callbacks[:after_tool]&.call(prepared, executed)
+      rescue StandardError => e
+        { "content" => [{ "type" => "text", "text" => "after_tool failed: #{e.message}" }], "isError" => true }
+      end
+      result = executed.dup
+      if patch
+        result["content"] = patch["content"] if patch["content"]
+        result["details"] = patch["details"] if patch["details"]
+        result["isError"] = patch["isError"] unless patch["isError"].nil?
+        result["terminate"] = true if patch["terminate"]
+      end
+      result
+    end
+
+    def tool_result_message(prepared_or_immediate, result)
+      call = prepared_or_immediate[:call]
+      Records.tool_result_message(tool_call_id: call["id"], tool_name: call["name"],
+                                  content: result["content"] || [], is_error: !!result["isError"],
+                                  details: result["details"])
+    end
+
+    # The batch driver. Rules preserved from the reference loop:
+    #  - stopReason "length" fails every call without executing (streamed
+    #    arguments may validate while silently truncated);
+    #  - sequential when requested, else parallel;
+    #  - phase 1 and on_tool_start run sequentially in source order, so a crash
+    #    mid-batch leaves a source-order prefix of records;
+    #  - phase 3, on_tool_result and message emission happen in source order;
+    #  - abort: no further calls are prepared, running ones settle.
+    def execute_tool_batch(assistant, active, callbacks, options, emit = nil, abort_check = nil)
+      calls = tool_calls(assistant)
+      return { messages: [], terminate: false } if calls.empty?
+
+      cwd = options[:cwd] || Dir.pwd
+
+      if assistant["stopReason"] == "length"
+        messages = calls.map do |c|
+          imm = immediate(c, "Tool call arguments were truncated by the context limit; not executed.")
+          msg = tool_result_message(imm, imm[:result])
+          callbacks[:on_tool_result]&.call(msg, nil)
+          msg
+        end
+        return { messages: messages, terminate: false }
+      end
+
+      prepared = calls.map do |c|
+        p = prepare_tool_call(c, active, callbacks, abort_check)
+        if p[:kind] == "prepared"
+          # The durability point: the harness writes tool_started here.
+          callbacks[:on_tool_start]&.call(p)
+        end
+        p
+      end
+
+      sequential = options[:tool_execution] == "sequential"
+      executed = {}
+      if sequential
+        prepared.each do |p|
+          executed[p[:call]["id"]] = p[:kind] == "prepared" ? execute_tool_call(p, cwd, emit) : p[:result]
+        end
+      else
+        ractors = {}
+        prepared.each do |p|
+          next unless p[:kind] == "prepared"
+
+          emit&.call({ "type" => "tool_start", "toolCallId" => p[:call]["id"],
+                       "toolName" => p[:name], "args" => p[:args] })
+          ractors[p[:call]["id"]] = Tools.spawn(p[:name], p[:args], cwd)
+        end
+        prepared.each do |p|
+          executed[p[:call]["id"]] =
+            if p[:kind] == "prepared"
+              raw = IPC.decode(ractors[p[:call]["id"]].value)
+              { "content" => raw["content"], "isError" => !!raw["isError"], "details" => raw["details"] }
+            else
+              p[:result]
+            end
+        end
+      end
+
+      terminate = !prepared.empty?
+      messages = prepared.map do |p|
+        result = p[:kind] == "prepared" ? finalize_tool_call(p, executed[p[:call]["id"]], callbacks) : p[:result]
+        terminate = false unless result["terminate"]
+        msg = tool_result_message(p, result)
+        emit&.call({ "type" => "tool_end", "toolCallId" => p[:call]["id"], "toolName" => p[:call]["name"],
+                     "result" => result, "isError" => !!result["isError"] })
+        callbacks[:on_tool_result]&.call(msg, p)
+        msg
+      end
+      { messages: messages, terminate: terminate }
+    end
+  end
+end
