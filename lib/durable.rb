@@ -17,6 +17,7 @@ require_relative "durable/storage/memory"
 require_relative "durable/storage/jsonl"
 require_relative "durable/store"
 require_relative "durable/provider"
+require_relative "durable/tools"
 
 module Durable
   VERSION = "0.1.0"
