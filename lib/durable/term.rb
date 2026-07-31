@@ -40,7 +40,17 @@ module Durable
     end
 
     def visible(str) = str.to_s.gsub(/\e\[[0-9;?]*[a-zA-Z]/, "")
-    def display_width(str) = visible(str).length
+
+    # Terminals disagree about "ambiguous width" glyphs, and a line that is one
+    # cell too long wraps and breaks every redraw after it. Count the wide
+    # ranges as two cells and stay conservative.
+    WIDE = [(0x1100..0x115F), (0x2E80..0xA4CF), (0xAC00..0xD7A3), (0xF900..0xFAFF),
+            (0xFE30..0xFE6F), (0xFF00..0xFF60), (0xFFE0..0xFFE6),
+            (0x1F300..0x1F64F), (0x1F900..0x1F9FF), (0x2600..0x27BF)].freeze
+
+    def display_width(str)
+      visible(str).each_char.sum { |c| WIDE.any? { _1.cover?(c.ord) } ? 2 : 1 }
+    end
 
     # left … right, right-aligned like a zsh RPROMPT. Falls back to two lines
     # when they do not fit.
@@ -57,9 +67,18 @@ module Durable
 
     def clip(str, max)
       v = visible(str)
-      return str if v.length <= max || max <= 1
+      return str if display_width(v) <= max || max <= 1
 
-      "#{v[0, max - 1]}…"
+      out = +""
+      w = 0
+      v.each_char do |c|
+        cw = display_width(c)
+        break if w + cw > max - 1
+
+        out << c
+        w += cw
+      end
+      "#{out}…"
     end
 
     # A line editor over one screen line, redrawable at any time.

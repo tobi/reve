@@ -195,7 +195,7 @@ module Durable
         @usage = { "input" => 0, "output" => 0 } if ev["type"].start_with?("run")
         start_spinner
         emit(s(:dim, "· resuming")) if ev["type"] == "run_resume"
-        emit(s(:magenta, "  ⟲ compacting context (#{ev["reason"]})…")) if ev["type"] == "compaction_start"
+        emit(s(:magenta, "  ~ compacting context (#{ev["reason"]})…")) if ev["type"] == "compaction_start"
       when "message_update"
         d = ev["event"]
         case d && d["type"]
@@ -224,16 +224,16 @@ module Durable
         refresh_status
       when "tool_end" then @tools.delete(ev["toolCallId"])
       when "retry_scheduled"
-        emit(s(:yellow, "  ↺ retry #{ev["attempt"]}/#{ev["maxAttempts"]} in #{ev["delayMs"]}ms — " \
+        emit(s(:yellow, "  ^ retry #{ev["attempt"]}/#{ev["maxAttempts"]} in #{ev["delayMs"]}ms — " \
                         "#{clip(ev["errorMessage"].to_s, width - 30)}"))
-      when "compaction_end" then emit(s(:magenta, "  ⟲ compaction #{ev["outcome"]}"))
+      when "compaction_end" then emit(s(:magenta, "  ~ compaction #{ev["outcome"]}"))
       when "navigation_end"
-        emit(s(:magenta, "  ⤺ moved to #{ev["newLeafId"].to_s[0, 10]} (#{ev["outcome"]})"))
+        emit(s(:magenta, "  <- moved to #{ev["newLeafId"].to_s[0, 10]} (#{ev["outcome"]})"))
       when "run_suspend"
         @busy = false if ev["lane"] == @lane
         stop_spinner
-        emit(s(:yellow, "⏸ parked on a deferred request — /resume later"))
-      when "run_abort" then emit(s(:yellow, "  ✋ aborting…"))
+        emit(s(:yellow, "|| parked on a deferred request — /resume later"))
+      when "run_abort" then emit(s(:yellow, "  ! aborting…"))
       when "run_end"
         flush_text
         @busy = false if ev["lane"] == @lane
@@ -255,8 +255,10 @@ module Durable
                       s(:dim, right), width)
     end
 
-    TOOL_ICON = { "bash" => "$", "read" => "◂", "write" => "✎", "edit" => "✎",
-                  "ls" => "▸", "glob" => "*", "grep" => "⌕" }.freeze
+    # Single-width glyphs only: an ambiguous-width icon costs one cell of
+    # budget and wraps the line on half the terminals out there.
+    TOOL_ICON = { "bash" => "$", "read" => "<", "write" => "+", "edit" => "~",
+                  "ls" => "/", "glob" => "*", "grep" => "?" }.freeze
 
     def tool_label(name, args)
       icon = TOOL_ICON[name] || "→"
@@ -337,10 +339,10 @@ module Durable
                    "#{st["activeTools"].size} tools · lane #{@lane} · #{Dir.pwd}"))
       emit(s(:dim, "  AGENTS.md: #{@h.agents_md.map { rel(_1["path"]) }.join(", ")}")) unless @h.agents_md.empty?
       emit(s(:dim, "  skills: #{@h.skills.map { _1["name"] }.sort.join(", ")}")) unless @h.skills.empty?
-      @h.skill_diagnostics.each { emit(s(:yellow, "  ⚠ skill #{rel(_1["path"])}: #{_1["message"]}")) }
+      @h.skill_diagnostics.each { emit(s(:yellow, "  ! skill #{rel(_1["path"])}: #{_1["message"]}")) }
       emit(s(:magenta, "  goal: #{clip(st["goal"].to_s.gsub(/\s+/, " "), width - 10)}")) if st["goal"]
       @suspended.each do |sp|
-        emit(s(:yellow, "  ⏸ suspended #{sp["kind"]} on lane #{sp["lane"]} (#{sp["reason"]}) — /resume"))
+        emit(s(:yellow, "  || suspended #{sp["kind"]} on lane #{sp["lane"]} (#{sp["reason"]}) — /resume"))
       end
       emit(s(:dim, "  /help for commands"), "")
     end
@@ -430,7 +432,7 @@ module Durable
 
       if busy?
         echo(text)
-        emit(s(:yellow, "↳ ") + text.lines.first.to_s.strip)
+        emit(s(:yellow, "-> ") + text.lines.first.to_s.strip)
         r = lane_handle.steer(text)
         emit(s(:yellow, "  #{r.dig("error", "message")}")) unless r["ok"]
       else
@@ -591,7 +593,7 @@ module Durable
       else
         active = lane_handle.state["activeTools"]
         Durable::Tools.declarations.each do |d|
-          mark = active.include?(d["name"]) ? s(:green, "●") : s(:dim, "○")
+          mark = active.include?(d["name"]) ? s(:green, "*") : s(:dim, "-")
           emit(Term.two_column("  #{mark} #{s(:bold, d["name"])} #{s(:dim, clip(d["description"], width / 2))}",
                                s(:dim, "replay=#{d["replay"]}"), width))
         end
@@ -600,7 +602,7 @@ module Durable
 
     def cmd_lanes
       @h.lanes.each do |l|
-        mark = l["name"] == @lane ? s(:green, "▸") : " "
+        mark = l["name"] == @lane ? s(:green, ">") : " "
         op = l["operation"] ? s(:yellow, " [#{l.dig("operation", "status")}]") : ""
         emit("  #{mark} #{l["name"].ljust(16)} #{s(:dim, l["leafId"].to_s[0, 10])}#{op}")
       end

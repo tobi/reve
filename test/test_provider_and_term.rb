@@ -105,6 +105,9 @@ group "term: right-aligned columns, like an RPROMPT" do
      Durable::Term.visible(Durable::Term.two_column("\e[1mleft\e[0m", "\e[2mright\e[0m", 20)).length
   eq "no room means two lines", true, Durable::Term.two_column("x" * 18, "y" * 10, 20).include?("\n")
   eq "clip keeps the ellipsis inside the budget", 10, Durable::Term.clip("x" * 40, 10).length
+  eq "wide glyphs count as two cells", 2, Durable::Term.display_width("✓")
+  eq "so a line with them still fits", true,
+     Durable::Term.display_width(Durable::Term.two_column("✓ ok", "✗ no", 20)) <= 20
 end
 
 group "term: the line editor" do
