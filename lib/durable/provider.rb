@@ -2,6 +2,7 @@
 
 require_relative "provider/models"
 require_relative "provider/anthropic"
+require_relative "provider/openai_responses"
 require_relative "provider/fake"
 
 module Durable
@@ -13,6 +14,7 @@ module Durable
     def for_model(model)
       case model["api"]
       when "fake" then Fake
+      when "openai-responses" then OpenAIResponses
       when "anthropic-messages" then Anthropic
       else Anthropic
       end
