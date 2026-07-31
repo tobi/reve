@@ -100,12 +100,15 @@ module Durable
     # only other thread is a waiter can trip Ruby's deadlock detector
     # ("No live threads left") while the child is still running. One thread,
     # one pipe, IO.select, waitpid.
-    def tool_bash(args, cwd, cancel = nil)
-      timeout = (args["timeout"] || 120).to_f
+    # One shell runner, shared by the bash tool and by the TUI's `!` command.
+    # Streams as it goes (the TUI wants live output), honours cancellation, and
+    # kills the child's process group on timeout or abort.
+    #
+    # => { "output" =>, "exitCode" =>, "cancelled" =>, "timedOut" => }
+    def exec_stream(command, cwd, timeout: 120.0, cancel: nil, &on_chunk)
       reader, writer = IO.pipe
-      pid = Process.spawn({ "TERM" => "dumb" }, "bash", "-lc", args["command"].to_s,
-                          chdir: cwd, out: writer, err: writer, in: File::NULL,
-                          pgroup: true)
+      pid = Process.spawn({ "TERM" => "dumb" }, "bash", "-lc", command.to_s,
+                          chdir: cwd, out: writer, err: writer, in: File::NULL, pgroup: true)
       writer.close
       out = +""
       deadline = Time.now + timeout
@@ -121,14 +124,15 @@ module Durable
           timed_out = true
           break
         end
-        ready = IO.select([reader], nil, nil, [remaining, 0.2].min)
-        next unless ready
+        next unless IO.select([reader], nil, nil, [remaining, 0.2].min)
 
         begin
-          out << reader.readpartial(65_536)
+          chunk = reader.readpartial(65_536)
         rescue EOFError
           break
         end
+        out << chunk
+        on_chunk&.call(chunk)
       end
       if timed_out || cancelled
         begin
@@ -138,7 +142,9 @@ module Durable
         rescue StandardError
           nil
         end
-        out << (cancelled ? "\n[aborted]" : "\n[timed out after #{timeout}s]")
+        tail = cancelled ? "\n[aborted]" : "\n[timed out after #{timeout}s]"
+        out << tail
+        on_chunk&.call(tail)
       end
       status = begin
         Process.waitpid2(pid)[1]
@@ -146,17 +152,26 @@ module Durable
         nil
       end
       begin
-        out << reader.read.to_s
+        rest = reader.read.to_s
+        unless rest.empty?
+          out << rest
+          on_chunk&.call(rest)
+        end
       rescue StandardError
         nil
       ensure
         reader.close
       end
-      return error("Interrupted.\n#{clip(out)}") if cancelled
+      { "output" => out, "exitCode" => status&.exitstatus || (timed_out ? 124 : -1),
+        "cancelled" => cancelled, "timedOut" => timed_out }
+    end
 
-      text = clip(out)
-      code = status&.exitstatus || (timed_out ? 124 : -1)
-      code.zero? ? ok(text.strip.empty? ? "(no output)" : text) : error("exit #{code}\n#{text}")
+    def tool_bash(args, cwd, cancel = nil)
+      r = exec_stream(args["command"], cwd, timeout: (args["timeout"] || 120).to_f, cancel: cancel)
+      text = clip(r["output"])
+      return error("Interrupted.\n#{text}") if r["cancelled"]
+
+      r["exitCode"].zero? ? ok(text.strip.empty? ? "(no output)" : text) : error("exit #{r["exitCode"]}\n#{text}")
     end
 
     def tool_read(args, cwd, cancel = nil)

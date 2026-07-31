@@ -166,6 +166,7 @@ module Durable
           @cursor = left.length
           nil
         when "\u000C" then :clear
+        when "\t" then :complete
         when "\e" then :escape
         else
           return nil if char.ord < 32
@@ -197,6 +198,25 @@ module Durable
         @hindex = @hindex.nil? ? @history.size : @hindex
         @hindex = (@hindex + delta).clamp(0, @history.size)
         @buffer = (@hindex == @history.size ? +"" : @history[@hindex].dup)
+        @cursor = @buffer.length
+      end
+
+      # Completion support: the caller decides what the candidates are; the
+      # editor only knows how to splice one in.
+      def token(sep: /\s/)
+        head = @buffer[0, @cursor].to_s
+        start = (head.rindex(sep) || -1) + 1
+        [head[start..].to_s, start]
+      end
+
+      def replace_token(text, start)
+        tail = @buffer[@cursor..].to_s
+        @buffer = @buffer[0, start].to_s + text + tail
+        @cursor = start + text.length
+      end
+
+      def replace_all(text)
+        @buffer = text.dup
         @cursor = @buffer.length
       end
 

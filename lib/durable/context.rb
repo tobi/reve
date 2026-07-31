@@ -21,6 +21,23 @@ module Durable
         { "role" => "user",
           "content" => [{ "type" => "text",
                           "text" => "[Summary of an abandoned branch]\n#{entry["summary"]}" }] }
+      when "custom"
+        project_custom(entry)
+      end
+    end
+
+    # Custom entries only enter provider context when they have a projector.
+    # A shell command the *user* ran is one: the model must see it, and it must
+    # be unmistakably the user's action rather than a tool result of its own.
+    def project_custom(entry)
+      case entry["customType"]
+      when "bash_execution"
+        d = entry["data"] || {}
+        { "role" => "user",
+          "content" => [{ "type" => "text",
+                          "text" => "The user ran a shell command.\n" \
+                                    "<bash_execution command=#{d["command"].to_s.inspect} " \
+                                    "exit=#{d["exitCode"]}>\n#{d["output"]}\n</bash_execution>" }] }
       end
     end
 

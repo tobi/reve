@@ -123,7 +123,9 @@ test/               parity + crash-site tests (§20)
     of every request on that lane.
 15. **openai-responses.** A second provider (the local vLLM endpoint is the default), with
     per-provider quirks read from the `compat` block of models.json.
-16. **A terminal the renderer can print into.** Own the input line instead of handing it to
+16. **Shell passthrough and completion.** `!command` as a first-class durable fact, and
+    context-aware tab completion driven by the same command table the dispatcher uses.
+17. **A terminal the renderer can print into.** Own the input line instead of handing it to
     a readline library: cbreak mode, a small line editor, one screen primitive that hides
     the input line, prints, and redraws it. Tool outcomes render right-aligned.
 

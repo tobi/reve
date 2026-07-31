@@ -24,6 +24,8 @@ module Durable
     HELP = <<~TXT
       conversation
         <text>              prompt · typing while the agent works steers it
+        !<command>          run a shell command; it and its output enter the conversation
+        <tab>               complete commands, skills, models, lanes, tools, paths
         /goal [text]        show or set the session goal (kept in every prompt)
         /skill [name]       list skills, or run one now
         /steer <text>       queue a steering message explicitly
@@ -48,6 +50,10 @@ module Durable
         /verbose            toggle thinking + full tool output
       /help  /exit
     TXT
+
+    COMMANDS = %w[help exit quit abort resume compact verbose goal skill model models think
+                  tools state agents lanes lane tree back log steer next].freeze
+    THINK_LEVELS = %w[off low medium high].freeze
 
     def initialize(harness, suspended, lane: "main")
       @h = harness
@@ -377,6 +383,7 @@ module Durable
             @out.flush
           end
           break if submit(text) == :exit
+        when :complete then complete!
         when :interrupt then handle_interrupt
         when :eof then break
         when :clear
@@ -406,6 +413,80 @@ module Durable
       seq
     end
 
+    # Tab completion. What can be completed depends on where the cursor is:
+    # the command itself, that command's argument, or a path.
+    def complete!
+      buffer = @line.buffer
+      candidates, token, start = completion_for(buffer, @line.token.first, @line.token.last)
+      return if candidates.nil? || candidates.empty?
+
+      if candidates.size == 1
+        @line.replace_token(candidates.first + (candidates.first.end_with?("/") ? "" : " "), start)
+        return
+      end
+      prefix = common_prefix(candidates)
+      @line.replace_token(prefix, start) if prefix.length > token.length
+      emit(columns(candidates))
+    end
+
+    # => [candidates, token, replace_start]
+    def completion_for(buffer, token, start)
+      if buffer.start_with?("/") && !buffer[0...start].include?(" ")
+        cmds = COMMANDS.select { _1.start_with?(token.delete_prefix("/")) }.map { "/#{_1}" }
+        return [cmds, token, 0]
+      end
+      if buffer.start_with?("/")
+        cmd = buffer[1..].split(" ", 2).first.to_s
+        list = argument_candidates(cmd)
+        return [list.select { _1.start_with?(token) }, token, start] if list
+      end
+      [path_candidates(token), token, start]
+    end
+
+    def argument_candidates(cmd)
+      case cmd
+      when "skill" then @h.skills.map { _1["name"] }.sort
+      when "lane" then @h.lanes.map { _1["name"] }
+      when "model" then @h.available_models.flat_map { ["#{_1["provider"]}/#{_1["modelId"]}", _1["modelId"]] }.uniq
+      when "think" then THINK_LEVELS
+      when "tools" then Durable::Tools.names
+      when "help" then COMMANDS
+      end
+    end
+
+    # Paths, for `!command <tab>` and for naming files in a prompt.
+    def path_candidates(token)
+      return [] if token.empty? && !@line.buffer.start_with?("!")
+
+      expanded = token.start_with?("~") ? File.expand_path(token) : token
+      dir = expanded.end_with?("/") ? expanded : File.dirname(expanded)
+      dir = "." if dir == "" || (!expanded.include?("/") && dir == ".")
+      base = expanded.end_with?("/") ? "" : File.basename(expanded)
+      prefix = expanded.include?("/") ? "#{dir.chomp("/")}/" : ""
+      Dir.children(dir).sort.filter_map do |name|
+        next unless name.start_with?(base)
+        next if name.start_with?(".") && !base.start_with?(".")
+
+        File.directory?(File.join(dir, name)) ? "#{prefix}#{name}/" : "#{prefix}#{name}"
+      end
+    rescue SystemCallError
+      []
+    end
+
+    def common_prefix(list)
+      first = list.first
+      first.each_char.with_index do |c, i|
+        return first[0, i] unless list.all? { _1[i] == c }
+      end
+      first
+    end
+
+    def columns(items)
+      w = items.map { _1.length }.max + 2
+      per_row = [(width / w), 1].max
+      items.each_slice(per_row).map { |row| "  " + row.map { _1.ljust(w) }.join.rstrip }
+    end
+
     def refresh_prompt
       @mutex.synchronize do
         @line.prompt = busy? ? s(:yellow, "steer › ") : s(:cyan, "› ")
@@ -429,6 +510,7 @@ module Durable
       return nil if text.empty?
 
       return command(text) if text.start_with?("/")
+      return shell(text[1..].to_s.strip) if text.start_with?("!")
 
       if busy?
         echo(text)
@@ -439,6 +521,34 @@ module Durable
         echo(text)
         emit(s(:cyan, "› ") + text.lines.first.to_s.strip)
         start_run { lane_handle.prompt(text) }
+      end
+      nil
+    end
+
+    # `!command`: the user's own shell command. It runs here, not through the
+    # model, and lands in the conversation as a bash_execution entry so the
+    # model sees what happened — durable like any other write, deferred when a
+    # step is in flight.
+    def shell(command)
+      return emit(s(:dim, "  usage: !<command>")) if command.empty?
+
+      emit(s(:blue, "$ ") + command)
+      Thread.new do
+        started = Time.now
+        printed = 0
+        r = Durable::Tools.exec_stream(command, Dir.pwd, timeout: 600) do |chunk|
+          chunk.each_line do |l|
+            printed += 1
+            emit(s(:gray, "  #{clip(l.rstrip, width - 4)}")) if printed <= 200 || @verbose
+          end
+        end
+        code = r["exitCode"]
+        emit(Term.two_column("  #{code.zero? ? s(:green, "ok") : s(:red, "exit #{code}")}",
+                             s(:dim, "#{(Time.now - started).round(1)}s"), width))
+        res = lane_handle.append_bash(command, Durable::Tools.clip(r["output"]), code)
+        emit(s(:dim, "  (queued for the next checkpoint)")) if busy? && res["ok"]
+      rescue StandardError => e
+        emit(s(:red, "  #{e.class}: #{e.message}"))
       end
       nil
     end

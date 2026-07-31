@@ -325,6 +325,10 @@ module Durable
       end
 
       def goal = call("get_goal")["goal"]
+
+      def append_bash(command, output, exit_code)
+        call("append_bash", { "command" => command, "output" => output, "exitCode" => exit_code })
+      end
       def set_goal(text) = call("set_goal", { "text" => text })
       def steer(text) = call("steer", { "text" => text })
       def follow_up(text) = call("follow_up", { "text" => text })

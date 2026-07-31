@@ -78,6 +78,7 @@ module Durable
         when "next_run" then enqueue("nextRun", arg)
         when "set_config" then set_persisted_config(arg)
         when "set_goal" then set_goal(arg)
+        when "append_bash" then append_bash(arg)
         when "get_goal" then { "goal" => current_goal }
         when "set_runtime" then update_runtime(arg)
         when "wait_idle" then wait_idle
@@ -254,15 +255,33 @@ module Durable
       def set_goal(arg)
         entry = { "type" => "custom", "id" => Ids.entry, "customType" => "goal",
                   "data" => { "text" => arg["text"].to_s } }
+        write_entry(entry)
+        { "ok" => true, "goal" => arg["text"] }
+      end
+
+      # A `!command` the user ran in the TUI. Same durability as any other
+      # write: immediate when idle, a deferred write while a step is in flight,
+      # so it lands after the assistant message that did not see it.
+      def append_bash(arg)
+        entry = { "type" => "custom", "id" => Ids.entry, "customType" => "bash_execution",
+                  "data" => { "command" => arg["command"], "output" => arg["output"],
+                              "exitCode" => arg["exitCode"] } }
+        write_entry(entry)
+        { "ok" => true, "entryId" => entry["id"] }
+      end
+
+      # Immediate when idle, deferred while busy (§4).
+      def write_entry(entry)
         if busy?
           @session.append_record(Records.write_deferred(lane: @lane, run_id: @op["id"], target: entry))
           @mutex.synchronize { @inbox << { "kind" => "write", "target" => entry } }
           emit("write_pending", { "entryId" => entry["id"], "entry" => entry })
+          :deferred
         else
-          @session.append_entry(entry)
-          emit("entry_added", { "entry" => entry })
+          appended = @session.append_entry(entry)
+          emit("entry_added", { "entry" => appended })
+          :appended
         end
-        { "ok" => true, "goal" => arg["text"] }
       end
 
       def update_runtime(arg)
