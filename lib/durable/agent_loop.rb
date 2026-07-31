@@ -61,13 +61,33 @@ module Durable
         result: { "content" => [{ "type" => "text", "text" => text }], "isError" => true } }
     end
 
-    # Phase 2 — the effect, in its own Ractor.
-    def execute_tool_call(prepared, cwd, emit = nil)
+    # Phase 2 — the effect, in its own Ractor. Abort signals the tool rather
+    # than waiting it out: a `sleep 60` must not hold a run open for a minute.
+    def execute_tool_call(prepared, cwd, emit = nil, abort_check = nil)
       emit&.call({ "type" => "tool_start", "toolCallId" => prepared[:call]["id"],
                    "toolName" => prepared[:name], "args" => prepared[:args] })
-      r = Tools.spawn(prepared[:name], prepared[:args], cwd)
-      result = IPC.decode(r.value)
+      ractor = Tools.spawn(prepared[:name], prepared[:args], cwd)
+      result = await_tools({ prepared[:call]["id"] => ractor }, abort_check).values.first
       { "content" => result["content"], "isError" => !!result["isError"], "details" => result["details"] }
+    end
+
+    # Wait for tool Ractors, cancelling them once if the run is aborting.
+    def await_tools(ractors, abort_check)
+      threads = ractors.transform_values { |r| Thread.new { IPC.decode(r.value) } }
+      cancelled = false
+      until threads.each_value.none?(&:alive?)
+        if !cancelled && abort_check&.call
+          ractors.each_value { Tools.cancel(_1) }
+          cancelled = true
+        end
+        sleep 0.05
+      end
+      threads.transform_values do |t|
+        t.value
+      rescue Ractor::RemoteError => e
+        { "content" => [{ "type" => "text", "text" => "tool ractor failed: #{e.cause&.message || e.message}" }],
+          "isError" => true }
+      end
     end
 
     # Phase 3 — after_tool patch, field by field.
@@ -131,7 +151,8 @@ module Durable
       executed = {}
       if sequential
         prepared.each do |p|
-          executed[p[:call]["id"]] = p[:kind] == "prepared" ? execute_tool_call(p, cwd, emit) : p[:result]
+          executed[p[:call]["id"]] =
+            p[:kind] == "prepared" ? execute_tool_call(p, cwd, emit, abort_check) : p[:result]
         end
       else
         ractors = {}
@@ -142,10 +163,11 @@ module Durable
                        "toolName" => p[:name], "args" => p[:args] })
           ractors[p[:call]["id"]] = Tools.spawn(p[:name], p[:args], cwd)
         end
+        raw_results = await_tools(ractors, abort_check)
         prepared.each do |p|
           executed[p[:call]["id"]] =
             if p[:kind] == "prepared"
-              raw = IPC.decode(ractors[p[:call]["id"]].value)
+              raw = raw_results[p[:call]["id"]]
               { "content" => raw["content"], "isError" => !!raw["isError"], "details" => raw["details"] }
             else
               p[:result]

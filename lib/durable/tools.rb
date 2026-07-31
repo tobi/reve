@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require "json"
-require "open3"
 require "fileutils"
 require_relative "ipc"
 
@@ -36,17 +35,39 @@ module Durable
 
     # Run a tool in its own Ractor: args JSON in, result JSON out, no shared
     # state. Parallel batches are therefore parallel for real.
+    #
+    # Abort "signals running effects" (§4), and a Ractor cannot be reached
+    # into — so cancellation is a message on the tool Ractor's own incoming
+    # port, which a watcher thread inside it turns into a flag the tool polls.
+    def cancel(ractor)
+      ractor.send("cancel")
+    rescue Ractor::ClosedError, Ractor::Error
+      nil
+    end
+
     def spawn(name, args, cwd)
       Ractor.new(name, IPC.encode(args), cwd) do |n, args_json, dir|
-        Durable::IPC.encode(Durable::Tools.invoke(n, JSON.parse(args_json), dir))
+        cancelled = [false]
+        watcher = Thread.new do
+          Ractor.receive
+          cancelled[0] = true
+        rescue StandardError
+          nil
+        end
+        begin
+          result = Durable::Tools.invoke(n, JSON.parse(args_json), dir, -> { cancelled[0] })
+        ensure
+          watcher.kill
+        end
+        Durable::IPC.encode(result)
       end
     end
 
     # No Dir.chdir: it is process-global, and tool Ractors run in parallel
     # inside one process. Every path is resolved against the workspace instead.
-    def invoke(name, args, cwd)
+    def invoke(name, args, cwd, cancel = nil)
       s = SPECS[name] or return error("unknown tool: #{name}")
-      public_send(s["handler"], args, cwd || Dir.pwd)
+      public_send(s["handler"], args, cwd || Dir.pwd, cancel || -> { false })
     rescue StandardError => e
       error("#{e.class}: #{e.message}")
     end
@@ -75,44 +96,70 @@ module Durable
 
     # ── handlers ────────────────────────────────────────────────────────────
 
-    def tool_bash(args, cwd)
+    # Deliberately not Open3: it spawns a waiter thread, and a Ractor whose
+    # only other thread is a waiter can trip Ruby's deadlock detector
+    # ("No live threads left") while the child is still running. One thread,
+    # one pipe, IO.select, waitpid.
+    def tool_bash(args, cwd, cancel = nil)
       timeout = (args["timeout"] || 120).to_f
+      reader, writer = IO.pipe
+      pid = Process.spawn({ "TERM" => "dumb" }, "bash", "-lc", args["command"].to_s,
+                          chdir: cwd, out: writer, err: writer, in: File::NULL,
+                          pgroup: true)
+      writer.close
       out = +""
-      status = nil
-      Open3.popen2e({ "TERM" => "dumb" }, "bash", "-lc", args["command"].to_s, chdir: cwd) do |stdin, oe, wait|
-        stdin.close
-        deadline = Time.now + timeout
-        loop do
-          break unless wait.alive? || oe.wait_readable(0)
-
-          if oe.wait_readable(0.1)
-            begin
-              out << oe.read_nonblock(65_536)
-            rescue EOFError
-              break
-            rescue IO::WaitReadable
-              nil
-            end
-          end
-          if Time.now >= deadline && wait.alive?
-            Process.kill("TERM", wait.pid)
-            out << "\n[timed out after #{timeout}s]"
-            break
-          end
+      deadline = Time.now + timeout
+      timed_out = false
+      cancelled = false
+      loop do
+        if cancel&.call
+          cancelled = true
+          break
         end
+        remaining = deadline - Time.now
+        if remaining <= 0
+          timed_out = true
+          break
+        end
+        ready = IO.select([reader], nil, nil, [remaining, 0.2].min)
+        next unless ready
+
         begin
-          out << oe.read
+          out << reader.readpartial(65_536)
+        rescue EOFError
+          break
+        end
+      end
+      if timed_out || cancelled
+        begin
+          Process.kill("-TERM", pid)
+          sleep 0.05
+          Process.kill("-KILL", pid)
         rescue StandardError
           nil
         end
-        status = wait.value
+        out << (cancelled ? "\n[aborted]" : "\n[timed out after #{timeout}s]")
       end
+      status = begin
+        Process.waitpid2(pid)[1]
+      rescue Errno::ECHILD
+        nil
+      end
+      begin
+        out << reader.read.to_s
+      rescue StandardError
+        nil
+      ensure
+        reader.close
+      end
+      return error("Interrupted.\n#{clip(out)}") if cancelled
+
       text = clip(out)
-      code = status&.exitstatus || -1
+      code = status&.exitstatus || (timed_out ? 124 : -1)
       code.zero? ? ok(text.strip.empty? ? "(no output)" : text) : error("exit #{code}\n#{text}")
     end
 
-    def tool_read(args, cwd)
+    def tool_read(args, cwd, cancel = nil)
       path = File.expand_path(args["path"].to_s, cwd)
       return error("no such file: #{path}") unless File.file?(path)
 
@@ -124,14 +171,14 @@ module Durable
       ok(clip(numbered.empty? ? "(empty)" : numbered), details: { "path" => path, "lines" => lines.size })
     end
 
-    def tool_write(args, cwd)
+    def tool_write(args, cwd, cancel = nil)
       path = File.expand_path(args["path"].to_s, cwd)
       FileUtils.mkdir_p(File.dirname(path))
       File.write(path, args["content"].to_s)
       ok("wrote #{args["content"].to_s.bytesize} bytes to #{path}")
     end
 
-    def tool_edit(args, cwd)
+    def tool_edit(args, cwd, cancel = nil)
       path = File.expand_path(args["path"].to_s, cwd)
       return error("no such file: #{path}") unless File.file?(path)
 
@@ -145,7 +192,7 @@ module Durable
       ok("edited #{path}")
     end
 
-    def tool_ls(args, cwd)
+    def tool_ls(args, cwd, cancel = nil)
       dir = File.expand_path(args["path"] || ".", cwd)
       return error("no such directory: #{dir}") unless File.directory?(dir)
 
@@ -156,7 +203,7 @@ module Durable
       ok(clip(rows.join("\n")))
     end
 
-    def tool_glob(args, cwd)
+    def tool_glob(args, cwd, cancel = nil)
       root = File.expand_path(args["path"] || ".", cwd)
       hits = Dir.glob(args["pattern"].to_s, base: root).map { File.join(root, _1) }
       hits = hits.sort_by { |f| -(begin
@@ -167,7 +214,7 @@ module Durable
       ok(clip(hits.join("\n").then { _1.empty? ? "(no matches)" : _1 }))
     end
 
-    def tool_grep(args, cwd)
+    def tool_grep(args, cwd, cancel = nil)
       root = File.expand_path(args["path"] || ".", cwd)
       re = Regexp.new(args["pattern"].to_s)
       pattern = args["glob"] || "**/*"
@@ -185,8 +232,10 @@ module Durable
         rescue ArgumentError, Errno::EACCES
           next
         end
-        break if out.size > 400
+        break if out.size > 400 || cancel&.call
       end
+      return error("Interrupted.") if cancel&.call
+
       ok(clip(out.join("\n").then { _1.empty? ? "(no matches)" : _1 }))
     end
 

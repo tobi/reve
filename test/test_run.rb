@@ -85,6 +85,23 @@ Dir.mktmpdir do |dir|
     h.close
   end
 
+  group "abort signals a running tool instead of waiting it out" do
+    model = fake_model(dir, [assistant_tool("bash", { "command" => "sleep 60; echo never" })])
+    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir)
+    t = Thread.new { h.prompt("start something long") }
+    sleep 1.0
+    t0 = Time.now
+    h.abort!
+    r = t.value
+    elapsed = Time.now - t0
+    eq "aborted", "aborted", r["outcome"]
+    eq "the tool was cancelled, not awaited", true, elapsed < 5
+    result = entries_of(h.session).find { _1.dig("message", "role") == "toolResult" }
+    eq "its result says so", true, result.dig("message", "content", 0, "text").include?("Interrupted")
+    eq "and it is an error result", true, result.dig("message", "isError")
+    h.close
+  end
+
   group "retry: the durable attempt count caps retries" do
     err = { "role" => "assistant", "content" => [], "stopReason" => "error",
             "errorMessage" => "overloaded", "retryable" => true }

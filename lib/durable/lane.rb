@@ -467,7 +467,8 @@ module Durable
             if started["replay"] == "safe" && current == "safe"
               prepared = { kind: "prepared", call: call["toolCall"], name: started["toolName"],
                            args: started["effectiveArgs"], replay: "safe" }
-              executed = AgentLoop.execute_tool_call(prepared, @config["cwd"] || Dir.pwd, method(:emit_raw).to_proc)
+              executed = AgentLoop.execute_tool_call(prepared, @config["cwd"] || Dir.pwd,
+                                                     method(:emit_raw).to_proc, -> { @abort })
               result = AgentLoop.finalize_tool_call(prepared, executed, {})
               msg = AgentLoop.tool_result_message(prepared, result)
               append_if_missing(Records.message_entry(msg, id: started["resultEntryId"]))
