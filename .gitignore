@@ -1,0 +1,4 @@
+*.jsonl
+*.cursor
+*.requests
+tmp/
