@@ -12,6 +12,10 @@ require_relative "durable/ipc"
 require_relative "durable/ids"
 require_relative "durable/records"
 require_relative "durable/context"
+require_relative "durable/storage/base"
+require_relative "durable/storage/memory"
+require_relative "durable/storage/jsonl"
+require_relative "durable/store"
 
 module Durable
   VERSION = "0.1.0"
