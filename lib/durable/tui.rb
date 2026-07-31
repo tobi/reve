@@ -16,7 +16,7 @@ module Durable
   class TUI
     RESET = "\e[0m"
     STYLE = {
-      dim: "\e[2m", bold: "\e[1m", red: "\e[31m", green: "\e[32m", yellow: "\e[33m",
+      dim: "\e[2m", bold: "\e[1m", bright: "\e[1;97m", red: "\e[31m", green: "\e[32m", yellow: "\e[33m",
       blue: "\e[34m", magenta: "\e[35m", cyan: "\e[36m", gray: "\e[90m", white: "\e[97m"
     }.freeze
     SPINNER = %w[⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏].freeze
@@ -26,6 +26,7 @@ module Durable
         <text>              prompt · typing while the agent works steers it
         !<command>          run a shell command; it and its output enter the conversation
         <tab>               complete commands, skills, models, lanes, tools, paths
+        ctrl-o              expand the last tool output
         /goal [text]        show or set the session goal (kept in every prompt)
         /skill [name]       list skills, or run one now
         /steer <text>       queue a steering message explicitly
@@ -37,6 +38,8 @@ module Durable
         /tree               the current branch
         /log [n]            the tail of the durable log (entries + records)
         /state              lane state as JSON
+        /cache              prompt-cache hit rate for this lane
+        /output [n]         print the last (or n-th last) tool output in full
         /back [n]           navigate n user turns back (branches the tree)
         /agents             AGENTS.md files in play
       lanes
@@ -52,7 +55,7 @@ module Durable
     TXT
 
     COMMANDS = %w[help exit quit abort resume compact verbose goal skill model models think
-                  tools state agents lanes lane tree back log steer next].freeze
+                  tools state cache output agents lanes lane tree back log steer next].freeze
     THINK_LEVELS = %w[off low medium high].freeze
 
     def initialize(harness, suspended, lane: "main")
@@ -150,7 +153,9 @@ module Durable
       return [s(:gray, "  │ ") + s(:white, line)] if @in_code
 
       case line
-      when /\A\#{1,6}\s+(.*)\z/ then [s(:bold, ::Regexp.last_match(1))]
+      when /\A(\#{1,6})\s+(.*)\z/
+        # Headlines are the one thing worth making brighter than body text.
+        [s(:bright, inline(::Regexp.last_match(2)))]
       when /\A\s*([-*])\s+(.*)\z/ then wrap("#{s(:cyan, "•")} #{inline(::Regexp.last_match(2))}", "  ")
       when /\A\s*(\d+)\.\s+(.*)\z/
         wrap("#{s(:cyan, "#{::Regexp.last_match(1)}.")} #{inline(::Regexp.last_match(2))}", "  ")
@@ -246,6 +251,12 @@ module Durable
         stop_spinner
         emit(footer(ev), "")
         refresh_prompt if @input_active
+      when "cache_invalidated"
+        if ev["expected"]
+          emit(s(:dim, "  prompt cache reset (#{ev["cause"]})"))
+        else
+          emit("\e[41;97;1m PROMPT CACHE \e[0m " + s(:red, (ev["reasons"] || []).join("; ")))
+        end
       when "fault" then emit(s(:red, "harness faulted: #{ev["message"]}"))
       when "handler_error" then emit(s(:red, "hook error (#{ev["hook"]}): #{ev["error"]}"))
       when "lane_created" then emit(s(:dim, "  + lane #{ev["lane"]}"))
@@ -262,6 +273,8 @@ module Durable
       bits << "#{(Time.now - @run_started).round(1)}s" if @run_started
       bits << "#{tok(u["output"])} out" if u["output"].to_i.positive?
       bits << "ctx #{tok(context_used(u))}/#{tok(context_window)}" if context_used(u).positive?
+      hit = cache_rate(u)
+      bits << "cache #{hit}%" if hit
       right = s(:dim, bits.join(" · "))
       left =
         case ev["outcome"]
@@ -280,8 +293,17 @@ module Durable
       "#{(n / 1000.0).round}k"
     end
 
+    # "input" already includes cached tokens (providers normalise this), so the
+    # context in play is simply input + output.
     def context_used(usage)
-      usage["input"].to_i + usage["cacheRead"].to_i + usage["cacheWrite"].to_i + usage["output"].to_i
+      usage["input"].to_i + usage["output"].to_i
+    end
+
+    def cache_rate(usage)
+      input = usage["input"].to_i
+      return nil unless input.positive? && usage["cacheRead"]
+
+      (usage["cacheRead"].to_i * 100.0 / input).round
     end
 
     def context_window
@@ -309,14 +331,38 @@ module Durable
       "  #{s(:blue, icon)} #{s(:bold, name)} #{detail}"
     end
 
-    # The RPROMPT idea: the call on the left, its outcome right-aligned. Full
-    # output only for errors, or with /verbose.
+    # The RPROMPT idea: the call on the left, its outcome right-aligned. Long
+    # output is collapsed to a hint; ctrl-o (or /output) prints it, and the
+    # tool has already spilled anything huge to a log file the model can read.
+    def remember_output(msg, lines)
+      @outputs ||= []
+      @outputs << { "tool" => msg["toolName"], "lines" => lines,
+                    "logPath" => msg.dig("details", "logPath"),
+                    "total" => msg.dig("details", "totalLines") || lines.size }
+      @outputs.shift while @outputs.size > 20
+    end
+
+    def expand_last_output(index = -1)
+      out = (@outputs || [])[index]
+      return emit(s(:dim, "  no tool output to expand")) unless out
+
+      lines = out["lines"]
+      if out["logPath"] && File.exist?(out["logPath"])
+        lines = File.readlines(out["logPath"]).map(&:rstrip)
+      end
+      emit(s(:dim, "  ── #{out["tool"]} · #{lines.size} lines#{out["logPath"] ? " · #{out["logPath"]}" : ""}"))
+      emit(lines.last(400).map { s(:gray, "  #{clip(_1, width - 4)}") })
+      emit(s(:dim, "  ── end")) if lines.size > 400
+    end
+
     def render_tool_result(msg)
       id = msg["toolCallId"]
       args = (@tool_args || {}).delete(id)
       started = (@tool_started_at || {}).delete(id)
       body = text_of(msg).to_s
       lines = body.lines.map(&:rstrip).reject(&:empty?)
+      # The spill footer is for the model; the UI shows the path in the hint.
+      lines.pop if lines.last.to_s.start_with?("[Full output:")
       error = msg["isError"]
 
       summary = result_summary(msg["toolName"], lines, error)
@@ -329,12 +375,19 @@ module Durable
       left = tool_label(msg["toolName"], args)
       emit(Term.two_column(clip(left, width - Term.display_width(right) - 2), right, width))
 
+      remember_output(msg, lines)
       shown = error ? lines.first(12) : (@verbose ? lines.first(60) : [])
       shown = shown.drop(1) if shown.first == lines.first
       emit(shown.map { s(:gray, "      #{clip(_1, width - 8)}") }) unless shown.empty?
-      if !@verbose && !error && lines.size > 1
-        nil # the count on the right already says how much there was
-      end
+
+      hidden = lines.size - shown.size - 1
+      total = msg.dig("details", "totalLines") || lines.size
+      hidden = total - shown.size - 1 if total > lines.size
+      return unless hidden.positive?
+
+      spill = msg.dig("details", "logPath")
+      emit(s(:dim, "      … #{hidden} more line#{hidden == 1 ? "" : "s"} · ctrl-o to expand" \
+                   "#{spill ? " · #{spill}" : ""}"))
     end
 
     # What belongs on the right: the outcome, not the output.
@@ -348,7 +401,11 @@ module Durable
         first == "(no matches)" ? "no matches" : "#{lines.size} #{tool == "grep" ? "hits" : "files"}"
       when "ls" then "#{lines.size} entries"
       when "write", "edit" then first
-      when "bash" then first == "(no output)" ? "ok" : "#{first}#{lines.size > 1 ? " +#{lines.size - 1}" : ""}"
+      when "bash"
+        # For a command, the last line is the answer; the first is scrollback.
+        return "ok" if first == "(no output)" || lines.empty?
+
+        lines.size > 1 ? "#{lines.last.to_s.gsub(/\s+/, " ")} · #{lines.size} lines" : first
       else first
       end
     end
@@ -425,6 +482,7 @@ module Durable
           end
           break if submit(shell_line ? "!#{text}" : text) == :exit
         when :complete then complete!
+        when :expand then expand_last_output
         when :interrupt then handle_interrupt
         when :eof then break
         when :clear
@@ -586,13 +644,19 @@ module Durable
       Thread.new do
         started = Time.now
         printed = 0
+        limit = @verbose ? 2000 : 40
         r = Durable::Tools.exec_stream(command, Dir.pwd, timeout: 600) do |chunk|
           chunk.each_line do |l|
             printed += 1
-            emit(s(:gray, "  #{clip(l.rstrip, width - 4)}")) if printed <= 200 || @verbose
+            emit(s(:gray, "  #{clip(l.rstrip, width - 4)}")) if printed <= limit
           end
         end
         code = r["exitCode"]
+        all = r["output"].lines.map(&:rstrip)
+        remember_output({ "toolName" => "!#{command.split.first}" }, all)
+        if all.size > printed || printed > limit
+          emit(s(:dim, "  … #{all.size - [printed, limit].min} more lines · ctrl-o to expand"))
+        end
         emit(Term.two_column("  #{code.zero? ? s(:green, "ok") : s(:red, "exit #{code}")}",
                              s(:dim, "#{(Time.now - started).round(1)}s"), width))
         res = lane_handle.append_bash(command, Durable::Tools.clip(r["output"]), code)
@@ -686,6 +750,8 @@ module Durable
           emit("  thinking = #{lane_handle.state["thinkingLevel"]} (off|low|medium|high)")
         end
       when "tools" then cmd_tools(rest)
+      when "cache" then cmd_cache
+      when "output" then expand_last_output(rest.to_s.empty? ? -1 : -rest.to_i)
       when "state" then emit(JSON.pretty_generate(lane_handle.state))
       when "agents"
         if @h.agents_md.empty?
@@ -758,6 +824,14 @@ module Durable
                                s(:dim, "replay=#{d["replay"]}"), width))
         end
       end
+    end
+
+    def cmd_cache
+      c = lane_handle.state["cache"] || {}
+      rate = c["hitRate"] ? (c["hitRate"] * 100).round : nil
+      emit("  requests #{c["requests"]}  input #{tok(c["input"])}  cached #{tok(c["cacheRead"])}")
+      emit("  hit rate #{rate ? "#{rate}%" : "—"}#{c["misses"].to_i.positive? ? s(:red, "  misses #{c["misses"]}") : ""}")
+      emit(s(:dim, "  a cold start and each compaction cost one full prefix; steady state should be >80%"))
     end
 
     def cmd_lanes

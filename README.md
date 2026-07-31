@@ -159,6 +159,13 @@ deep copies and no isolation errors at runtime.
 * **A session goal.** `/goal <text>` writes a custom entry on the lane's branch and every
   request on that lane carries it in the system prompt. It is branch state, so it is
   per lane, survives compaction, and is a deferred write when set mid-run.
+* **Prompt caching, watched.** Providers report usage with `input` as the *total* prompt and
+  `cacheRead` as the part that was cached, so the hit rate is one division. Every request is
+  fingerprinted (system prompt, tool set, each message) and compared with the previous one:
+  a prefix that diverged prints a red `PROMPT CACHE INVALIDATED` with the reason and the
+  message index, and a provider that reports zero cached tokens for an unchanged prefix is
+  flagged as a miss. Deliberate breaks (a new goal, a model switch, a compaction) are
+  announced quietly instead. `/cache` shows the running hit rate — steady state is >90%.
 * **Hooks** (`before_run`, `before_tool`, `after_tool`, `transform_context`,
   `after_response`, `before_compaction`, `before_navigation`, `before_run_end`,
   `before_resume`) intercept; **events** only observe. `before_tool` fails closed.

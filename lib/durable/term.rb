@@ -167,6 +167,7 @@ module Durable
           nil
         when "\u000C" then :clear
         when "\t" then :complete
+        when "\u000F" then :expand
         when "\e" then :escape
         else
           return nil if char.ord < 32

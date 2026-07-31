@@ -2,6 +2,8 @@
 
 require "json"
 require "fileutils"
+require "tmpdir"
+require "securerandom"
 require_relative "ipc"
 
 module Durable
@@ -16,7 +18,11 @@ module Durable
   # unfinished call only when the tool_started record AND the current
   # declaration both say "safe".
   module Tools
-    MAX_OUTPUT = 40_000
+    MAX_OUTPUT = 50_000            # bytes kept in the tool result
+    MAX_OUTPUT_LINES = 2_000       # lines kept in the tool result
+    # Frozen on purpose: an unfrozen String constant is unreachable from a
+    # non-main Ractor, and every tool runs in one.
+    LOG_DIR = File.join(Dir.tmpdir, "rbagent").freeze
 
     module_function
 
@@ -86,12 +92,43 @@ module Durable
       r
     end
 
-    def error(text) = { "content" => [{ "type" => "text", "text" => text.to_s }], "isError" => true }
+    def error(text, details: nil)
+      r = { "content" => [{ "type" => "text", "text" => text.to_s }], "isError" => true }
+      r["details"] = details if details
+      r
+    end
 
+    # Big output does not belong in the context window, and it does not belong
+    # in /dev/null either: the whole thing goes to a log file and the result
+    # says where. The model can then read the parts it needs with `read`, and
+    # the UI can expand it without another tool call.
+    #
+    # => [text_for_the_model, details_hash_or_nil]
+    def overspill(text, kind)
+      text = text.to_s
+      lines = text.lines
+      return [text, nil] if text.bytesize <= MAX_OUTPUT && lines.size <= MAX_OUTPUT_LINES
+
+      FileUtils.mkdir_p(LOG_DIR)
+      path = File.join(LOG_DIR, "#{kind}-#{SecureRandom.hex(6)}.log")
+      File.write(path, text)
+
+      # Keep the tail: for builds, tests and long listings the end is the part
+      # that matters.
+      kept = lines.last(MAX_OUTPUT_LINES)
+      kept = kept.last(kept.size / 2) while kept.join.bytesize > MAX_OUTPUT && kept.size > 1
+      omitted = lines.size - kept.size
+      shown = kept.join
+      footer = "[Full output: #{path}. Truncated: #{kept.size} lines shown, " \
+               "#{omitted} earlier lines omitted (#{(MAX_OUTPUT / 1000.0).round(1)}KB limit)]"
+      [(shown.end_with?("\n") ? shown : "#{shown}\n") + footer,
+       { "logPath" => path, "totalLines" => lines.size, "shownLines" => kept.size,
+         "totalBytes" => text.bytesize }]
+    end
+
+    # Kept for callers that only need a hard cap (no file, no details).
     def clip(text)
-      return text if text.bytesize <= MAX_OUTPUT
-
-      "#{text.byteslice(0, MAX_OUTPUT)}\n… [truncated #{text.bytesize - MAX_OUTPUT} bytes]"
+      overspill(text, "clip").first
     end
 
     # ── handlers ────────────────────────────────────────────────────────────
@@ -167,11 +204,19 @@ module Durable
     end
 
     def tool_bash(args, cwd, cancel = nil)
+      started = Time.now
       r = exec_stream(args["command"], cwd, timeout: (args["timeout"] || 120).to_f, cancel: cancel)
-      text = clip(r["output"])
-      return error("Interrupted.\n#{text}") if r["cancelled"]
+      text, spill = overspill(r["output"], "bash")
+      took = Time.now - started
+      details = (spill || {}).merge("exitCode" => r["exitCode"], "durationMs" => (took * 1000).round)
+      return error("Interrupted after #{took.round(1)}s.\n#{text}") if r["cancelled"]
 
-      r["exitCode"].zero? ? ok(text.strip.empty? ? "(no output)" : text) : error("exit #{r["exitCode"]}\n#{text}")
+      slow = took > 1 ? "\n[Took #{took.round(1)}s]" : ""
+      if r["exitCode"].zero?
+        ok(text.strip.empty? ? "(no output)#{slow}" : "#{text}#{slow}", details: details)
+      else
+        error("exit #{r["exitCode"]}#{slow}\n#{text}", details: details)
+      end
     end
 
     def tool_read(args, cwd, cancel = nil)
@@ -183,7 +228,10 @@ module Durable
       limit = (args["limit"] || 2000).to_i
       slice = lines[(offset - 1)..]&.first(limit) || []
       numbered = slice.each_with_index.map { |l, i| format("%6d\t%s", offset + i, l) }.join
-      ok(clip(numbered.empty? ? "(empty)" : numbered), details: { "path" => path, "lines" => lines.size })
+      text, spill = overspill(numbered.empty? ? "(empty)" : numbered, "read")
+      remaining = lines.size - (offset - 1 + slice.size)
+      text += "\n[#{remaining} more lines; call read again with offset=#{offset + slice.size}]" if remaining.positive?
+      ok(text, details: { "path" => path, "lines" => lines.size }.merge(spill || {}))
     end
 
     def tool_write(args, cwd, cancel = nil)
@@ -215,7 +263,8 @@ module Durable
         full = File.join(dir, c)
         File.directory?(full) ? "#{c}/" : "#{c}\t#{File.size(full)}"
       end
-      ok(clip(rows.join("\n")))
+      text, spill = overspill(rows.join("\n"), "ls")
+      ok(text, details: spill)
     end
 
     def tool_glob(args, cwd, cancel = nil)
@@ -226,7 +275,8 @@ module Durable
       rescue StandardError
         0
       end) }.first(500)
-      ok(clip(hits.join("\n").then { _1.empty? ? "(no matches)" : _1 }))
+      text, spill = overspill(hits.join("\n").then { _1.empty? ? "(no matches)" : _1 }, "glob")
+      ok(text, details: spill)
     end
 
     def tool_grep(args, cwd, cancel = nil)
@@ -251,7 +301,8 @@ module Durable
       end
       return error("Interrupted.") if cancel&.call
 
-      ok(clip(out.join("\n").then { _1.empty? ? "(no matches)" : _1 }))
+      text, spill = overspill(out.join("\n").then { _1.empty? ? "(no matches)" : _1 }, "grep")
+      ok(text, details: spill)
     end
 
     STR = { "type" => "string" }.freeze

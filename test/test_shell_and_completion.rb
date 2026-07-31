@@ -135,4 +135,41 @@ Dir.mktmpdir do |dir|
   end
 end
 
+group "every tool survives being run inside a Ractor" do
+  # An unfrozen String constant is unreachable from a non-main Ractor and every
+  # tool runs in one — a mistake that only shows up at runtime, in the tool
+  # result, as an IsolationError. So: exercise all of them through spawn.
+  Dir.mktmpdir do |dir|
+    File.write(File.join(dir, "a.txt"), "hello\n")
+    args = { "bash" => { "command" => "echo hi" }, "read" => { "path" => "a.txt" },
+             "write" => { "path" => "w.txt", "content" => "x" },
+             "edit" => { "path" => "a.txt", "oldText" => "hello", "newText" => "bye" },
+             "ls" => { "path" => "." }, "glob" => { "pattern" => "*.txt" },
+             "grep" => { "pattern" => "bye" } }
+    Durable::Tools.names.each do |name|
+      result = Durable::IPC.decode(Durable::Tools.spawn(name, args.fetch(name), dir).value)
+      text = result["content"].map { _1["text"] }.join
+      check("#{name} runs in a Ractor without isolation errors") do
+        !text.include?("IsolationError") && !text.include?("ractor failed")
+      end
+    end
+  end
+end
+
+group "big output spills to a file instead of the context window" do
+  r = Durable::Tools.invoke("bash", { "command" => "seq 1 5000" }, Dir.pwd)
+  text = r["content"][0]["text"]
+  eq "the result is capped", 2001, text.lines.size
+  eq "it keeps the tail", true, text.include?("5000")
+  eq "and says where the rest is", true, text.lines.last.start_with?("[Full output: /tmp/rbagent/")
+  eq "with the counts", true, text.lines.last.include?("3000 earlier lines omitted")
+  path = r.dig("details", "logPath")
+  eq "the file has everything", 5000, File.readlines(path).size
+  eq "details carry the totals", [5000, 2000], [r.dig("details", "totalLines"), r.dig("details", "shownLines")]
+  eq "small output is untouched", "hi\n", Durable::Tools.invoke("bash", { "command" => "echo hi" }, Dir.pwd)
+                                                        .dig("content", 0, "text")
+  eq "slow commands report their duration", true,
+     Durable::Tools.invoke("bash", { "command" => "sleep 1.2" }, Dir.pwd).dig("content", 0, "text").include?("Took")
+end
+
 done
