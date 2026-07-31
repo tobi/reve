@@ -23,8 +23,18 @@ module Durable
           "messages" => to_provider_messages(messages),
           "stream" => true
         }
-        body["system"] = [{ "type" => "text", "text" => system }] if system && !system.empty?
-        body["tools"] = tools.map { tool_schema(_1) } unless tools.empty?
+        if system && !system.empty?
+          # Cache breakpoints: the system prompt never changes within a run, and
+          # the message tail is the longest stable prefix of the next request.
+          body["system"] = [{ "type" => "text", "text" => system,
+                              "cache_control" => { "type" => "ephemeral" } }]
+        end
+        unless tools.empty?
+          schemas = tools.map { tool_schema(_1) }
+          schemas.last["cache_control"] = { "type" => "ephemeral" }
+          body["tools"] = schemas
+        end
+        mark_cache_breakpoint(body["messages"])
         if thinking && thinking != "off" && model["reasoning"]
           budget = { "low" => 4000, "medium" => 10_000, "high" => 24_000 }[thinking] || 10_000
           budget = [budget, body["max_tokens"] - 1024].min
@@ -70,6 +80,15 @@ module Durable
           return acc.error("#{e.class}: #{e.message}", retryable: false)
         end
         acc.finish
+      end
+
+      # One breakpoint on the newest message: everything before it is the
+      # prefix the next request will reuse.
+      def mark_cache_breakpoint(messages)
+        last = messages.last or return
+
+        block = last["content"].is_a?(Array) ? last["content"].last : nil
+        block["cache_control"] = { "type" => "ephemeral" } if block.is_a?(Hash)
       end
 
       def parse_sse(block)
@@ -228,11 +247,16 @@ module Durable
           end
         end
 
+        # "input" is the *total* prompt size, with cacheRead/cacheWrite as
+        # subsets of it — anthropic reports uncached input, so add them back.
+        # Every consumer can then compute a hit rate the same way.
         def merge_usage(u)
-          @usage["input"] += u["input_tokens"].to_i
+          read = u["cache_read_input_tokens"].to_i
+          write = u["cache_creation_input_tokens"].to_i
+          @usage["input"] += u["input_tokens"].to_i + read + write
           @usage["output"] += u["output_tokens"].to_i
-          @usage["cacheRead"] += u["cache_read_input_tokens"].to_i
-          @usage["cacheWrite"] += u["cache_creation_input_tokens"].to_i
+          @usage["cacheRead"] += read
+          @usage["cacheWrite"] += write
         end
 
         def base

@@ -5,6 +5,7 @@ require_relative "store"
 require_relative "records"
 require_relative "agent_loop"
 require_relative "context"
+require "digest"
 
 module Durable
   # A lane: a named position in the tree plus the work serialized on it.
@@ -112,7 +113,8 @@ module Durable
           "model" => effective_model_spec,
           "thinkingLevel" => effective_thinking,
           "activeTools" => active_tool_names,
-          "goal" => current_goal
+          "goal" => current_goal,
+          "cache" => cache_stats
         }
       end
 
@@ -246,6 +248,7 @@ module Durable
           @session.append_entry(entry)
           emit("config_update", { "property" => arg["property"], "value" => arg["value"] })
         end
+        cache_break!("#{arg["property"]} changed")
         { "ok" => true }
       end
 
@@ -256,6 +259,7 @@ module Durable
         entry = { "type" => "custom", "id" => Ids.entry, "customType" => "goal",
                   "data" => { "text" => arg["text"].to_s } }
         write_entry(entry)
+        cache_break!("goal changed")
         { "ok" => true, "goal" => arg["text"] }
       end
 
@@ -396,17 +400,23 @@ module Durable
           emit("step_start", { "stepId" => stepid })
           model = effective_model
           @stream_message = { "role" => "assistant", "content" => [] }
+          # Fingerprint what is actually sent, after transform_context: a hook
+          # that rewrites history is the classic silent cache killer, and it is
+          # invisible from the entries alone.
+          messages = transform_context(context_messages)
+          prompt = @op.dig("intent", "systemPromptOverride") || system_prompt
+          check_cache_prefix(prompt, messages, tool_declarations)
           final = AgentLoop.stream_assistant(
-            context_messages,
-            { model: model, system_prompt: @op.dig("intent", "systemPromptOverride") || system_prompt,
+            messages,
+            { model: model, system_prompt: prompt,
               tools: tool_declarations, thinking_level: effective_thinking,
-              transform_context: method(:transform_context).to_proc,
               abort_check: -> { @abort } },
             method(:on_stream_event).to_proc
           )
           patched = hook_call("after_response", { "message" => final })
           final = patched["message"] if patched && patched["message"]
           @stream_message = nil
+          record_cache_usage(final["usage"])
 
           entry = @session.append_entry(Records.assistant_entry(final))
           emit("message_end", { "message" => final, "entryId" => entry["id"] })
@@ -603,6 +613,7 @@ module Durable
         # The leaf move and operation_finished are one atomic write.
         rec = Records.operation_finished(lane: @lane, run_id: @op["id"], outcome: "completed")
         @session.append_record(rec, move_lane: { "lane" => @lane, "to" => target })
+        cache_break!("navigation")
         emit("navigation_end", { "outcome" => "completed", "oldLeafId" => old_leaf, "newLeafId" => target,
                                  "summaryEntry" => summary_entry })
         run_id = @op["id"]
@@ -699,6 +710,7 @@ module Durable
                                     usage: usage
                                   ).merge("details" => prep["fileOps"]))
         emit("entry_added", { "entry" => entry })
+        cache_break!("compaction")
         :completed
       end
 
@@ -1019,6 +1031,93 @@ module Durable
           sleep 0.1
           slept += 0.1
         end
+      end
+
+      # ── prompt cache ─────────────────────────────────────────────────────
+      #
+      # Provider prefix caching is the difference between a cheap agent and an
+      # expensive one, and it is silent when it breaks: the run still works, it
+      # just costs ten times more. The lane therefore fingerprints every
+      # request prefix and says loudly when a request could not reuse the
+      # previous one.
+
+      def digest(obj)
+        Digest::SHA256.hexdigest(obj.is_a?(String) ? obj : JSON.generate(obj))[0, 16]
+      end
+
+      def cache_fingerprint(system, messages, tools)
+        { "system" => digest(system.to_s),
+          "tools" => digest(tools.map { _1["name"] }),
+          "messages" => messages.map { digest(_1) } }
+      end
+
+      # Record that the next prefix break is deliberate.
+      def cache_break!(cause) = @cache_break = cause
+
+      def check_cache_prefix(system, messages, tools)
+        fp = cache_fingerprint(system, messages, tools)
+        prev = @cache_fp
+        @cache_fp = fp
+        @cache_expected = false
+        return unless prev
+
+        reasons = []
+        reasons << "system prompt changed" if prev["system"] != fp["system"]
+        reasons << "tool set changed" if prev["tools"] != fp["tools"]
+        i = prev["messages"].each_index.find { |n| fp["messages"][n] != prev["messages"][n] }
+        if i
+          kind = messages[i] ? (messages[i]["role"] || "message") : "(dropped)"
+          reasons << "context diverged at message #{i + 1}/#{prev["messages"].size} (#{kind})"
+        end
+        if reasons.empty?
+          @cache_expected = true
+          return
+        end
+
+        # Some breaks are the price of something the user asked for: a new
+        # goal, a model switch, a compaction. Those are announced, not alarming.
+        deliberate = @cache_break
+        @cache_break = nil
+        emit("cache_invalidated", { "reasons" => reasons, "expected" => !deliberate.nil?,
+                                    "cause" => deliberate,
+                                    "keptPrefix" => i || prev["messages"].size,
+                                    "previousMessages" => prev["messages"].size,
+                                    "messages" => fp["messages"].size })
+        if deliberate
+          warn "\e[33m prompt cache reset (#{deliberate}): #{reasons.join("; ")}\e[0m"
+        else
+          warn_loudly("PROMPT CACHE INVALIDATED", reasons)
+        end
+      end
+
+      def record_cache_usage(usage)
+        return unless usage
+
+        input = usage["input"].to_i
+        read = usage["cacheRead"].to_i
+        @cache_stats ||= { "input" => 0, "cacheRead" => 0, "requests" => 0, "misses" => 0 }
+        @cache_stats["input"] += input
+        @cache_stats["cacheRead"] += read
+        @cache_stats["requests"] += 1
+        return unless @cache_expected && input > 1000 && read.zero?
+
+        @cache_stats["misses"] += 1
+        emit("cache_invalidated", { "reasons" => ["provider reported no cached tokens for an unchanged prefix"],
+                                    "input" => input })
+        warn_loudly("PROMPT CACHE MISS", ["identical prefix, #{input} input tokens, 0 cached"])
+      end
+
+      def cache_stats
+        st = @cache_stats || { "input" => 0, "cacheRead" => 0, "requests" => 0, "misses" => 0 }
+        total = st["input"].to_i
+        st.merge("hitRate" => total.positive? ? (st["cacheRead"].to_f / total).round(3) : nil)
+      end
+
+      # Loud on purpose: this is the failure mode nobody notices in a log.
+      def warn_loudly(title, reasons)
+        bar = "\e[41;97;1m #{title} \e[0m"
+        warn "#{bar} lane=#{@lane}"
+        reasons.each { warn "  \e[31m▸ #{_1}\e[0m" }
       end
 
       # ── hooks and events ─────────────────────────────────────────────────
