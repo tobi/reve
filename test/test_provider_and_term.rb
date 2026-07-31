@@ -1,0 +1,138 @@
+# frozen_string_literal: true
+
+require_relative "helper"
+require_relative "../lib/durable/term"
+include TestKit
+
+VLLM = { "provider" => "vllm", "modelId" => "glm52", "api" => "openai-responses",
+         "baseUrl" => "http://gb300:8000/v1", "apiKey" => "dummy", "reasoning" => true,
+         "maxTokens" => 4096, "contextWindow" => 250_000,
+         "compat" => { "supportsStore" => false, "supportsDeveloperRole" => false,
+                       "supportsReasoningEffort" => false, "maxTokensField" => "max_tokens" } }.freeze
+
+R = Durable::Provider::OpenAIResponses
+
+group "openai-responses: message conversion" do
+  input = R.to_input([
+                       { "role" => "user", "content" => [{ "type" => "text", "text" => "hi" }] },
+                       { "role" => "assistant", "stopReason" => "toolUse",
+                         "content" => [{ "type" => "text", "text" => "on it" },
+                                       { "type" => "toolCall", "id" => "c1", "name" => "ls",
+                                         "arguments" => { "path" => "." } }] },
+                       { "role" => "toolResult", "toolCallId" => "c1", "toolName" => "ls",
+                         "content" => [{ "type" => "text", "text" => "a.rb" }] }
+                     ])
+  eq "user text becomes input_text", "input_text", input[0].dig("content", 0, "type")
+  eq "assistant text goes in as a plain string", "on it", input[1]["content"]
+  eq "tool calls become function_call items", "function_call", input[2]["type"]
+  eq "arguments are a json string", '{"path":"."}', input[2]["arguments"]
+  eq "results are function_call_output", %w[function_call_output c1],
+     [input[3]["type"], input[3]["call_id"]]
+  eq "deferred assistant messages project to nothing", [],
+     R.to_input([{ "role" => "assistant", "stopReason" => "deferred", "content" => [] }])
+end
+
+group "openai-responses: orphaned tool calls are healed" do
+  input = R.to_input([
+                       { "role" => "assistant", "stopReason" => "toolUse",
+                         "content" => [{ "type" => "toolCall", "id" => "c9", "name" => "bash",
+                                         "arguments" => {} }] }
+                     ])
+  eq "a synthetic output is inserted", %w[function_call function_call_output], input.map { _1["type"] }
+  eq "for the same call", "c9", input[1]["call_id"]
+end
+
+group "openai-responses: streaming accumulation" do
+  acc = R::Accumulator.new(VLLM)
+  events = [
+    { "type" => "response.reasoning_text.delta", "delta" => "thinking…" },
+    { "type" => "response.output_text.delta", "delta" => "Hello " },
+    { "type" => "response.output_text.delta", "delta" => "world" },
+    { "type" => "response.output_item.added",
+      "item" => { "type" => "function_call", "id" => "i1", "call_id" => "call_1", "name" => "read" } },
+    { "type" => "response.function_call_arguments.delta", "item_id" => "i1", "delta" => '{"path":' },
+    { "type" => "response.function_call_arguments.done", "item_id" => "i1", "arguments" => '{"path":"x.rb"}' },
+    { "type" => "response.completed",
+      "response" => { "status" => "completed",
+                      "usage" => { "input_tokens" => 100, "output_tokens" => 20,
+                                   "input_tokens_details" => { "cached_tokens" => 40 } } } }
+  ]
+  deltas = []
+  events.each { |e| acc.handle(e) { |d| deltas << d["type"] } }
+  msg = acc.finish
+  eq "streamed both kinds of delta", %w[thinking_delta text_delta text_delta tool_call_start],
+     deltas.uniq.sort.then { deltas.first(4) }
+  eq "thinking captured", "thinking…", msg["content"][0]["thinking"]
+  eq "text captured", "Hello world", msg["content"][1]["text"]
+  eq "tool call parsed from the done event", { "path" => "x.rb" }, msg["content"][2]["arguments"]
+  eq "call id is the provider's call_id", "call_1", msg["content"][2]["id"]
+  eq "stop reason is toolUse", "toolUse", msg["stopReason"]
+  eq "usage mapped", [100, 20, 40], [msg["usage"]["input"], msg["usage"]["output"], msg["usage"]["cacheRead"]]
+end
+
+group "openai-responses: truncation and failure are in-band" do
+  acc = R::Accumulator.new(VLLM)
+  acc.handle({ "type" => "response.output_text.delta", "delta" => "partial" })
+  acc.handle({ "type" => "response.incomplete",
+               "response" => { "status" => "incomplete",
+                               "incomplete_details" => { "reason" => "max_output_tokens" }, "usage" => {} } })
+  eq "hitting the token cap is 'length'", "length", acc.finish["stopReason"]
+
+  failed = R::Accumulator.new(VLLM)
+  failed.handle({ "type" => "response.failed",
+                  "response" => { "status" => "failed", "error" => { "message" => "boom" }, "usage" => {} } })
+  m = failed.finish
+  eq "a failure never raises", "error", m["stopReason"]
+  eq "and carries the message", "boom", m["errorMessage"]
+end
+
+group "model resolution: provider-only asks the endpoint" do
+  cfg = { "providers" => { "vllm" => { "baseUrl" => "http://127.0.0.1:1", "api" => "openai-responses",
+                                       "models" => [{ "id" => "glm52", "contextWindow" => 250_000 }] } } }
+  m = Durable::Provider::Models.resolve(cfg, "vllm")
+  eq "unreachable endpoint falls back to the config", "glm52", m["modelId"]
+  eq "compat travels with the model", true, m.key?("compat")
+  eq "provider/model still works", "glm52", Durable::Provider::Models.resolve(cfg, "vllm/glm52")["modelId"]
+  eq "bare id still works", "glm52", Durable::Provider::Models.resolve(cfg, "glm52")["modelId"]
+  eq "unknown provider is nil", nil, Durable::Provider::Models.resolve(cfg, "nope/x")
+end
+
+group "term: right-aligned columns, like an RPROMPT" do
+  line = Durable::Term.two_column("left", "right", 20)
+  eq "padded to the column", 20, line.length
+  eq "right edge is the right text", true, line.end_with?("right")
+  eq "colour codes do not count toward width", 20,
+     Durable::Term.visible(Durable::Term.two_column("\e[1mleft\e[0m", "\e[2mright\e[0m", 20)).length
+  eq "no room means two lines", true, Durable::Term.two_column("x" * 18, "y" * 10, 20).include?("\n")
+  eq "clip keeps the ellipsis inside the budget", 10, Durable::Term.clip("x" * 40, 10).length
+end
+
+group "term: the line editor" do
+  l = Durable::Term::Line.new
+  "hello".each_char { l.feed(_1) }
+  eq "typing", "hello", l.buffer
+  l.feed("\u007F")
+  eq "backspace", "hell", l.buffer
+  l.feed("\u0001")           # home
+  l.feed("Y")
+  eq "insert at the cursor", "Yhell", l.buffer
+  l.feed("\u0015")           # kill to start
+  eq "ctrl-u", "hell", l.buffer
+  eq "enter submits", :submit, l.feed("\r")
+  eq "take clears and returns", ["hell", ""], [l.take, l.buffer]
+  eq "ctrl-c interrupts", :interrupt, l.feed("\u0003")
+  eq "ctrl-d on an empty line is eof", :eof, l.feed("\u0004")
+
+  "one".each_char { l.feed(_1) }
+  l.take
+  "two".each_char { l.feed(_1) }
+  l.take
+  l.feed_escape("[A")
+  eq "history up", "two", l.buffer
+  l.feed_escape("[A")
+  eq "history up again", "one", l.buffer
+  l.feed_escape("[B")
+  eq "history down", "two", l.buffer
+end
+
+done
