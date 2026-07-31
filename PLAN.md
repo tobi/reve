@@ -121,6 +121,11 @@ test/               parity + crash-site tests (§20)
     mechanically extracted file lists.
 14. **Session goal.** A `goal` custom entry on the branch, injected into the system prompt
     of every request on that lane.
+15. **openai-responses.** A second provider (the local vLLM endpoint is the default), with
+    per-provider quirks read from the `compat` block of models.json.
+16. **A terminal the renderer can print into.** Own the input line instead of handing it to
+    a readline library: cbreak mode, a small line editor, one screen primitive that hides
+    the input line, prints, and redraws it. Tool outcomes render right-aligned.
 
 ## 4. Scope cuts (explicit)
 

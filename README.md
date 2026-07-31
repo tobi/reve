@@ -48,9 +48,16 @@ bin/rbagent --list                   # sessions for this directory
 bin/test                             # the whole suite (~140 checks)
 ```
 
-Models come from `~/.pi/agent/models.json` (pi's format) or
-`~/.config/rbagent/models.json`; `-m provider/model-id`. The provider layer speaks
-`anthropic-messages` streaming, plus a scripted `fake` provider used by the tests.
+Models come from `~/.pi/agent/models.json` (pi's format) or `~/.config/rbagent/models.json`.
+`-m` takes `provider/model-id`, a bare `model-id`, or just a `provider` — the last form asks
+the endpoint what it is serving right now (`GET /v1/models`) and falls back to the configured
+list when it cannot be reached. The default is `vllm`, i.e. whatever the local inference
+server has loaded.
+
+The provider layer speaks `openai-responses` and `anthropic-messages` streaming, plus a
+scripted `fake` provider for the tests. Per-provider quirks live in the `compat` block of
+models.json (`maxTokensField`, `supportsDeveloperRole`, `supportsReasoningEffort`, …), not
+in the code.
 
 Sessions are JSONL, one file per session, one line per mutation:
 
@@ -110,6 +117,7 @@ deep copies and no isolation errors at runtime.
 | `lib/durable/agents_md.rb` | AGENTS.md discovery, static and nested-on-demand |
 | `lib/durable/skills.rb` | Agent Skills: SKILL.md discovery, validation, prompt section |
 | `lib/durable/compaction.rb` | cut point, kept suffix, structured summary, file lists |
+| `lib/durable/term.rb` | cbreak mode, a line editor, right-aligned columns |
 | `lib/durable/tui.rb` | the terminal client — an ordinary consumer of `watch()` |
 
 ## What the harness gives you
@@ -123,7 +131,8 @@ deep copies and no isolation errors at runtime.
   dies on abort; next-run survives.
 * **Deferred writes.** `set_model` and friends mid-step become `write_deferred` records
   and land after the in-flight assistant message — never before it.
-* **Abort.** Durable on return; reconciliation (synthetic tool results, closing message,
+* **Abort.** Signals the running tool (its Ractor gets a cancel message and kills its child
+  process), durable on return; reconciliation (synthetic tool results, closing message,
   `operation_finished aborted`) finishes in the background, and completes on resume if the
   process dies first.
 * **Retries.** The attempt count is a record, so a crash-restart loop cannot reset it.
