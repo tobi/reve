@@ -25,7 +25,10 @@ module Durable
     # activated in /etc/profile.d, so `sh -lc` picks it up like a login shell).
     APT_PACKAGES = %w[ca-certificates curl git build-essential jq unzip
                       ripgrep fd-find file less].freeze
-    MISE_TOOLS = %w[node@lts].freeze
+    # mise supplies what apt does not: the runtimes, plus gh and ast-grep, both
+    # of which come from GitHub releases — which the egress policy already
+    # allows, because that is the one place it allows.
+    MISE_TOOLS = %w[node@lts gh ast-grep].freeze
 
     DEFAULTS = Ractor.make_shareable({
       "backend" => "auto",

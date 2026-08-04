@@ -86,23 +86,35 @@ Launch `rbagent` in a directory and it takes its setup from the files it finds �
 ```
 $ rbagent init
 initialised /tmp/agentdir
+  + agent.rb
   + instructions.md
   + tools/example.rb
   + skills/release-notes/SKILL.md
   + sandbox/sandbox.rb
   + AGENTS.md
+  + workspace/AGENTS.md
 
   edit instructions.md, then run rbagent in this directory
 ```
 
+rbagent refuses to start anywhere else: an agent with no instructions is a chat window
+with your filesystem attached. `rbagent init` makes one; `rbagent --plain` overrides.
+
 ```
-instructions.md        what this agent is and how it works — all you need
-agent.rb               optional: model, thinking, active tools, sandbox
-tools/*.rb             optional: tools in the Ruby DSL
-skills/*/SKILL.md      optional: skills (also .agents/skills, .pi/skills)
-sandbox/sandbox.rb     optional: swap the sandbox backend or bootstrap it
+instructions.md        what this agent is and how it works
+agent.rb               its configuration: model, thinking, tools, sandbox
+tools/*.rb             tools in the Ruby DSL
+skills/*/SKILL.md      skills (also .agents/skills, .pi/skills)
+sandbox/sandbox.rb     swap the sandbox backend or bootstrap it
+workspace/             the work: /workspace in the sandbox, cwd for every command
 .rbagent/sessions/     the durable logs of this agent's runs
 ```
+
+The split matters: the agent's own definition lives in the agent directory, and the
+material it works on lives in `workspace/`, which is mounted at `/workspace` and is the
+working directory for every command — so a relative path means the same thing on the host
+and inside the VM. `workspace/AGENTS.md` ships pointing at the toolchain (`fd`, `rg`,
+`ast-grep`, `jq`, `gh`, `mise`), and both AGENTS.md files are in scope, outermost first.
 
 The prompt is a *list* of files, not one file: `instructions.md` is the job, `SOUL.md` is the
 character, and `agent.rb` can name as many as you like — each arrives in its own tagged
@@ -131,10 +143,31 @@ You are haiku-bot. You answer everything as a single haiku, then stop.
 Nothing is required: in a plain checkout with none of these files rbagent is still an
 ordinary coding agent, which is why it works in any repository.
 
-## Tools are Ruby
+## Tools are Ruby, and they can be typed
 
 `tools/` is a folder of small Ruby files. The typed declarations become the JSON schema the
 model sees, and `replay` is the recovery contract from the harness design.
+
+A tool's parameters are a type signature, and Ruby has a notation for that — so write the
+signature as an **RBS comment** and the schema is derived from it, once:
+
+```ruby
+tool "weather" do
+  # Get the weather for a city.
+  # @param city  City name, e.g. "Berlin"
+  #: (city: String, ?units: ("metric" | "imperial"), ?days: Integer) -> String
+  replay :safe
+  run do |city:, units: "metric", days: 1, ctx:|
+    ctx.sh("curl -s wttr.in/#{city}?#{units == "metric" ? "m" : "u"}")
+  end
+end
+```
+
+The model receives `city` (required string), `units` (an **enum** of the two literals) and
+`days` (integer), each with the `@param` line as its description, and the block is called
+with keywords — defaults included, `ctx:` injected if it asks. RBS ships with Ruby, so its
+real parser does the work; a small fallback parser covers the common forms when it is
+absent. `sig/durable.rbs` describes the library itself, and `rake rbs` keeps it honest.
 
 ```ruby
 tool "syllables" do

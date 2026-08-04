@@ -44,6 +44,7 @@ OptionParser.new do |o|
   end
   o.on("-p", "--print PROMPT", "run one prompt non-interactively and exit") { options[:print] = _1 }
   o.on("--memory", "keep the session in memory only") { options[:storage] = "memory" }
+  o.on("--plain", "run in a directory that is not an agent directory") { options[:plain] = true }
   o.on("--list", "list sessions for this directory") { options[:list] = true }
   o.on("-h", "--help") do
     puts o
@@ -52,6 +53,21 @@ OptionParser.new do |o|
 end.parse!
 
 prompt_arg = ARGV.join(" ") unless ARGV.empty?
+
+# rbagent runs *an agent*, and an agent is a directory. Without one there is
+# nothing to run, so say what is missing and how to make it rather than starting
+# a personality-free chat session in someone's checkout.
+unless options[:plain] || Durable::Project.agent_dir?(options[:cwd])
+  warn "\e[1mnot an agent directory\e[0m: #{options[:cwd]}"
+  warn ""
+  warn "  an agent needs at least one of:"
+  warn "    instructions.md   what the agent is and how it works"
+  warn "    agent.rb          its configuration (model, tools, sandbox)"
+  warn ""
+  warn "  \e[1mrbagent init\e[0m           scaffold one here"
+  warn "  \e[1mrbagent --plain\e[0m        run without one anyway"
+  exit 1
+end
 
 # An agent directory keeps its sessions with itself; a plain checkout keeps them
 # under ~/.rbagent.

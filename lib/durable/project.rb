@@ -34,6 +34,13 @@ module Durable
 
     def self.load(root = Dir.pwd, user_skills: true) = new(root, user_skills: user_skills)
 
+    # What makes a directory an agent directory. rbagent refuses to launch
+    # without one, because an agent with no instructions is just a chat window
+    # with your filesystem attached.
+    def self.agent_dir?(root = Dir.pwd)
+      (INSTRUCTIONS + AGENT_FILES + EXTRA_PROMPT_FILES).any? { File.file?(File.join(root, _1)) }
+    end
+
     def initialize(root = Dir.pwd, user_skills: true)
       @root = File.expand_path(root)
       @user_skills = user_skills
@@ -51,6 +58,19 @@ module Durable
     end
 
     def agent? = !@instructions_path.nil? || !@prompt_sources.empty?
+
+    # Where the work happens. The agent directory holds the agent — its
+    # instructions, tools, skills — and workspace/ holds the material it works
+    # on. That split is what makes the sandbox mapping obvious: workspace/ is
+    # /workspace inside the VM, and the agent's own definition is not in it.
+    WORKSPACE = "workspace"
+
+    def workspace_dir
+      dir = File.join(@root, WORKSPACE)
+      File.directory?(dir) ? dir : @root
+    end
+
+    def workspace? = File.directory?(File.join(@root, WORKSPACE))
     def name = @config["name"] || File.basename(@root)
     def sessions_dir = File.join(@root, ".rbagent", "sessions")
 
@@ -90,13 +110,12 @@ module Durable
     # default; agent.rb may name more (or different ones), and a SOUL.md next to
     # it is picked up on its own.
     def load_prompt_files
-      listed = @config["promptFiles"]
-      paths =
-        if listed && !listed.empty?
-          listed
-        else
-          EXTRA_PROMPT_FILES.select { File.file?(File.join(@root, _1)) }
-        end
+      # A listed file is deliberate and keeps its position; a SOUL.md that
+      # simply exists is appended. Dropping one next to a scaffolded agent
+      # should work without editing agent.rb.
+      listed = @config["promptFiles"] || []
+      extras = EXTRA_PROMPT_FILES.select { File.file?(File.join(@root, _1)) }
+      paths = (listed + extras).uniq
       paths.each do |rel|
         path = File.expand_path(rel, @root)
         next if @prompt_sources.any? { _1["path"] == path }
@@ -207,7 +226,7 @@ module Durable
           {}
         end
       @sandbox_config = Sandbox.config(from_file.merge(@config["sandbox"] || {}))
-                               .merge("hostWorkspace" => @root)
+                               .merge("hostWorkspace" => workspace_dir)
     end
 
     def load_skills
@@ -222,8 +241,8 @@ module Durable
     # authority; the harness preamble stays because a model still needs to know
     # which tools exist and how this loop behaves.
     def system_prompt(tools: nil, sandbox: nil)
-      base = Prompt.system_prompt(cwd: @root, tools: tools, agents: AgentsMd.discover(@root),
-                                 skills: @skills)
+      base = Prompt.system_prompt(cwd: workspace_dir, tools: tools,
+                                  agents: AgentsMd.discover(workspace_dir), skills: @skills)
       parts = [base]
       sources = @prompt_sources.reject { _1["content"].to_s.empty? }
       unless sources.empty?
@@ -241,10 +260,25 @@ module Durable
     # ── scaffolding ───────────────────────────────────────────────────────
 
     SCAFFOLD = {
+      "agent.rb" => <<~'RUBY',
+        # What this agent is, in code. instructions.md is its prose; this file is
+        # its configuration.
+
+        agent do
+          model "vllm"                 # provider, provider/model-id, or model-id
+          thinking :off                # off | low | medium | high
+
+          # The prompt is a list of files, in order. instructions.md is the job;
+          # add a SOUL.md for voice and taste, or any other file you like.
+          instructions "instructions.md"
+
+          # tools :read, :write, :edit, :bash   # restrict the active set
+          # sandbox :auto                       # :microsandbox | :local
+        end
+      RUBY
       "instructions.md" => <<~'MD',
         ---
         name: %<name>s
-        model: vllm
         ---
 
         You are %<name>s, an agent that works in this directory.
@@ -255,6 +289,8 @@ module Durable
 
         - Read before you change. Verify after you change.
         - Prefer small, reviewable steps.
+        - Work in workspace/ — it is /workspace in the sandbox and your working
+          directory. rg, fd, ast-grep, jq, gh and mise are all available there.
       MD
       "tools/example.rb" => <<~'RUBY',
         # Tools are Ruby. One file may define several.
@@ -295,10 +331,13 @@ module Durable
       "sandbox/sandbox.rb" => <<~'RUBY',
         # The sandbox every command runs in.
         #
+        # workspace/ is mounted at /workspace and is the working directory, so a
+        # relative path means the same thing on the host and in the VM. The agent's
+        # own files (instructions.md, tools/, skills/) stay outside it.
+        #
         # The default is `:auto`: a microVM when microsandbox is installed, this
         # machine otherwise. The VM is debian with the tools an agent reaches for
-        # (git, ripgrep, fd, jq, build-essential) and mise for language runtimes,
-        # activated for every shell.
+        # (git, rg, fd, jq, gh, ast-grep, mise) and mise activated for every shell.
         #
         # Egress is deny-by-default: github.com only, using your own GitHub
         # credential — lent to the sandbox through microsandbox's secret proxy, so
@@ -321,21 +360,43 @@ module Durable
           # bootstrap "bundle install"
         end
       RUBY
-      "SOUL.md" => <<~'MD',
-        You are %<name>s.
-
-        instructions.md is the job; this file is the character. Voice, taste, what you
-        refuse to do, how you talk to the user. Both files go into every request, in
-        order, and `agent.rb` can name more of them.
-      MD
-      "AGENTS.md" => <<~'MD'
+      "AGENTS.md" => <<~'MD',
         # %<name>s
 
-        Conventions for anyone — human or agent — working in this directory.
+        This directory *is* the agent: instructions.md and SOUL.md are its prompt,
+        agent.rb its configuration, tools/ its tools, skills/ its skills.
 
-        - (add yours here)
+        The work happens in workspace/, which is mounted at /workspace in the sandbox
+        and is the working directory for every command. Keep the agent's own files out
+        of it.
       MD
+      "workspace/AGENTS.md" => <<~'MD',
+        # workspace
+
+        This is the working directory: /workspace inside the sandbox, and where every
+        command starts. Whatever the agent is asked to build, clone or edit lives here.
+
+        Tools available in the sandbox (all on PATH, mise-managed where noted):
+
+        | tool        | use it for                                              |
+        |-------------|---------------------------------------------------------|
+        | `fd`        | finding files by name — faster and quieter than `find`   |
+        | `rg`        | searching file contents (ripgrep); use `-n` for lines    |
+        | `ast-grep`  | structural search and rewrite by syntax, not by regex    |
+        | `jq`        | slicing JSON from APIs and config                       |
+        | `gh`        | GitHub: issues, PRs, releases, `gh api` for the rest     |
+        | `mise`      | language runtimes and CLIs: `mise use -g python@3.12`    |
+        | `git`       | as usual; the host's GitHub credential is already lent   |
+
+        Prefer `rg` over `grep -r`, `fd` over `find`, and `ast-grep` when the pattern is
+        about code structure rather than text. `mise install` picks up a .tool-versions
+        or mise.toml in this directory.
+      MD
+      "workspace/.gitkeep" => ""
     }.freeze
+
+    # Entries written verbatim, without format() — no %<name>s in them.
+    VERBATIM = ["workspace/.gitkeep"].freeze
 
     def self.init(root = Dir.pwd, name: nil, force: false)
       root = File.expand_path(root)
@@ -349,7 +410,7 @@ module Durable
           next
         end
         FileUtils.mkdir_p(File.dirname(path))
-        File.write(path, format(template, name: name))
+        File.write(path, VERBATIM.include?(rel) ? template : format(template, name: name))
         created << rel
       end
       FileUtils.mkdir_p(File.join(root, ".rbagent", "sessions"))

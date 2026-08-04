@@ -134,8 +134,13 @@ test/               parity + crash-site tests (§20)
 
 An agent is a directory, and the files in it are its definition: `instructions.md` (the
 authority in the system prompt), `agent.rb` (config), `tools/*.rb` (Ruby DSL), `skills/`,
-`sandbox/sandbox.rb`, and `.rbagent/sessions/` for the durable logs. `rbagent init`
-scaffolds all of it. Nothing is required — with no files, rbagent is a plain coding agent.
+`sandbox/sandbox.rb`, `workspace/` (the work), and `.rbagent/sessions/` for the durable
+logs. `rbagent init` scaffolds all of it, and rbagent refuses to launch outside such a
+directory (`--plain` overrides).
+
+`workspace/` is the working directory for every tool and is mounted at `/workspace` in the
+sandbox, so relative paths mean the same thing on both sides and the agent's own files are
+not in the material it edits.
 
 Two Ractor consequences shape the implementation:
 
@@ -145,6 +150,17 @@ Two Ractor consequences shape the implementation:
   replay safety and recovery are unchanged.
 * The sandbox holds a live connection (a microVM handle), so it lives in the host Ractor too,
   and sandboxed tools are host-run by construction.
+
+## 3a2. Typed tools
+
+A tool's parameters are a type signature. RBS comments above the `run` block
+(`#: (city: String, ?units: ("metric" | "imperial")) -> String`) are read from the source
+via `Proc#source_location`, parsed by RBS when it is available and by a small fallback
+parser when it is not, and turned into the JSON schema the model sees — literal unions
+become enums, `@param` lines become descriptions, `Proc#parameters` decides requiredness.
+Typed blocks are invoked with keywords; the older `|args, ctx|` form still works.
+
+`sig/durable.rbs` covers the library's public surface and `rake rbs` resolves it.
 
 ## 3b. Sandbox policy
 

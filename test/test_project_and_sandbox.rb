@@ -7,11 +7,17 @@ group "rbagent init scaffolds an agent directory" do
   Dir.mktmpdir do |dir|
     result = Durable::Project.init(dir, name: "notes-bot")
     eq "instructions.md is the centre of it", true, result["created"].include?("instructions.md")
-    eq "with tools, skills, a soul and a sandbox alongside",
-       %w[AGENTS.md SOUL.md sandbox/sandbox.rb skills/release-notes/SKILL.md tools/example.rb],
+    eq "agent.rb carries the configuration", true, result["created"].include?("agent.rb")
+    eq "with tools, skills and a sandbox alongside",
+       %w[AGENTS.md sandbox/sandbox.rb skills/release-notes/SKILL.md tools/example.rb],
        (result["created"] & %w[tools/example.rb skills/release-notes/SKILL.md sandbox/sandbox.rb
-                               SOUL.md AGENTS.md]).sort
+                               AGENTS.md]).sort
+    eq "no SOUL.md unless you want one", false, result["created"].include?("SOUL.md")
+    eq "the directory is now an agent directory", true, Durable::Project.agent_dir?(dir)
     eq "sessions live with the agent", true, File.directory?(File.join(dir, ".rbagent", "sessions"))
+    eq "workspace/ is where the work goes", true, File.directory?(File.join(dir, "workspace"))
+    eq "with its own AGENTS.md naming the tools", true,
+       %w[fd rg ast-grep jq gh mise].all? { File.read(File.join(dir, "workspace", "AGENTS.md")).include?("`#{_1}`") }
     eq "and are not committed", true, File.read(File.join(dir, ".gitignore")).include?(".rbagent/")
     again = Durable::Project.init(dir)
     eq "running init twice changes nothing", [], again["created"] - [".gitignore"]
@@ -26,13 +32,17 @@ Dir.mktmpdir do |root|
     p = Durable::Project.load(root, user_skills: false)
     eq "it knows it is an agent", true, p.agent?
     eq "name from frontmatter", "notes-bot", p.name
-    eq "model from frontmatter", "vllm", p.config["model"]
+    eq "model comes from agent.rb", "vllm", p.config["model"]
+    eq "thinking too", "off", p.config["thinkingLevel"]
     eq "instructions are the body, not the frontmatter", false, p.instructions.include?("name: notes-bot")
     eq "tools/ loaded", %w[sandboxed_uname word_count], p.tools.map(&:name).sort
     eq "skills/ loaded", ["release-notes"], p.skills.map { _1["name"] }
     eq "sandbox is auto: a microVM when one is available", "auto", p.sandbox_config["backend"]
     eq "no diagnostics for the scaffold", [], p.diagnostics
     eq "sessions dir", File.join(root, ".rbagent", "sessions"), p.sessions_dir
+    eq "workspace is the working directory", File.join(root, "workspace"), p.workspace_dir
+    eq "and it is what the sandbox mounts", File.join(root, "workspace"), p.sandbox_config["hostWorkspace"]
+    eq "at /workspace", "/workspace", p.sandbox_config["workdir"]
   end
 
   group "the system prompt carries the instructions as the authority" do
@@ -58,8 +68,9 @@ Dir.mktmpdir do |root|
   end
 
   group "a project tool runs, and its return value is normalised" do
-    File.write(File.join(root, "sample.txt"), "one two three\nfour five\n")
-    sandbox = Durable::Sandbox.resolve(Durable::Sandbox.config("hostWorkspace" => root), warn_io: nil)
+    File.write(File.join(root, "workspace", "sample.txt"), "one two three\nfour five\n")
+    sandbox = Durable::Sandbox.resolve(Durable::Sandbox.config("hostWorkspace" => File.join(root, "workspace")),
+                                       warn_io: nil)
     ctx = Durable::ToolDSL::Context.new(sandbox: sandbox, cwd: root)
     p = Durable::Project.load(root, user_skills: false)
     result = Durable::ToolDSL.invoke(p.tool("word_count"), { "path" => "sample.txt" }, ctx)
@@ -101,7 +112,7 @@ Dir.mktmpdir do |root|
     h, = Durable::Harness.create(storage: "memory", model: model, cwd: root, user_skills: false)
     eq "project tools are active", true, h.state["activeTools"].include?("word_count")
     eq "built-ins are still there", true, h.state["activeTools"].include?("bash")
-    eq "sandbox reported", "local (no isolation) → #{root}", h.sandbox.describe
+    eq "sandbox reported", "local (no isolation) → #{File.join(root, "workspace")}", h.sandbox.describe
     r = h.prompt("count the words in sample.txt")
     eq "the run completed", true, r["ok"]
     result = entries_of(h.session).find { _1.dig("message", "role") == "toolResult" }
@@ -111,6 +122,17 @@ Dir.mktmpdir do |root|
        File.readlines("#{ENV["DURABLE_FAKE_SCRIPT"]}.requests")
            .last.include?("word_count")
     h.close
+  end
+end
+
+group "a directory has to look like an agent" do
+  Dir.mktmpdir do |dir|
+    eq "an empty directory is not one", false, Durable::Project.agent_dir?(dir)
+    File.write(File.join(dir, "instructions.md"), "Be useful.")
+    eq "instructions.md is enough", true, Durable::Project.agent_dir?(dir)
+    File.delete(File.join(dir, "instructions.md"))
+    File.write(File.join(dir, "agent.rb"), "agent { model \"vllm\" }")
+    eq "so is agent.rb", true, Durable::Project.agent_dir?(dir)
   end
 end
 
@@ -149,7 +171,8 @@ group "the prompt is a list of files, so SOUL.md can join it" do
     p3 = Durable::Project.load(root, user_skills: false)
     eq "a missing prompt file is a diagnostic", true,
        p3.diagnostics.any? { _1["message"] == "prompt file not found" }
-    eq "and the rest still load", 1, p3.prompt_sources.size
+    eq "and the rest still load", %w[instructions.md SOUL.md],
+       p3.prompt_sources.map { File.basename(_1["path"]) }
   end
 end
 
@@ -171,19 +194,42 @@ group "inline instructions in agent.rb work too" do
   end
 end
 
+group "the workspace is mapped, and the agent's own files are not" do
+  Dir.mktmpdir do |root|
+    Durable::Project.init(root, name: "mapped")
+    model = fake_model(root, [assistant_tool("bash", { "command" => "pwd" }), assistant_text("done")])
+    h, = Durable::Harness.create(storage: "memory", model: model, cwd: root, user_skills: false)
+    eq "tools run in workspace/", File.join(root, "workspace"), h.config["cwd"]
+    eq "the agent directory is remembered separately", root, h.config["agentRoot"]
+    eq "the sandbox mounts workspace/ at /workspace",
+       [File.join(root, "workspace"), "/workspace"],
+       [Durable::Sandbox.create_options(h.sandbox.config, h.sandbox.host_workspace,
+                                        h.sandbox.workdir).dig("volumes", "/workspace", "bind"),
+        h.sandbox.workdir]
+    eq "both AGENTS.md files are in scope, outermost first",
+       [File.join(root, "AGENTS.md"), File.join(root, "workspace", "AGENTS.md")],
+       h.agents_md.map { _1["path"] }
+    h.prompt("where are you?")
+    result = entries_of(h.session).find { _1.dig("message", "role") == "toolResult" }
+    eq "and a command really starts there", true,
+       result.dig("message", "content", 0, "text").lines.first.strip == File.join(root, "workspace")
+    h.close
+  end
+end
+
 group "sandbox: default image comes with the tools an agent reaches for" do
   cfg = Durable::Sandbox.config({})
   eq "debian", "debian:trixie-slim", cfg["image"]
   eq "ripgrep and fd are in the package list", true,
      (cfg["packages"] & %w[ripgrep fd-find]).size == 2
-  eq "mise supplies runtimes", ["node@lts"], cfg["mise"]
+  eq "mise supplies runtimes and the github/ast tools", %w[node@lts gh ast-grep], cfg["mise"]
   script = Durable::Sandbox.provision_script(cfg)
   eq "mise is installed", true, script.include?("https://mise.run")
   eq "and activated for every shell", true, script.include?("/etc/profile.d/10-mise.sh")
   eq "shims go on PATH, because /bin/sh is dash", true, script.include?("mise/shims")
   eq "fd gets its familiar name", true, script.include?("ln -sf /usr/bin/fdfind")
   eq "provisioning is idempotent", true, script.include?("[ -f /var/lib/rbagent/provisioned ]")
-  eq "runtimes installed globally", true, script.include?("mise use -g node@lts")
+  eq "runtimes installed globally", true, script.include?("mise use -g node@lts gh ast-grep")
 end
 
 group "sandbox: egress is deny-by-default, github only" do

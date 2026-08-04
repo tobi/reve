@@ -47,7 +47,10 @@ module Durable
       @model = spec.is_a?(String) ? Provider::Models.resolve(@models_config, spec) : spec
       raise ArgumentError, "unknown model #{spec.inspect}" if @model.nil?
 
-      @agents = agents_md ? AgentsMd.discover(cwd) : []
+      # Discovery starts where the work is: workspace/AGENTS.md is the closest
+      # file and the agent directory's is the outer one, which is the order the
+      # prompt wants them in.
+      @agents = agents_md ? AgentsMd.discover(@project&.workspace_dir || cwd) : []
       @agents_loaded = @agents.map { _1["path"] }
       loaded = skills ? Skills.load(cwd: cwd, extra_dirs: skill_dirs, user: user_skills)
                       : { "skills" => [], "diagnostics" => [] }
@@ -66,7 +69,10 @@ module Durable
         "thinkingLevel" => thinking_level || @project&.config&.dig("thinkingLevel") || "off",
         "retry" => retry_policy || @project&.config&.dig("retry") || { "maxAttempts" => 5, "baseMs" => 500 },
         "compaction" => compaction || @project&.config&.dig("compaction") || { "threshold" => 0.8 },
-        "cwd" => cwd,
+        # Tools run where the work is: workspace/ when the agent has one, so the
+        # host and the sandbox agree about what "." means.
+        "cwd" => @project&.workspace_dir || cwd,
+        "agentRoot" => cwd,
         "toolExecution" => tool_execution
       }
       @hooks = {}
