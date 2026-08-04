@@ -45,7 +45,9 @@ bin/rbagent -p "fix the failing test"   # one-shot, streams to stdout
 bin/rbagent -c                       # continue the newest session for this directory
 bin/rbagent -r                       # continue and resume whatever a crash left open
 bin/rbagent --list                   # sessions for this directory
-bin/test                             # the whole suite (~140 checks)
+bin/test                             # the whole suite
+rake install                         # build and install the gem locally
+rake test lint version               # the rest of the tasks
 ```
 
 Models come from the bundled `models.yml` in the repo root, overridden by
@@ -102,6 +104,17 @@ sandbox/sandbox.rb     optional: swap the sandbox backend or bootstrap it
 .rbagent/sessions/     the durable logs of this agent's runs
 ```
 
+The prompt is a *list* of files, not one file: `instructions.md` is the job, `SOUL.md` is the
+character, and `agent.rb` can name as many as you like — each arrives in its own tagged
+block, in order.
+
+```ruby
+agent do
+  model "vllm"
+  instructions "instructions.md", "SOUL.md", "docs/style.md"
+end
+```
+
 `instructions.md` carries frontmatter for the things an agent needs to say about itself,
 and its body becomes the authority in the system prompt:
 
@@ -147,16 +160,30 @@ shadow a built-in.
 
 ## Sandbox
 
-Every agent has a sandbox: the place its commands run. `sandbox/sandbox.rb` swaps the
-backend, and nothing else in the agent changes.
+Every agent has a sandbox: the place its commands run. The default is `:auto` — a microVM
+when microsandbox is installed, this machine otherwise — and it comes provisioned:
+debian with git, ripgrep, fd, jq and build-essential, plus **mise** for language runtimes,
+activated for every shell (shims on `PATH`, because `/bin/sh` is dash). Provisioning runs
+once per named sandbox, so the second launch boots straight into a ready toolchain.
+
+**Egress is deny-by-default: github.com and nothing else.** An agent that can reach the
+whole internet is an agent that can exfiltrate the whole workspace. And it reaches GitHub
+as *you*: the host's credential (`$GITHUB_TOKEN`, `gh auth token`, or the git credential
+helper) is lent to the sandbox as a microsandbox secret — scoped to the GitHub hosts,
+substituted into requests by the proxy, and never present inside the VM.
 
 ```ruby
 sandbox do
-  backend :microsandbox      # a local microVM; :local runs on this machine
-  image "python:3.12"
-  cpus 2
-  memory 2048
-  bootstrap "pip install -r requirements.txt"
+  backend :auto              # :microsandbox to insist, :local to opt out
+  mise "node@lts", "python@3.12"
+  packages "postgresql-client"
+
+  allow "rubygems.org"                            # add to the egress allowlist
+  # allow_all                                     # opt out of the policy
+  # github_auth false                             # do not lend the token
+  secret "OPENAI_API_KEY", hosts: ["api.openai.com"]
+
+  bootstrap "bundle install"
 end
 ```
 

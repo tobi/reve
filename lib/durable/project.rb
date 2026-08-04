@@ -23,9 +23,14 @@ module Durable
   # still works.
   class Project
     INSTRUCTIONS = %w[instructions.md INSTRUCTIONS.md].freeze
+    # Files that join the prompt without being asked for, when they exist. A
+    # SOUL.md is a common second file: instructions.md is the job, SOUL.md is
+    # the character.
+    EXTRA_PROMPT_FILES = %w[SOUL.md agent/SOUL.md .rbagent/SOUL.md].freeze
     AGENT_FILES = %w[agent.rb .rbagent/agent.rb].freeze
 
-    attr_reader :root, :instructions, :config, :tools, :sandbox_config, :diagnostics, :skills
+    attr_reader :root, :instructions, :config, :tools, :sandbox_config, :diagnostics, :skills,
+                :prompt_sources
 
     def self.load(root = Dir.pwd, user_skills: true) = new(root, user_skills: user_skills)
 
@@ -35,15 +40,17 @@ module Durable
       @diagnostics = []
       @instructions_path = INSTRUCTIONS.map { File.join(@root, _1) }.find { File.file?(_1) }
       @instructions = nil
+      @prompt_sources = []
       @config = {}
       load_instructions
       load_agent_file
+      load_prompt_files
       load_tools
       load_sandbox
       load_skills
     end
 
-    def agent? = !@instructions_path.nil?
+    def agent? = !@instructions_path.nil? || !@prompt_sources.empty?
     def name = @config["name"] || File.basename(@root)
     def sessions_dir = File.join(@root, ".rbagent", "sessions")
 
@@ -63,6 +70,7 @@ module Durable
 
       fm, body = Frontmatter.parse(File.read(@instructions_path))
       @instructions = body.strip
+      @prompt_sources << { "path" => @instructions_path, "content" => @instructions }
       @config["name"] = fm["name"] if fm["name"]
       @config["model"] = fm["model"] if fm["model"]
       @config["thinkingLevel"] = fm["thinking"] if fm["thinking"]
@@ -76,6 +84,39 @@ module Durable
       return value if value.is_a?(Array)
 
       value.to_s.split(/[\s,]+/).reject(&:empty?)
+    end
+
+    # The prompt is a list of files, not one file. instructions.md is the
+    # default; agent.rb may name more (or different ones), and a SOUL.md next to
+    # it is picked up on its own.
+    def load_prompt_files
+      listed = @config["promptFiles"]
+      paths =
+        if listed && !listed.empty?
+          listed
+        else
+          EXTRA_PROMPT_FILES.select { File.file?(File.join(@root, _1)) }
+        end
+      paths.each do |rel|
+        path = File.expand_path(rel, @root)
+        next if @prompt_sources.any? { _1["path"] == path }
+
+        unless File.file?(path)
+          @diagnostics << { "type" => "warning", "path" => path, "message" => "prompt file not found" }
+          next
+        end
+        fm, body = Frontmatter.parse(File.read(path))
+        # Later files may carry config too; the closest write wins.
+        @config["name"] = fm["name"] if fm["name"]
+        @config["model"] = fm["model"] if fm["model"]
+        @config["thinkingLevel"] = fm["thinking"] if fm["thinking"]
+        @prompt_sources << { "path" => path, "content" => body.strip }
+      end
+      # Inline prose from agent.rb counts as a source, after the files.
+      if (inline = @config["inlineInstructions"])
+        @prompt_sources << { "path" => "agent.rb", "content" => inline.strip }
+      end
+      @instructions ||= @prompt_sources.first&.dig("content")
     end
 
     # ── agent.rb ──────────────────────────────────────────────────────────
@@ -100,7 +141,17 @@ module Durable
       def model(value) = @config["model"] = value.to_s
       def thinking(value) = @config["thinkingLevel"] = value.to_s
       def tools(*names) = @config["activeTools"] = names.flatten.map(&:to_s)
-      def instructions(text) = @config["instructions"] = text.to_s
+      # instructions "instructions.md", "SOUL.md"   → prompt files, in order
+      # instructions <<~TXT ... TXT                  → inline prose
+      def instructions(*sources)
+        files, inline = sources.flatten.map(&:to_s).partition { _1.length < 200 && _1.end_with?(".md") }
+        @config["promptFiles"] = files unless files.empty?
+        @config["inlineInstructions"] = inline.join("\n\n") unless inline.empty?
+        @config["promptFiles"] || @config["inlineInstructions"]
+      end
+
+      # An explicit alias for the file list, when that reads better.
+      def prompt_files(*paths) = @config["promptFiles"] = paths.flatten.map(&:to_s)
 
       def sandbox(backend = nil, **opts)
         cfg = @config["sandbox"] ||= {}
@@ -125,9 +176,7 @@ module Durable
         return
       end
       @agent_path = path
-      # instructions.md wins over agent.rb for prose; agent.rb wins for config.
-      @instructions ||= file.config["instructions"]
-      @config = @config.merge(file.config.reject { _1 == "instructions" })
+      @config = @config.merge(file.config)
     end
 
     # ── tools/ ────────────────────────────────────────────────────────────
@@ -176,9 +225,13 @@ module Durable
       base = Prompt.system_prompt(cwd: @root, tools: tools, agents: AgentsMd.discover(@root),
                                  skills: @skills)
       parts = [base]
-      unless @instructions.to_s.empty?
-        parts << "<agent_instructions source=\"#{File.basename(@instructions_path || "agent.rb")}\">\n" \
-                 "#{@instructions}\n</agent_instructions>\n" \
+      sources = @prompt_sources.reject { _1["content"].to_s.empty? }
+      unless sources.empty?
+        blocks = sources.map do |src|
+          rel = src["path"].to_s.start_with?(@root) ? src["path"].delete_prefix("#{@root}/") : src["path"]
+          "<agent_instructions source=\"#{rel}\">\n#{src["content"]}\n</agent_instructions>"
+        end
+        parts << "#{blocks.join("\n\n")}\n" \
                  "These instructions define this agent. They outrank the general guidance above."
       end
       parts << "Your sandbox: #{sandbox.describe}." if sandbox
@@ -192,7 +245,6 @@ module Durable
         ---
         name: %<name>s
         model: vllm
-        sandbox: local
         ---
 
         You are %<name>s, an agent that works in this directory.
@@ -241,20 +293,41 @@ module Durable
         3. Write them to CHANGELOG.md under a new version heading.
       MD
       "sandbox/sandbox.rb" => <<~'RUBY',
-        # The sandbox every command runs in. `backend :local` runs on this machine
-        # (no isolation, right for a coding agent on your own checkout);
-        # `backend :microsandbox` boots a local microVM instead.
+        # The sandbox every command runs in.
+        #
+        # The default is `:auto`: a microVM when microsandbox is installed, this
+        # machine otherwise. The VM is debian with the tools an agent reaches for
+        # (git, ripgrep, fd, jq, build-essential) and mise for language runtimes,
+        # activated for every shell.
+        #
+        # Egress is deny-by-default: github.com only, using your own GitHub
+        # credential — lent to the sandbox through microsandbox's secret proxy, so
+        # the token never enters the VM. Add hosts explicitly with `allow`.
 
         sandbox do
-          backend :local
+          backend :auto           # :microsandbox to insist, :local to opt out
 
-          # backend :microsandbox
-          # image "debian"
+          # image "debian:trixie-slim"
           # cpus 2
-          # memory 1024
-          # bootstrap "apt-get update -qq"
+          # memory 2048
+          # mise "node@lts", "python@3.12"
+          # packages "ripgrep", "fd-find", "postgresql-client"
+
+          # allow "rubygems.org", "registry.npmjs.org"
+          # allow_all                     # opt out of the egress policy
+          # github_auth false             # do not lend the host's github token
+          # secret "OPENAI_API_KEY", hosts: ["api.openai.com"]
+
+          # bootstrap "bundle install"
         end
       RUBY
+      "SOUL.md" => <<~'MD',
+        You are %<name>s.
+
+        instructions.md is the job; this file is the character. Voice, taste, what you
+        refuse to do, how you talk to the user. Both files go into every request, in
+        order, and `agent.rb` can name more of them.
+      MD
       "AGENTS.md" => <<~'MD'
         # %<name>s
 

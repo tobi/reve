@@ -7,9 +7,10 @@ group "rbagent init scaffolds an agent directory" do
   Dir.mktmpdir do |dir|
     result = Durable::Project.init(dir, name: "notes-bot")
     eq "instructions.md is the centre of it", true, result["created"].include?("instructions.md")
-    eq "with tools, skills and a sandbox alongside", %w[AGENTS.md sandbox/sandbox.rb skills/release-notes/SKILL.md
-                                                        tools/example.rb],
-       (result["created"] & %w[tools/example.rb skills/release-notes/SKILL.md sandbox/sandbox.rb AGENTS.md]).sort
+    eq "with tools, skills, a soul and a sandbox alongside",
+       %w[AGENTS.md SOUL.md sandbox/sandbox.rb skills/release-notes/SKILL.md tools/example.rb],
+       (result["created"] & %w[tools/example.rb skills/release-notes/SKILL.md sandbox/sandbox.rb
+                               SOUL.md AGENTS.md]).sort
     eq "sessions live with the agent", true, File.directory?(File.join(dir, ".rbagent", "sessions"))
     eq "and are not committed", true, File.read(File.join(dir, ".gitignore")).include?(".rbagent/")
     again = Durable::Project.init(dir)
@@ -29,7 +30,7 @@ Dir.mktmpdir do |root|
     eq "instructions are the body, not the frontmatter", false, p.instructions.include?("name: notes-bot")
     eq "tools/ loaded", %w[sandboxed_uname word_count], p.tools.map(&:name).sort
     eq "skills/ loaded", ["release-notes"], p.skills.map { _1["name"] }
-    eq "sandbox configured", "local", p.sandbox_config["backend"]
+    eq "sandbox is auto: a microVM when one is available", "auto", p.sandbox_config["backend"]
     eq "no diagnostics for the scaffold", [], p.diagnostics
     eq "sessions dir", File.join(root, ".rbagent", "sessions"), p.sessions_dir
   end
@@ -111,6 +112,135 @@ Dir.mktmpdir do |root|
            .last.include?("word_count")
     h.close
   end
+end
+
+group "the prompt is a list of files, so SOUL.md can join it" do
+  Dir.mktmpdir do |root|
+    Durable::Project.init(root, name: "soulful")
+    File.write(File.join(root, "SOUL.md"), "You are terse and dry.")
+    p = Durable::Project.load(root, user_skills: false)
+    eq "SOUL.md joins on its own", %w[instructions.md SOUL.md],
+       p.prompt_sources.map { File.basename(_1["path"]) }
+    prompt = p.system_prompt(tools: %w[read])
+    eq "each file gets its own block", ["instructions.md", "SOUL.md"],
+       prompt.scan(/<agent_instructions source="([^"]+)">/).flatten
+    eq "in order", true, prompt.index("instructions.md") < prompt.index("SOUL.md")
+
+    File.write(File.join(root, "docs", "style.md").tap { FileUtils.mkdir_p(File.dirname(_1)) },
+               "Tables over prose.")
+    File.write(File.join(root, "agent.rb"), <<~RUBY)
+      agent do
+        model "vllm"
+        instructions "instructions.md", "SOUL.md", "docs/style.md"
+      end
+    RUBY
+    p2 = Durable::Project.load(root, user_skills: false)
+    eq "agent.rb names the list", %w[instructions.md SOUL.md style.md],
+       p2.prompt_sources.map { File.basename(_1["path"]) }
+    eq "nested paths keep their path in the tag", true,
+       p2.system_prompt(tools: %w[read]).include?('source="docs/style.md"')
+    eq "config from agent.rb still applies", "vllm", p2.config["model"]
+
+    File.write(File.join(root, "agent.rb"), <<~RUBY)
+      agent do
+        instructions "instructions.md", "nope.md"
+      end
+    RUBY
+    p3 = Durable::Project.load(root, user_skills: false)
+    eq "a missing prompt file is a diagnostic", true,
+       p3.diagnostics.any? { _1["message"] == "prompt file not found" }
+    eq "and the rest still load", 1, p3.prompt_sources.size
+  end
+end
+
+group "inline instructions in agent.rb work too" do
+  Dir.mktmpdir do |root|
+    File.write(File.join(root, "agent.rb"), <<~RUBY)
+      agent do
+        model "vllm"
+        instructions <<~TXT
+          You are a one-file agent. No instructions.md needed.
+        TXT
+      end
+    RUBY
+    p = Durable::Project.load(root, user_skills: false)
+    eq "it counts as an agent", true, p.agent?
+    eq "the prose is a source", "agent.rb", p.prompt_sources.first["path"]
+    eq "and reaches the prompt", true,
+       p.system_prompt(tools: %w[read]).include?("one-file agent")
+  end
+end
+
+group "sandbox: default image comes with the tools an agent reaches for" do
+  cfg = Durable::Sandbox.config({})
+  eq "debian", "debian:trixie-slim", cfg["image"]
+  eq "ripgrep and fd are in the package list", true,
+     (cfg["packages"] & %w[ripgrep fd-find]).size == 2
+  eq "mise supplies runtimes", ["node@lts"], cfg["mise"]
+  script = Durable::Sandbox.provision_script(cfg)
+  eq "mise is installed", true, script.include?("https://mise.run")
+  eq "and activated for every shell", true, script.include?("/etc/profile.d/10-mise.sh")
+  eq "shims go on PATH, because /bin/sh is dash", true, script.include?("mise/shims")
+  eq "fd gets its familiar name", true, script.include?("ln -sf /usr/bin/fdfind")
+  eq "provisioning is idempotent", true, script.include?("[ -f /var/lib/rbagent/provisioned ]")
+  eq "runtimes installed globally", true, script.include?("mise use -g node@lts")
+end
+
+group "sandbox: egress is deny-by-default, github only" do
+  cfg = Durable::Sandbox.config("provision" => false)
+  net = Durable::Sandbox.network_options(cfg)
+  rules = net.dig("custom_policy", "rules")
+  allowed = rules.select { _1["destination_kind"] == "domain" }.map { _1["destination"] }.uniq
+  eq "only github hosts are allowed", %w[api.github.com codeload.github.com github.com
+                                         objects.githubusercontent.com raw.githubusercontent.com],
+     allowed.sort
+  eq "dns is open, or nothing resolves", %w[tcp udp],
+     rules.select { _1["destination"] == "dns" }.map { _1["protocol"] }.sort
+  eq "every rule is an allow, so the policy denies by default", ["allow"], rules.map { _1["action"] }.uniq
+  eq "egress only", ["egress"], rules.map { _1["direction"] }.uniq
+
+  provisioning = Durable::Sandbox.network_options(Durable::Sandbox.config({}))
+  hosts = provisioning.dig("custom_policy", "rules").map { _1["destination"] }
+  eq "package mirrors are allowed only while provisioning", true, hosts.include?("deb.debian.org")
+  eq "and mise's installer with them", true, hosts.include?("mise.run")
+
+  open_cfg = Durable::Sandbox.config("allowAll" => true)
+  eq "allow_all opts out of the policy entirely", {}, Durable::Sandbox.network_options(open_cfg)
+end
+
+group "sandbox: the host's github auth is lent, not copied" do
+  entry = { "env_var" => "GITHUB_TOKEN", "value" => "ghp_secret", "allow_hosts" => %w[github.com] }
+  cfg = Durable::Sandbox.config("githubAuth" => false, "secrets" => [entry])
+  secrets = Durable::Sandbox.secret_entries(cfg)
+  eq "declared secrets pass through", ["GITHUB_TOKEN"], secrets.map { _1["env_var"] }
+  eq "scoped to their hosts", %w[github.com], secrets.first["allow_hosts"]
+  eq "a secret with no value is dropped", [],
+     Durable::Sandbox.secret_entries(Durable::Sandbox.config("githubAuth" => false,
+                                                             "secrets" => [{ "env_var" => "X", "value" => "" }]))
+
+  with_token = Durable::Sandbox.config("githubAuth" => true, "secrets" => [])
+  found = Durable::Sandbox::HostAuth.github_secret
+  if found
+    entries = Durable::Sandbox.secret_entries(with_token)
+    eq "the host token is offered to the sandbox", "GITHUB_TOKEN", entries.first["env_var"]
+    eq "scoped to github only", true, entries.first["allow_hosts"].all? { _1.include?("github") }
+    eq "with a placeholder, so the VM never sees the value", "rbagent-github-token",
+       entries.first["placeholder"]
+    eq "and we know where it came from", true, %w[$GITHUB_TOKEN $GH_TOKEN].include?(found["source"]) ||
+                                               found["source"].include?("git") || found["source"].include?("gh ")
+  else
+    eq "no host credential, no secret", [], Durable::Sandbox.secret_entries(with_token)
+  end
+end
+
+group "sandbox: create options speak microsandbox's wire shape" do
+  cfg = Durable::Sandbox.config("provision" => false, "githubAuth" => false)
+  opts = Durable::Sandbox.create_options(cfg, "/host/ws", "/workspace")
+  eq "memory is memory_mib", 2048, opts["memory_mib"]
+  eq "the workspace is a bind volume", { "bind" => "/host/ws" }, opts.dig("volumes", "/workspace")
+  eq "env travels", "noninteractive", opts.dig("env", "DEBIAN_FRONTEND")
+  eq "network policy attached", true, opts.key?("network")
+  eq "no empty secrets key", false, opts.key?("secrets")
 end
 
 group "sandbox: local backend is honest about what it is" do

@@ -146,6 +146,18 @@ Two Ractor consequences shape the implementation:
 * The sandbox holds a live connection (a microVM handle), so it lives in the host Ractor too,
   and sandboxed tools are host-run by construction.
 
+## 3b. Sandbox policy
+
+The default sandbox is a provisioned debian microVM (git, ripgrep, fd, jq,
+build-essential, mise with node) whose egress is **deny-by-default with github.com the only
+allowed destination**. Package mirrors are allowed only while provisioning is enabled, so an
+agent that bakes its own image gets the github-only policy and nothing more.
+
+GitHub access uses the host's own credential without copying it into the VM:
+microsandbox's secret proxy substitutes the value into requests to the allowed hosts, and
+the guest only ever holds a placeholder. Discovery order is `$GITHUB_TOKEN`/`$GH_TOKEN`,
+`gh auth token`, then the git credential helper.
+
 ## 4. Scope cuts (explicit)
 
 * No v3 JSONL compatibility: this is a new agent, there is nothing to be compatible with.
@@ -159,7 +171,8 @@ Two Ractor consequences shape the implementation:
 * Channels, connections, subagents and schedules from eve's model are out of scope for now;
   the directory layout leaves room for them.
 * The microsandbox backend is bound but not exercised against a real microVM here (no `msb`
-  installed); its ABI is covered by a stub library built at test time.
+  installed); its ABI is covered by a stub library built at test time, and the network
+  policy and secret entries are covered as wire-shape tests.
 
 ## 5. Invariants we test
 
