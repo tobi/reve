@@ -8,7 +8,7 @@ module Durable
   module Provider
     # openai-responses, streaming. Written against the shape vLLM serves at
     # /v1/responses, which is also what OpenAI serves — the differences live in
-    # the model's `compat` block (from models.json), not in the code:
+    # the model's `compat` block (from models.yml), not in the code:
     #
     #   supportsStore            send "store": false explicitly
     #   supportsDeveloperRole    system prompt as a developer message vs "instructions"
@@ -57,6 +57,7 @@ module Durable
         req["accept"] = "text/event-stream"
         key = model["apiKey"].to_s
         req["authorization"] = "Bearer #{key}" unless key.empty?
+        (model["headers"] || {}).each { |k, v| req[k] = v }
         req.body = JSON.generate(body)
 
         acc = Accumulator.new(model)

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "json"
+require "yaml"
 require "net/http"
 require "uri"
 
@@ -8,20 +9,39 @@ module Durable
   module Provider
     # Model registry. Providers and models are configuration, never live
     # objects: a Ractor gets a JSON hash and can construct everything it needs.
+    #
+    # Config is YAML (models.yml). Source order: a user override file, then the
+    # bundled models.yml in the repo root — so the agent is self-contained and
+    # works with no user configuration at all. A legacy .json file is still read
+    # if it exists (YAML parses it too).
+    #
+    # omp-style env resolution: a string value in `apiKey` or in `headers`
+    # that is an all-caps identifier (e.g. PI_PROXY_API_KEY) names an
+    # environment variable and is resolved at build time. A value that is already a
+    # literal key passes through untouched.
     module Models
       DEFAULT_CONFIG_PATHS = [
-        File.expand_path("~/.pi/agent/models.json"),
-        File.expand_path("~/.config/rbagent/models.json")
+        File.expand_path("~/.agent/models.yml"),
+        File.expand_path("~/.config/rbagent/models.yml"),
+        File.expand_path("~/.config/rbagent/models.json"),
+        File.expand_path("../../../models.yml", __dir__)
       ].freeze
+
+      ENV_NAMED = /\A[A-Z][A-Z0-9_]*\z/
 
       module_function
 
       def load(path = nil)
-        paths = path ? [path] : DEFAULT_CONFIG_PATHS
-        file = paths.find { File.exist?(_1) }
-        return { "providers" => {} } unless file
+        file = path || config_path
+        return { "providers" => {} } unless file && File.exist?(file)
 
-        JSON.parse(File.read(file))
+        YAML.safe_load(File.read(file), permitted_classes: [], aliases: false) || {}
+      end
+
+      # First existing path wins. Exposed for tests: the precedence order is
+      # deterministic, so it can be checked without touching a real home.
+      def config_path(paths = nil)
+        (paths || DEFAULT_CONFIG_PATHS).find { File.exist?(_1) }
       end
 
       # Accepts "provider/model-id", "model-id", or just "provider" — the last
@@ -75,6 +95,7 @@ module Durable
         http.read_timeout = timeout
         req = Net::HTTP::Get.new(uri)
         key = pcfg["apiKey"].to_s
+        key = resolve_env_named(key)
         req["authorization"] = "Bearer #{key}" unless key.empty?
         res = http.request(req)
         return [] unless res.code.to_i == 200
@@ -98,12 +119,30 @@ module Durable
           "name" => model["name"] || model["id"],
           "api" => pcfg["api"] || "anthropic-messages",
           "baseUrl" => pcfg["baseUrl"],
-          "apiKey" => pcfg["apiKey"] || (pcfg.dig("env", "apiKeyEnv") && ENV[pcfg.dig("env", "apiKeyEnv")]),
+          "apiKey" => resolve_env_named(
+            pcfg["apiKey"] || (pcfg.dig("env", "apiKeyEnv") && ENV[pcfg.dig("env", "apiKeyEnv")])
+          ),
+          "headers" => resolve_headers(pcfg),
           "reasoning" => !!model["reasoning"],
           "contextWindow" => model["contextWindow"] || 200_000,
           "maxTokens" => model["maxTokens"] || 8192,
           "cost" => model["cost"] || {}
         }
+      end
+
+      # A value that looks like an env-var name is one (omp convention).
+      # Anything else — a literal key, a shell-expanded string — passes through.
+      # An unresolved or empty name resolves to "", which providers read as "no
+      # auth": vLLM's local endpoint is configured with `apiKey: EMPTY`.
+      def resolve_env_named(value)
+        value.is_a?(String) && value.match?(ENV_NAMED) ? ENV[value].to_s : value
+      end
+
+      # Header values follow the same convention as apiKey.
+      def resolve_headers(pcfg)
+        (pcfg["headers"] || {}).each_with_object({}) do |(k, v), out|
+          out[k] = resolve_env_named(v)
+        end
       end
     end
   end

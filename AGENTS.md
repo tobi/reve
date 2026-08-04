@@ -1,7 +1,8 @@
 # rbagent
 
 A durable coding agent in pure Ruby (stdlib only, no gems) on Ractors. The design is
-pi's `harness-v2`; PLAN.md maps it onto Ractors and records what is in and out of scope.
+omp's durable harness (see PLAN.md); PLAN.md maps it onto Ractors and records what is in and
+out of scope.
 
 ## Rules
 
@@ -15,6 +16,11 @@ pi's `harness-v2`; PLAN.md maps it onto Ractors and records what is in and out o
   produce, then append the result with exactly those ids.
 - Every new behaviour gets a test in `test/`, and recovery behaviour gets a crash-site
   test that kills a real child process.
+- Project code (`tools/*.rb`, hooks, the sandbox connection) runs in the host Ractor,
+  because blocks and live handles cannot cross a Ractor boundary. Built-in tools run in
+  their own Ractor.
+- FFI means `fiddle`, not the ffi gem. Bind C ABIs through one call helper and test them
+  against a stub shared library built at test time.
 
 ## Commands
 

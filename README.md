@@ -1,6 +1,6 @@
 # rbagent — a durable coding agent in pure Ruby, on Ractors
 
-An implementation of [pi's harness-v2 design](https://github.com/earendil-works/pi/blob/main/packages/agent/docs/harness-v2.md)
+An implementation of the [durable harness-v2 design](https://github.com/earendil-works/pi/blob/main/packages/agent/docs/harness-v2.md)
 in stdlib-only Ruby 4. No gems. The plan and the mapping from the design to Ractors is in
 [PLAN.md](PLAN.md).
 
@@ -48,15 +48,16 @@ bin/rbagent --list                   # sessions for this directory
 bin/test                             # the whole suite (~140 checks)
 ```
 
-Models come from `~/.pi/agent/models.json` (pi's format) or `~/.config/rbagent/models.json`.
-`-m` takes `provider/model-id`, a bare `model-id`, or just a `provider` — the last form asks
-the endpoint what it is serving right now (`GET /v1/models`) and falls back to the configured
-list when it cannot be reached. The default is `vllm`, i.e. whatever the local inference
-server has loaded.
+Models come from the bundled `models.yml` in the repo root, overridden by
+`~/.agent/models.yml` or `~/.config/rbagent/models.yml` (a legacy `.json` is still read).
+`-m` takes `provider/model-id`, a bare `model-id`, or just a `provider` — the last
+form asks the endpoint what it is serving right now (`GET /v1/models`) and falls
+back to the configured list when it cannot be reached. The default is `vllm`, i.e.
+whatever the local inference server has loaded.
 
 The provider layer speaks `openai-responses` and `anthropic-messages` streaming, plus a
 scripted `fake` provider for the tests. Per-provider quirks live in the `compat` block of
-models.json (`maxTokensField`, `supportsDeveloperRole`, `supportsReasoningEffort`, …), not
+models.yml (`maxTokensField`, `supportsDeveloperRole`, `supportsReasoningEffort`, …), not
 in the code.
 
 Sessions are JSONL, one file per session, one line per mutation:
@@ -74,6 +75,109 @@ Sessions are JSONL, one file per session, one line per mutation:
 
 Delete every `record` line and a complete, valid conversation remains. That is an
 invariant, and a test.
+
+## An agent is a directory
+
+Launch `rbagent` in a directory and it takes its setup from the files it finds — eve's model
+([eve.dev](https://eve.dev): "an instructions.md file is all you need to run an agent").
+
+```
+$ rbagent init
+initialised /tmp/agentdir
+  + instructions.md
+  + tools/example.rb
+  + skills/release-notes/SKILL.md
+  + sandbox/sandbox.rb
+  + AGENTS.md
+
+  edit instructions.md, then run rbagent in this directory
+```
+
+```
+instructions.md        what this agent is and how it works — all you need
+agent.rb               optional: model, thinking, active tools, sandbox
+tools/*.rb             optional: tools in the Ruby DSL
+skills/*/SKILL.md      optional: skills (also .agents/skills, .pi/skills)
+sandbox/sandbox.rb     optional: swap the sandbox backend or bootstrap it
+.rbagent/sessions/     the durable logs of this agent's runs
+```
+
+`instructions.md` carries frontmatter for the things an agent needs to say about itself,
+and its body becomes the authority in the system prompt:
+
+```markdown
+---
+name: haiku-bot
+model: vllm
+sandbox: local
+---
+
+You are haiku-bot. You answer everything as a single haiku, then stop.
+```
+
+Nothing is required: in a plain checkout with none of these files rbagent is still an
+ordinary coding agent, which is why it works in any repository.
+
+## Tools are Ruby
+
+`tools/` is a folder of small Ruby files. The typed declarations become the JSON schema the
+model sees, and `replay` is the recovery contract from the harness design.
+
+```ruby
+tool "syllables" do
+  description "Roughly count syllables in a line of text"
+  string :line, "The line to measure", required: true
+  replay :safe                      # recovery may re-run this after a crash
+
+  run { |args, _ctx| "#{args["line"].scan(/[aeiouy]+/i).size} syllables" }
+end
+
+tool "test_suite" do
+  description "Run the test suite in the sandbox"
+  sandbox true                      # runs inside the sandbox, not on the host
+  run { |_args, ctx| ctx.sh("bin/test") }
+end
+```
+
+A project tool's body is a Ruby block, and a block cannot cross a Ractor boundary — so
+project tools run in the host Ractor and lanes reach them by RPC, exactly like hooks. Their
+`tool_started` records look like any other tool's, so recovery treats them identically.
+A tool file with a syntax error is a startup diagnostic, not a crash, and a tool may not
+shadow a built-in.
+
+## Sandbox
+
+Every agent has a sandbox: the place its commands run. `sandbox/sandbox.rb` swaps the
+backend, and nothing else in the agent changes.
+
+```ruby
+sandbox do
+  backend :microsandbox      # a local microVM; :local runs on this machine
+  image "python:3.12"
+  cpus 2
+  memory 2048
+  bootstrap "pip install -r requirements.txt"
+end
+```
+
+The `microsandbox` backend is [microsandbox](https://github.com/superradcompany/microsandbox)
+bound through its C ABI with **fiddle** — the stdlib's FFI, because this project takes no
+gems:
+
+```c
+char *msb_sandbox_create(uint64_t cancel_id, const char *name,
+                         const char *opts_json, uint8_t *buf, size_t buf_len);
+```
+
+Every call takes a cancellation token, JSON options and an output buffer, and returns NULL
+on success or a `char *` JSON error to free with `msb_free_string`. That maps onto one Ruby
+method (`Microsandbox#call`), so adding a call is one line in a signature table. Abort
+reaches into a blocking VM call through the same token. When the library is not installed,
+`resolve` says so in yellow and falls back to local execution rather than pretending.
+
+The bindings are tested against a stub shared library built at test time
+(`test/support/msb_stub.c`) that implements the same ABI — argument marshalling, the buffer
+protocol, base64 payloads, the error convention and cancellation, all verified without KVM.
 
 ## Architecture
 
@@ -111,9 +215,9 @@ deep copies and no isolation errors at runtime.
 | `lib/durable/lane.rb` | lane Ractor: run/compaction/navigation procedures, checkpoints, **the recovery reduction** |
 | `lib/durable/harness.rb` | lanes, hooks, config, `watch()` |
 | `lib/durable/observer.rb` | event hub, lane mirrors, gapless snapshots |
-| `lib/durable/provider/*` | models.json, anthropic SSE, scripted fake |
+| `lib/durable/provider/*` | models.yml, anthropic SSE, scripted fake |
 | `lib/durable/tools.rb` | bash/read/write/edit/ls/glob/grep, each with declared replay safety |
-| `lib/durable/prompt.rb` | system prompt (pi-shaped: tools, guidelines, project context, skills, cwd) |
+| `lib/durable/prompt.rb` | system prompt (tools, guidelines, project context, skills, cwd) |
 | `lib/durable/agents_md.rb` | AGENTS.md discovery, static and nested-on-demand |
 | `lib/durable/skills.rb` | Agent Skills: SKILL.md discovery, validation, prompt section |
 | `lib/durable/compaction.rb` | cut point, kept suffix, structured summary, file lists |
@@ -151,7 +255,7 @@ deep copies and no isolation errors at runtime.
   in the tree is loaded the first time a tool touches a path under it and rides along on
   that tool's result — late context arrives at the tail, never before the assistant message
   that did not see it.
-* **Skills.** `SKILL.md` files under `.agents/skills/`, `.pi/skills/`, `.rbagent/skills/`
+* **Skills.** `SKILL.md` files under `.agents/skills/`, `.agent/skills/`, `.rbagent/skills/`
   and their `~/` counterparts. Names and descriptions go into the system prompt in the
   Agent Skills XML shape so the model can pick one and `read` it; `/skill <name>` loads the
   body into the conversation immediately. Over-long descriptions (>1024 chars), invalid

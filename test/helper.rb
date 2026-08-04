@@ -3,6 +3,7 @@
 require "json"
 require "fileutils"
 require "tmpdir"
+require "stringio"
 require_relative "../lib/durable"
 
 module TestKit

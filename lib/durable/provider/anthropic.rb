@@ -50,6 +50,9 @@ module Durable
         req["accept"] = "text/event-stream"
         req["anthropic-version"] = "2023-06-01"
         req["x-api-key"] = model["apiKey"].to_s
+        # Per-provider headers from models.yml, after env resolution. A
+        # user-set header wins over the library defaults above.
+        (model["headers"] || {}).each { |k, v| req[k] = v }
         req.body = JSON.generate(body)
 
         acc = Accumulator.new(model)

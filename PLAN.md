@@ -1,6 +1,7 @@
 # Durable coding agent in pure Ruby, on Ractors
 
-Implementation plan. The design is [pi's harness-v2](https://github.com/earendil-works/pi/blob/main/packages/agent/docs/harness-v2.md);
+Implementation plan. The durable-harness design it follows is documented by omp at
+[harness-v2.md](https://github.com/earendil-works/pi/blob/main/packages/agent/docs/harness-v2.md);
 this document maps it onto Ruby 4 Ractors and records what we build, in which order, and
 what we deliberately leave out.
 
@@ -57,7 +58,7 @@ runtime. Records and entries are JSON on the wire and JSON on disk — one repre
 | events (passive) | fire-and-forget JSON to the observer hub |
 | `watch()` snapshot + gapless stream | the hub is single-threaded: it mirrors lane state from the event stream, so "capture snapshot + register port" is one atomic hub operation. The Port itself is the buffer; `start` is the consumer's first `receive` |
 | tools | one Ractor per call: args JSON in, result JSON out, no shared state |
-| telemetry | `pi.*`-shaped span events on a separate hub topic |
+| telemetry | `rbagent.*`-shaped span events on a separate hub topic |
 
 Things a Ractor forces us to do differently, all improvements:
 
@@ -84,7 +85,7 @@ lib/durable/
   agent_loop.rb     streamAssistant / prepare|execute|finalize tool call / batch (§14)
   lane.rb           run, compaction, navigation procedures; checkpoints; recovery (§15, §7)
   harness.rb        create/restore, lane management, global config (§8)
-  provider/         models.json loading, anthropic-messages SSE, fake provider (§16)
+  provider/         models.yml loading, anthropic-messages SSE, fake provider (§16)
   tools/            bash, read, write, edit, ls, grep, glob
   tui.rb            streaming renderer + slash commands
 bin/rbagent         CLI entry
@@ -112,7 +113,7 @@ test/               parity + crash-site tests (§20)
 10. **Deferred requests.** Park/redeem path, exercised by the fake provider.
 11. **Project context.** AGENTS.md (static, from the repo root down; nested, on first
     touch, appended to the tool result that touched it).
-12. **Skills.** SKILL.md discovery in `.agents/skills`, `.pi/skills`, `.rbagent/skills` and
+12. **Skills.** SKILL.md discovery in `.agents/skills`, `.agent/skills`, `.rbagent/skills` and
     the `~/` equivalents; frontmatter validation with diagnostics (name shape, description
     length, collisions); the Agent Skills XML section in the system prompt; `/skill` to run
     one now.
@@ -122,12 +123,28 @@ test/               parity + crash-site tests (§20)
 14. **Session goal.** A `goal` custom entry on the branch, injected into the system prompt
     of every request on that lane.
 15. **openai-responses.** A second provider (the local vLLM endpoint is the default), with
-    per-provider quirks read from the `compat` block of models.json.
+    per-provider quirks read from the `compat` block of models.yml.
 16. **Shell passthrough and completion.** `!command` as a first-class durable fact, and
     context-aware tab completion driven by the same command table the dispatcher uses.
 17. **A terminal the renderer can print into.** Own the input line instead of handing it to
     a readline library: cbreak mode, a small line editor, one screen primitive that hides
     the input line, prints, and redraws it. Tool outcomes render right-aligned.
+
+## 3a. The agent directory (eve's model)
+
+An agent is a directory, and the files in it are its definition: `instructions.md` (the
+authority in the system prompt), `agent.rb` (config), `tools/*.rb` (Ruby DSL), `skills/`,
+`sandbox/sandbox.rb`, and `.rbagent/sessions/` for the durable logs. `rbagent init`
+scaffolds all of it. Nothing is required — with no files, rbagent is a plain coding agent.
+
+Two Ractor consequences shape the implementation:
+
+* A project tool's body is a Ruby block, so it cannot travel into a tool Ractor. Project
+  tools run in the host Ractor and lanes call them over the same RPC channel as hooks. The
+  declaration carries `runner: "host"`, and the batch driver dispatches accordingly. Records,
+  replay safety and recovery are unchanged.
+* The sandbox holds a live connection (a microVM handle), so it lives in the host Ractor too,
+  and sandboxed tools are host-run by construction.
 
 ## 4. Scope cuts (explicit)
 
@@ -139,6 +156,10 @@ test/               parity + crash-site tests (§20)
 * Deferred requests exist as a code path and are tested against the fake provider; no real
   batch-API provider.
 * Telemetry: span events on the hub, no exporters.
+* Channels, connections, subagents and schedules from eve's model are out of scope for now;
+  the directory layout leaves room for them.
+* The microsandbox backend is bound but not exercised against a real microVM here (no `msb`
+  installed); its ABI is covered by a stub library built at test time.
 
 ## 5. Invariants we test
 

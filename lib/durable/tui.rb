@@ -39,6 +39,7 @@ module Durable
         /log [n]            the tail of the durable log (entries + records)
         /state              lane state as JSON
         /cache              prompt-cache hit rate for this lane
+        /sandbox [cmd]      show the sandbox, or run one command in it
         /output [n]         print the last (or n-th last) tool output in full
         /back [n]           navigate n user turns back (branches the tree)
         /agents             AGENTS.md files in play
@@ -55,7 +56,7 @@ module Durable
     TXT
 
     COMMANDS = %w[help exit quit abort resume compact verbose goal skill model models think
-                  tools state cache output agents lanes lane tree back log steer next].freeze
+                  tools state cache sandbox output agents lanes lane tree back log steer next].freeze
     THINK_LEVELS = %w[off low medium high].freeze
 
     def initialize(harness, suspended, lane: "main")
@@ -276,6 +277,10 @@ module Durable
       bits << "ctx #{tok(context_used(u))}/#{tok(context_window)}" if context_used(u).positive?
       hit = cache_rate(u)
       bits << "cache #{hit}%" if hit
+      if ev.dig("finalMessage", "provider") && ev.dig("finalMessage", "model") &&
+         ev.dig("finalMessage", "provider") != @h.model["provider"]
+        bits << "model #{ev.dig("finalMessage", "provider")}/#{ev.dig("finalMessage", "model")}"
+      end
       right = s(:dim, bits.join(" · "))
       left =
         case ev["outcome"]
@@ -423,11 +428,31 @@ module Durable
 
     # ── banner ────────────────────────────────────────────────────────────
 
+    # One status line, partially config and partially live: thinking is the
+    # lane's current branch state, tools are active tools. Everything else is
+    # static for the session.
+    def status_line
+      st = @h.state
+      model = (@h.model rescue nil) || st["model"] || {}
+      name = model["name"] || model["modelId"]
+      bits = []
+      bits << "lane #{@lane}"
+      bits << "model #{model["provider"]}/#{model["modelId"]}"
+      bits << "tools #{(st["activeTools"] || []).size}"
+      bits << "thinking #{st["thinkingLevel"]}"
+      bits << "context #{tok(context_window)}"
+      s(:bold, "rbagent") + s(:dim, "  #{bits.join(" · ")}")
+    end
+
     def banner
       st = @h.state
-      emit(s(:bold, "rbagent") + s(:dim, "  durable harness on ractors · ruby #{RUBY_VERSION}"),
-           s(:dim, "  #{st.dig("model", "provider")}/#{st.dig("model", "modelId")} · " \
-                   "#{st["activeTools"].size} tools · lane #{@lane} · #{Dir.pwd}"))
+      emit(status_line)
+      emit(s(:dim, "  cwd #{Dir.pwd}"))
+      if @h.project&.agent?
+        emit(s(:dim, "  agent #{@h.project.name} · instructions.md · #{@h.project.tools.size} project tool" \
+                     "#{@h.project.tools.size == 1 ? "" : "s"}"))
+      end
+      emit(s(@h.sandbox&.isolated? ? :green : :dim, "  sandbox #{@h.sandbox.describe}")) if @h.sandbox
       emit(s(:dim, "  AGENTS.md: #{@h.agents_md.map { rel(_1["path"]) }.join(", ")}")) unless @h.agents_md.empty?
       emit(s(:dim, "  skills: #{@h.skills.map { _1["name"] }.sort.join(", ")}")) unless @h.skills.empty?
       @h.skill_diagnostics.each { emit(s(:yellow, "  ! skill #{rel(_1["path"])}: #{_1["message"]}")) }
@@ -436,6 +461,18 @@ module Durable
         emit(s(:yellow, "  || suspended #{sp["kind"]} on lane #{sp["lane"]} (#{sp["reason"]}) — /resume"))
       end
       emit(s(:dim, "  /help for commands"), "")
+    end
+
+    # A quiet boundary between turns — the scrollback reads as one long stream
+    # otherwise, and a finished turn is a paragraph, not a full stop.
+    def turn_separator
+      return unless @turns.positive?
+
+      emit(s(:dim, "  #{'─' * 16}"))
+    end
+
+    def note_turn
+      @turns = @turns.to_i + 1
     end
 
     # ── main loop ─────────────────────────────────────────────────────────
@@ -456,9 +493,17 @@ module Durable
       rescue StandardError
         nil
       end
+      # SIGWINCH cannot safely call into the line editor either — this pipe
+      # is read by the same select loop, and resize becomes a redraw.
+      @winch_r, @winch_w = IO.pipe
+      trap("WINCH") do
+        @winch_w.write_nonblock("R")
+      rescue StandardError
+        nil
+      end
       refresh_prompt
       loop do
-        ready = IO.select([$stdin, @int_r], nil, nil, nil)
+        ready = IO.select([$stdin, @int_r, @winch_r], nil, nil, nil)
         if ready && ready[0].include?(@int_r)
           begin
             @int_r.read_nonblock(64)
@@ -466,6 +511,15 @@ module Durable
             nil
           end
           handle_interrupt
+          next
+        end
+        if ready && ready[0].include?(@winch_r)
+          begin
+            @winch_r.read_nonblock(64)
+          rescue StandardError
+            nil
+          end
+          refresh_prompt
           next
         end
         char = $stdin.getc
@@ -619,7 +673,8 @@ module Durable
     def prompt_for(_buffer = nil)
       return s(:red, "! ") if @shell_mode
 
-      busy? ? s(:yellow, "steer › ") : s(:cyan, "› ")
+      prefix = @lane == "main" ? "" : "[#{@lane}] "
+      busy? ? s(:yellow, "#{prefix}steer › ") : s(:cyan, "#{prefix}› ")
     end
 
     # Non-tty (pipes, CI): plain line reading, same command handling.
@@ -639,12 +694,14 @@ module Durable
       return command(text) if text.start_with?("/")
       return shell(text[1..].to_s.strip) if text.start_with?("!")
 
+      turn_separator
       if busy?
         echo(text)
         emit(s(:yellow, "-> ") + text.lines.first.to_s.strip)
         r = lane_handle.steer(text)
         emit(s(:yellow, "  #{r.dig("error", "message")}")) unless r["ok"]
       else
+        note_turn
         echo(text)
         emit(s(:cyan, "› ") + text.lines.first.to_s.strip)
         start_run { lane_handle.prompt(text) }
@@ -841,6 +898,7 @@ module Durable
         end
       when "tools" then cmd_tools(rest)
       when "cache" then cmd_cache
+      when "sandbox" then cmd_sandbox(rest)
       when "output" then expand_last_output(rest.to_s.empty? ? -1 : -rest.to_i)
       when "state" then emit(JSON.pretty_generate(lane_handle.state))
       when "agents"
@@ -908,11 +966,33 @@ module Durable
         show(lane_handle.set_persisted("activeTools", rest.split(/[\s,]+/)))
       else
         active = lane_handle.state["activeTools"]
-        Durable::Tools.declarations.each do |d|
+        builtin = Durable::Tools.declarations.map { _1.merge("where" => "ractor") }
+        project = @h.project_tools.map { _1.declaration.merge("where" => "host") }
+        (builtin + project).each do |d|
           mark = active.include?(d["name"]) ? s(:green, "*") : s(:dim, "-")
+          tail = "replay=#{d["replay"]}#{d["where"] == "host" ? " · project" : ""}" \
+                 "#{d["sandbox"] ? " · sandboxed" : ""}"
           emit(Term.two_column("  #{mark} #{s(:bold, d["name"])} #{s(:dim, clip(d["description"], width / 2))}",
-                               s(:dim, "replay=#{d["replay"]}"), width))
+                               s(:dim, tail), width))
         end
+      end
+    end
+
+    def cmd_sandbox(rest)
+      sb = @h.sandbox
+      return emit(s(:dim, "  no sandbox")) unless sb
+
+      if rest.nil? || rest.empty?
+        emit("  #{sb.describe}")
+        emit(s(:dim, "  backend #{sb.backend_name}#{sb.isolated? ? "" : " — commands run on this machine"}"))
+        emit(s(:yellow, "  fallback: #{sb.config["fallbackReason"]}")) if sb.config["fallbackReason"]
+        return
+      end
+      emit(s(:blue, "$ ") + rest + s(:dim, "  (in the sandbox)"))
+      Thread.new do
+        r = sb.exec(rest)
+        r["stdout"].to_s.lines.first(40).each { emit(s(:gray, "  #{clip(_1.rstrip, width - 4)}")) }
+        emit(s(r["exitCode"].zero? ? :green : :red, "  exit #{r["exitCode"]}"))
       end
     end
 

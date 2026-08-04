@@ -47,7 +47,7 @@ Dir.mktmpdir do |root|
     eq "no frontmatter is left alone", [{}, "just text"], Durable::Frontmatter.parse("just text")
   end
 
-  group "discovery across .agents/skills and .pi/skills" do
+  group "discovery across .agents/skills and .agent/skills" do
     loaded = Durable::Skills.load(cwd: project, user: false)
     names = loaded["skills"].map { _1["name"] }.sort
     eq "both roots scanned", %w[db-migrate release-notes], names
