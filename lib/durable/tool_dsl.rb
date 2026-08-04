@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "tools"
+require_relative "rbs_schema"
 
 module Durable
   # `tools/` is a folder of Ruby. One file, one (or more) tools:
@@ -14,6 +15,19 @@ module Durable
   #
   #     run do |args, ctx|
   #       ctx.sandbox.exec("curl -s wttr.in/#{args["city"]}")["stdout"]
+  #     end
+  #   end
+  #
+  # Or the same thing typed once, as an RBS comment over the block — the schema
+  # the model sees is derived from the signature, and the block is called with
+  # keywords:
+  #
+  #   tool "weather" do
+  #     description "Get the weather for a city"
+  #     # @param city  City name, e.g. "Berlin"
+  #     #: (city: String, ?units: ("metric" | "imperial")) -> String
+  #     run do |city:, units: "metric", ctx:|
+  #       ctx.sh("curl -s wttr.in/#{city}?#{units}")
   #     end
   #   end
   #
@@ -64,13 +78,49 @@ module Durable
       def sandboxed? = @sandbox
       def timeout(seconds) = @timeout = seconds
 
-      def run(&blk) = @handler = blk
+      # The block, plus whatever it says about itself: an RBS comment above it
+      # types the arguments, @param lines describe them, and Proc#parameters
+      # says which ones are optional. Nothing is written twice.
+      def run(&blk)
+        @handler = blk
+        @signature = RbsSchema.proc_signature(blk)
+        @keywords = blk.parameters.any? { |kind, _| %i[key keyreq].include?(kind) }
+        blk
+      end
+
+      def keywords? = !!@keywords
+      def signature = @signature
 
       def declaration
-        { "name" => @name, "description" => @description, "replay" => @replay,
+        { "name" => @name, "description" => description_text, "replay" => @replay,
           "runner" => "host", "sandbox" => @sandbox, "timeout" => @timeout,
-          "parameters" => { "type" => "object", "properties" => @properties,
-                            "required" => @required } }
+          "typed" => !@signature.nil? && !@signature["signature"].nil?,
+          "parameters" => parameters_schema }
+      end
+
+      # Explicit declarations and a derived schema compose: the DSL wins where
+      # both describe a field, because it is the more specific statement.
+      def parameters_schema
+        derived =
+          if @signature
+            RbsSchema.to_schema(@signature["signature"], params: @signature["params"],
+                                                         parameters: @signature["parameters"])
+          else
+            { "type" => "object", "properties" => {}, "required" => [] }
+          end
+        properties = derived["properties"].merge(@properties)
+        required = (derived["required"] + @required).uniq
+        # A property nobody declared optional and nobody typed is still required
+        # if it came from a required keyword.
+        { "type" => "object", "properties" => properties,
+          "required" => required.select { properties.key?(_1) } }
+      end
+
+      # A description may come from the DSL or from the comment above the block.
+      def description_text
+        return @description unless @description.to_s.empty?
+
+        @signature&.dig("doc").to_s
       end
     end
 
@@ -148,11 +198,31 @@ module Durable
 
     # Run a project tool's block and normalise whatever it returns into a tool
     # result. A raised exception is an error result, never a crashed run.
+    #
+    # A block that declares keywords is called with keywords (and `ctx:` if it
+    # asked for one); the older `|args, ctx|` form still works.
     def invoke(definition, args, context)
-      value = definition.handler.call(args, context)
+      value =
+        if definition.keywords?
+          definition.handler.call(**keyword_arguments(definition, args, context))
+        else
+          definition.handler.call(args, context)
+        end
       normalise(value)
     rescue StandardError => e
       Tools.error("#{e.class}: #{e.message}")
+    end
+
+    def keyword_arguments(definition, args, context)
+      accepted = definition.handler.parameters.filter_map { |kind, name| name if %i[key keyreq].include?(kind) }
+      rest = definition.handler.parameters.any? { |kind, _| kind == :keyrest }
+      kwargs = {}
+      (args || {}).each do |key, value|
+        sym = key.to_sym
+        kwargs[sym] = value if rest || accepted.include?(sym)
+      end
+      kwargs[:ctx] = context if accepted.include?(:ctx) || rest
+      kwargs
     end
 
     def normalise(value)

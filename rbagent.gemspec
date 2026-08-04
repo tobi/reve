@@ -20,6 +20,7 @@ Gem::Specification.new do |spec|
 
   spec.files = Dir[
     "lib/**/*.rb",
+    "sig/**/*.rbs",
     "bin/rbagent",
     # The bundled model configuration: without it an installed gem has no
     # providers and every launch fails with "unknown model".
