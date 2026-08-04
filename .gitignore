@@ -2,3 +2,6 @@
 *.cursor
 *.requests
 tmp/
+
+# build artifacts
+*.gem
