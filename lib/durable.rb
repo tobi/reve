@@ -8,6 +8,7 @@
 Warning[:experimental] = false if Warning.respond_to?(:[]=)
 
 require "set"
+require_relative "durable/version"
 require_relative "durable/ipc"
 require_relative "durable/ids"
 require_relative "durable/records"
@@ -31,6 +32,4 @@ require_relative "durable/project"
 require_relative "durable/lane"
 require_relative "durable/harness"
 
-module Durable
-  VERSION = "0.1.0"
-end
+
