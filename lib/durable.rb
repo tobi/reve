@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 # A durable coding agent in pure Ruby on Ractors.
-# Design: pi's harness-v2 (see PLAN.md).
+# Design: omp's durable harness (see PLAN.md).
 #
 # Everything must be required *before* any Ractor is spawned: a non-main Ractor
 # cannot `require`.
@@ -25,6 +25,9 @@ require_relative "durable/agents_md"
 require_relative "durable/skills"
 require_relative "durable/compaction"
 require_relative "durable/prompt"
+require_relative "durable/tool_dsl"
+require_relative "durable/sandbox"
+require_relative "durable/project"
 require_relative "durable/lane"
 require_relative "durable/harness"
 

@@ -37,13 +37,18 @@ module Durable
 
     # Phase 1 — clearance. Tool lookup, validation, before_tool (may block),
     # abort checks. No effect starts here.
+    #
+    # `active` maps tool name => declaration. A declaration whose "runner" is
+    # "host" is a project tool: its body is a Ruby block, so it cannot run in a
+    # tool Ractor and is dispatched back to the host instead.
     def prepare_tool_call(call, active, callbacks, abort_check = nil)
       name = call["name"]
+      declaration = active[name]
       return immediate(call, "Aborted before execution.") if abort_check&.call
-      return immediate(call, "unknown tool: #{name}") unless active.include?(name) && Tools.spec(name)
+      return immediate(call, "unknown tool: #{name}") unless declaration
 
       args = call["arguments"] || {}
-      if (err = Tools.validate(name, args))
+      if (err = validate(declaration, args))
         return immediate(call, err)
       end
 
@@ -53,7 +58,15 @@ module Durable
       end
 
       args = hook["args"] if hook && hook["args"]
-      { kind: "prepared", call: call, name: name, args: args, replay: Tools.replay_of(name) }
+      { kind: "prepared", call: call, name: name, args: args,
+        replay: declaration["replay"] || "never", runner: declaration["runner"] || "ractor" }
+    end
+
+    def validate(declaration, args)
+      missing = (declaration.dig("parameters", "required") || []) - args.keys
+      return nil if missing.empty?
+
+      "missing required argument(s): #{missing.join(", ")}"
     end
 
     def immediate(call, text)
@@ -63,9 +76,14 @@ module Durable
 
     # Phase 2 — the effect, in its own Ractor. Abort signals the tool rather
     # than waiting it out: a `sleep 60` must not hold a run open for a minute.
-    def execute_tool_call(prepared, cwd, emit = nil, abort_check = nil)
+    def execute_tool_call(prepared, cwd, emit = nil, abort_check = nil, remote: nil)
       emit&.call({ "type" => "tool_start", "toolCallId" => prepared[:call]["id"],
                    "toolName" => prepared[:name], "args" => prepared[:args] })
+      if prepared[:runner] == "host"
+        raw = remote.call(prepared[:name], prepared[:args])
+        return { "content" => raw["content"], "isError" => !!raw["isError"], "details" => raw["details"] }
+      end
+
       ractor = Tools.spawn(prepared[:name], prepared[:args], cwd)
       result = await_tools({ prepared[:call]["id"] => ractor }, abort_check).values.first
       { "content" => result["content"], "isError" => !!result["isError"], "details" => result["details"] }
@@ -152,18 +170,31 @@ module Durable
       if sequential
         prepared.each do |p|
           executed[p[:call]["id"]] =
-            p[:kind] == "prepared" ? execute_tool_call(p, cwd, emit, abort_check) : p[:result]
+            if p[:kind] == "prepared"
+              execute_tool_call(p, cwd, emit, abort_check, remote: options[:remote])
+            else
+              p[:result]
+            end
         end
       else
         ractors = {}
+        host_threads = {}
         prepared.each do |p|
           next unless p[:kind] == "prepared"
+
+          if p[:runner] == "host"
+            emit&.call({ "type" => "tool_start", "toolCallId" => p[:call]["id"],
+                         "toolName" => p[:name], "args" => p[:args] })
+            host_threads[p[:call]["id"]] = Thread.new { options[:remote].call(p[:name], p[:args]) }
+            next
+          end
 
           emit&.call({ "type" => "tool_start", "toolCallId" => p[:call]["id"],
                        "toolName" => p[:name], "args" => p[:args] })
           ractors[p[:call]["id"]] = Tools.spawn(p[:name], p[:args], cwd)
         end
         raw_results = await_tools(ractors, abort_check)
+        host_threads.each { |id, t| raw_results[id] = t.value }
         prepared.each do |p|
           executed[p[:call]["id"]] =
             if p[:kind] == "prepared"

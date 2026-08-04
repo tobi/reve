@@ -9,16 +9,18 @@ module Durable
   # the `read` tool, or loaded eagerly by `/skill <name>`.
   #
   # Discovery, project before user (project wins on a name collision):
-  #   ./.agents/skills  ./.pi/skills  ./.rbagent/skills
-  #   ~/.agents/skills  ~/.pi/agent/skills  ~/.config/rbagent/skills
+  #   ./.agents/skills  ./.agent/skills  ./.rbagent/skills
+  #   ~/.agents/skills  ~/.agent/skills  ~/.config/rbagent/skills
   #
-  # Rules, matching pi: a directory containing SKILL.md is a skill root and is
-  # not recursed into; otherwise direct .md children of a skills root count, and
+  # Rules: a directory containing SKILL.md is a skill root and is not recursed
+  # into; otherwise direct .md children of a skills root count, and
   # subdirectories are searched for SKILL.md.
   module Skills
     MAX_NAME = 64
     MAX_DESCRIPTION = 1024
-    PROJECT_DIRS = [".agents/skills", ".pi/skills", ".rbagent/skills"].freeze
+    # "skills/" comes first: in an agent directory (instructions.md, tools/,
+    # skills/) that is where they live.
+    PROJECT_DIRS = ["skills", ".agents/skills", ".pi/skills", ".rbagent/skills"].freeze
     USER_DIRS = ["~/.agents/skills", "~/.pi/agent/skills", "~/.config/rbagent/skills"].freeze
 
     module_function

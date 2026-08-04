@@ -4,9 +4,9 @@ require_relative "agents_md"
 require_relative "skills"
 
 module Durable
-  # System prompt construction, modelled on pi's: a short role statement, the
-  # available tools with one-line snippets, guidelines, then project context
-  # (AGENTS.md), then skills, and the working directory last.
+  # System prompt construction: a short role statement, the available tools with
+  # one-line snippets, guidelines, then project context (AGENTS.md), then skills,
+  # and the working directory last.
   module Prompt
     # One line per tool, in the order they should be considered.
     SNIPPETS = {

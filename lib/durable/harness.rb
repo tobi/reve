@@ -10,6 +10,9 @@ require_relative "prompt"
 require_relative "agents_md"
 require_relative "skills"
 require_relative "compaction"
+require_relative "project"
+require_relative "sandbox"
+require_relative "tool_dsl"
 
 module Durable
   # The harness (§8). Lives in the main Ractor: it owns the store Ractor, the
@@ -32,29 +35,37 @@ module Durable
     def initialize(storage: "memory", path: nil, model: nil, system_prompt: nil,
                    active_tools: nil, thinking_level: "off", retry_policy: nil, compaction: nil,
                    cwd: Dir.pwd, tool_execution: "parallel", models_config: nil, agents_md: true,
-                   skills: true, skill_dirs: [], user_skills: true)
+                   skills: true, skill_dirs: [], user_skills: true, project: nil, sandbox: nil)
+      # An agent is a directory: instructions.md, tools/, skills/, sandbox/.
+      @project = project.is_a?(Project) ? project : (project == false ? nil : Project.load(cwd, user_skills: user_skills))
+      @sandbox = sandbox || Sandbox.resolve(@project ? @project.sandbox_config : { "hostWorkspace" => cwd })
       @store = Store.spawn(kind: storage, path: path, metadata: { "cwd" => cwd })
       @hub = Observer.spawn(store: @store)
       @session = Session.new(@store)
       @models_config = models_config || Provider::Models.load
-      @model = model.is_a?(String) ? Provider::Models.resolve(@models_config, model) : model
-      raise ArgumentError, "unknown model #{model.inspect}" if @model.nil?
+      spec = model || @project&.config&.dig("model")
+      @model = spec.is_a?(String) ? Provider::Models.resolve(@models_config, spec) : spec
+      raise ArgumentError, "unknown model #{spec.inspect}" if @model.nil?
 
       @agents = agents_md ? AgentsMd.discover(cwd) : []
       @agents_loaded = @agents.map { _1["path"] }
       loaded = skills ? Skills.load(cwd: cwd, extra_dirs: skill_dirs, user: user_skills)
                       : { "skills" => [], "diagnostics" => [] }
       @skills = loaded["skills"]
-      @skill_diagnostics = loaded["diagnostics"]
+      @skill_diagnostics = loaded["diagnostics"] + (@project&.diagnostics || [])
+      @project_tools = @project ? @project.tools : []
+      project_declarations = @project_tools.map { _1.declaration }
+      active_names = active_tools || @project&.config&.dig("activeTools") ||
+                     (Tools.names + project_declarations.map { _1["name"] })
       @config = {
         "model" => @model,
         "models" => Provider::Models.list(@models_config),
-        "systemPrompt" => system_prompt || Prompt.system_prompt(cwd: cwd, agents: @agents, skills: @skills,
-                                                                tools: active_tools || Tools.names),
-        "activeToolNames" => active_tools || Tools.names,
-        "thinkingLevel" => thinking_level,
-        "retry" => retry_policy || { "maxAttempts" => 5, "baseMs" => 500 },
-        "compaction" => compaction || { "threshold" => 0.8 },
+        "systemPrompt" => system_prompt || build_system_prompt(cwd, active_names),
+        "activeToolNames" => active_names,
+        "projectTools" => project_declarations,
+        "thinkingLevel" => thinking_level || @project&.config&.dig("thinkingLevel") || "off",
+        "retry" => retry_policy || @project&.config&.dig("retry") || { "maxAttempts" => 5, "baseMs" => 500 },
+        "compaction" => compaction || @project&.config&.dig("compaction") || { "threshold" => 0.8 },
         "cwd" => cwd,
         "toolExecution" => tool_execution
       }
@@ -69,6 +80,18 @@ module Durable
 
     # The AGENTS.md files that are part of the system prompt.
     def agents_md = @agents
+    def project = @project
+    def sandbox = @sandbox
+    def project_tools = @project_tools
+
+    def build_system_prompt(cwd, active_names)
+      if @project&.agent?
+        @project.system_prompt(tools: active_names, sandbox: @sandbox)
+      else
+        base = Prompt.system_prompt(cwd: cwd, agents: @agents, skills: @skills, tools: active_names)
+        @sandbox&.isolated? ? "#{base}\n\nYour sandbox: #{@sandbox.describe}." : base
+      end
+    end
 
     # Skills and the diagnostics collected while loading them (over-long
     # descriptions, invalid names, name collisions). The caller decides how
@@ -178,6 +201,7 @@ module Durable
 
       @closed = true
       @lanes.each_value(&:close)
+      quietly { @sandbox&.stop if @sandbox&.isolated? }
       quietly { IPC.cast(@hub, "close") }
       quietly { @session.close }
       @host_thread&.kill
@@ -247,6 +271,7 @@ module Durable
           IPC.serve(msg) do |op, arg, _port|
             case op
             when "hook" then run_hook(arg["hook"], arg["lane"], arg["payload"])
+            when "run_tool" then run_project_tool(arg["tool"], arg["args"], arg["lane"])
             else raise ArgumentError, "unknown host op #{op}"
             end
           end
@@ -254,6 +279,17 @@ module Durable
       rescue Ractor::ClosedError
         nil
       end
+    end
+
+    # Project tools run here: their bodies are Ruby blocks and the sandbox
+    # connection lives in this Ractor. Each call gets its own thread, so a slow
+    # tool does not block the host's hook traffic.
+    def run_project_tool(name, args, lane_name)
+      definition = @project_tools.find { _1.name == name }
+      return { "content" => [{ "type" => "text", "text" => "unknown tool: #{name}" }], "isError" => true } unless definition
+
+      context = ToolDSL::Context.new(sandbox: @sandbox, cwd: @config["cwd"], lane: lane_name, harness: self)
+      Thread.new { ToolDSL.invoke(definition, args || {}, context) }.value
     end
 
     def run_hook(name, lane_name, payload)

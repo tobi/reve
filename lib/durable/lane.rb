@@ -407,11 +407,11 @@ module Durable
           # invisible from the entries alone.
           messages = transform_context(context_messages)
           prompt = @op.dig("intent", "systemPromptOverride") || system_prompt
-          check_cache_prefix(prompt, messages, tool_declarations)
+          check_cache_prefix(prompt, messages, tool_declarations.values)
           final = AgentLoop.stream_assistant(
             messages,
             { model: model, system_prompt: prompt,
-              tools: tool_declarations, thinking_level: effective_thinking,
+              tools: tool_declarations.values, thinking_level: effective_thinking,
               abort_check: -> { @abort } },
             method(:on_stream_event).to_proc
           )
@@ -480,10 +480,18 @@ module Durable
             append_if_missing(Records.message_entry(message, id: id))
           end
         }
-        AgentLoop.execute_tool_batch(assistant, active_tool_names, callbacks,
+        AgentLoop.execute_tool_batch(assistant, tool_declarations, callbacks,
                                      { cwd: @config["cwd"] || Dir.pwd,
-                                       tool_execution: @config["toolExecution"] },
+                                       tool_execution: @config["toolExecution"],
+                                       remote: method(:run_host_tool).to_proc },
                                      method(:emit_raw).to_proc, -> { @abort })
+      end
+
+      # A project tool: the host owns the block (and the sandbox connection).
+      def run_host_tool(name, args)
+        Durable::IPC.call(@host, "run_tool", { "tool" => name, "args" => args, "lane" => @lane })
+      rescue Durable::RemoteError => e
+        { "content" => [{ "type" => "text", "text" => "tool #{name} failed: #{e.message}" }], "isError" => true }
       end
 
       # Recovery path: each call of the batch at its own crash site (§6).
@@ -494,12 +502,14 @@ module Durable
 
           started = call["started"]
           if started
-            current = Tools.replay_of(started["toolName"])
+            current = (tool_declarations.dig(started["toolName"], "replay") || "never")
             if started["replay"] == "safe" && current == "safe"
               prepared = { kind: "prepared", call: call["toolCall"], name: started["toolName"],
-                           args: started["effectiveArgs"], replay: "safe" }
+                           args: started["effectiveArgs"], replay: "safe",
+                           runner: tool_declarations.dig(started["toolName"], "runner") || "ractor" }
               executed = AgentLoop.execute_tool_call(prepared, @config["cwd"] || Dir.pwd,
-                                                     method(:emit_raw).to_proc, -> { @abort })
+                                                     method(:emit_raw).to_proc, -> { @abort },
+                                                     remote: method(:run_host_tool).to_proc)
               result = AgentLoop.finalize_tool_call(prepared, executed, {})
               msg = AgentLoop.tool_result_message(prepared, result)
               append_if_missing(Records.message_entry(msg, id: started["resultEntryId"]))
@@ -931,11 +941,24 @@ module Durable
         (hook && hook["messages"]) || messages
       end
 
-      def tool_declarations = Tools.declarations(active_tool_names)
+      # name => declaration, built-ins plus the project's own tools (which the
+      # host runs, because their bodies are Ruby blocks).
+      def tool_declarations
+        map = {}
+        Tools.declarations(active_tool_names & Tools.names).each { map[_1["name"]] = _1.merge("runner" => "ractor") }
+        (@config["projectTools"] || []).each do |d|
+          next unless active_tool_names.include?(d["name"])
+
+          map[d["name"]] = d.merge("runner" => "host")
+        end
+        map
+      end
 
       def active_tool_names
         entry = @session.find_entry_on_branch("type" => "active_tools_change")
-        entry ? entry["activeToolNames"] : (@config["activeToolNames"] || Tools.names)
+        return entry["activeToolNames"] if entry
+
+        @config["activeToolNames"] || (Tools.names + (@config["projectTools"] || []).map { _1["name"] })
       end
 
       def effective_thinking
@@ -959,9 +982,10 @@ module Durable
       end
 
       def missing_identities
+        known = tool_declarations
         tools = (@op&.dig("toolBatch", "calls") || []).filter_map do |c|
           name = c.dig("started", "toolName")
-          name if name && !Tools.spec(name)
+          name if name && !known.key?(name)
         end
         model = effective_model
         { "tools" => tools.uniq, "models" => model && model["modelId"] ? [] : [effective_model_spec.to_s] }

@@ -5,6 +5,21 @@ require "optparse"
 require_relative "../lib/durable"
 require_relative "../lib/durable/tui"
 
+# `rbagent init` scaffolds an agent directory, eve-style: instructions.md is all
+# you need, the rest are optional building blocks.
+if ARGV.first == "init"
+  ARGV.shift
+  target = ARGV.shift || Dir.pwd
+  force = ARGV.delete("--force")
+  result = Durable::Project.init(target, force: !force.nil?)
+  puts "\e[1minitialised #{result["root"]}\e[0m"
+  result["created"].each { puts "  \e[32m+\e[0m #{_1}" }
+  result["skipped"].each { puts "  \e[2m· #{_1} (exists)\e[0m" }
+  puts
+  puts "  edit \e[1minstructions.md\e[0m, then run \e[1mrbagent\e[0m in this directory"
+  exit 0
+end
+
 options = {
   storage: "jsonl",
   model: ENV["RBAGENT_MODEL"] || "vllm",
@@ -16,9 +31,10 @@ options = {
 }
 
 OptionParser.new do |o|
-  o.banner = "usage: rbagent [options] [prompt]"
+  o.banner = "usage: rbagent [options] [prompt]\n       rbagent init [dir]   scaffold an agent directory"
   o.on("-m", "--model SPEC", "provider, provider/model-id, or model-id (default #{options[:model]})") do
     options[:model] = _1
+    options[:model_given] = true
   end
   o.on("-s", "--session PATH", "session file (JSONL)") { options[:session] = _1 }
   o.on("-c", "--continue", "continue the newest session for this directory") { options[:continue] = true }
@@ -37,9 +53,16 @@ end.parse!
 
 prompt_arg = ARGV.join(" ") unless ARGV.empty?
 
-SESSION_ROOT = File.expand_path("~/.rbagent/sessions")
-slug = options[:cwd].gsub(%r{[/\\]}, "-").sub(/\A-/, "")
-dir = File.join(SESSION_ROOT, slug)
+# An agent directory keeps its sessions with itself; a plain checkout keeps them
+# under ~/.rbagent.
+PROJECT = Durable::Project.load(options[:cwd])
+dir =
+  if PROJECT.agent?
+    PROJECT.sessions_dir
+  else
+    slug = options[:cwd].gsub(%r{[/\\]}, "-").sub(/\A-/, "")
+    File.join(File.expand_path("~/.rbagent/sessions"), slug)
+  end
 
 if options[:list]
   Dir.glob(File.join(dir, "*.jsonl")).sort.reverse.each do |f|
@@ -60,7 +83,8 @@ path =
 
 harness, suspended = Durable::Harness.create(
   storage: options[:storage], path: options[:storage] == "jsonl" ? path : nil,
-  model: options[:model], cwd: options[:cwd]
+  model: options[:model_given] ? options[:model] : (PROJECT.config["model"] || options[:model]),
+  cwd: options[:cwd], project: PROJECT
 )
 
 # A default policy hook: destructive tools outside the workspace need a reason.
