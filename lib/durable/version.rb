@@ -3,5 +3,5 @@
 # Kept in its own file so the gemspec can read the version without loading the
 # agent (and everything it requires).
 module Durable
-  VERSION = "0.5.0"
+  VERSION = "0.6.0"
 end

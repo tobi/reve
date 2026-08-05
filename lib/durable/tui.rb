@@ -72,6 +72,11 @@ module Durable
       @stream_open = false
       @line_buf = +""
       @in_code = false
+      @turns = 0
+      @outputs = []
+      @tool_args = {}
+      @tool_started_at = {}
+      @echoed = []
       @out = $stdout
     end
 
@@ -466,7 +471,7 @@ module Durable
     # A quiet boundary between turns — the scrollback reads as one long stream
     # otherwise, and a finished turn is a paragraph, not a full stop.
     def turn_separator
-      return unless @turns.positive?
+      return unless @turns.to_i.positive?
 
       emit(s(:dim, "  #{'─' * 16}"))
     end

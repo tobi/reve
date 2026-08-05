@@ -46,6 +46,10 @@ OptionParser.new do |o|
   o.on("--memory", "keep the session in memory only") { options[:storage] = "memory" }
   o.on("--plain", "run in a directory that is not an agent directory") { options[:plain] = true }
   o.on("--list", "list sessions for this directory") { options[:list] = true }
+  o.on("-v", "--version", "print the version") do
+    puts "rbagent #{Durable::VERSION}"
+    exit 0
+  end
   o.on("-h", "--help") do
     puts o
     exit 0

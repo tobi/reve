@@ -50,8 +50,31 @@ end
 desc "build and install the gem locally"
 task install: :build do
   sh "gem", "install", "--local", GEM_FILE
+  # gem install keeps every older version around; one installed rbagent is
+  # enough, and a stale one on PATH is a confusing bug report.
+  sh "gem", "cleanup", GEM_NAME do |ok, _|
+    warn "gem cleanup failed; older versions are still installed" unless ok
+  end
   puts
   puts "installed #{GEM_NAME} #{Durable::VERSION} — run `rbagent init` in a directory to start one"
+
+  # rubygems warns that the executable will not run and then leaves it there.
+  # Say what to do about it, with the actual path.
+  bindir = Gem.bindir
+  on_path = ENV["PATH"].to_s.split(File::PATH_SEPARATOR).include?(bindir)
+  next if on_path
+
+  puts
+  puts "  \e[33mrbagent is installed in #{bindir}, which is not on your PATH\e[0m"
+  hints = [["export PATH=\"#{bindir}:$PATH\"", "add this to your shell profile"],
+           ["#{bindir}/rbagent --help", "or run it directly"]]
+  hints << ["mise reshim", "if ruby comes from mise"] if which("mise")
+  width = hints.map { _1.first.length }.max
+  hints.each { |cmd, note| puts "    #{cmd.ljust(width)}   \e[2m# #{note}\e[0m" }
+end
+
+def which(cmd)
+  ENV["PATH"].to_s.split(File::PATH_SEPARATOR).any? { |d| File.executable?(File.join(d, cmd)) }
 end
 
 desc "remove the locally installed gem"

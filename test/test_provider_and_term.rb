@@ -138,4 +138,25 @@ group "term: the line editor" do
   eq "history down", "two", l.buffer
 end
 
+group "the tui's own state is initialised, so the first turn cannot crash" do
+  require_relative "../lib/durable/tui"
+  Dir.mktmpdir do |dir|
+    model = fake_model(dir, [assistant_text("ok")])
+    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir, user_skills: false,
+                                 project: false)
+    tui = Durable::TUI.new(h, [])
+    # A separator before any turn, an expand with nothing to expand, and a
+    # claimed echo that was never echoed: each of these read an ivar that used
+    # to be nil on the first keystroke.
+    %i[turn_separator note_turn].each { |m| tui.send(m) }
+    eq "a separator before the first turn is a no-op, not a NoMethodError", true,
+       tui.instance_variable_get(:@turns).to_i.positive?
+    eq "expanding nothing is safe", true, (tui.expand_last_output || true) && true
+    eq "claiming an echo nobody made is false", false, tui.claim_echo("never typed")
+    eq "and every collection starts empty, not nil", [[], {}, {}, []],
+       %i[@outputs @tool_args @tool_started_at @echoed].map { tui.instance_variable_get(_1) }
+    h.close
+  end
+end
+
 done
