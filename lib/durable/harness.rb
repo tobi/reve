@@ -10,6 +10,7 @@ require_relative "prompt"
 require_relative "agents_md"
 require_relative "skills"
 require_relative "compaction"
+require "fileutils"
 require_relative "project"
 require_relative "sandbox"
 require_relative "tool_dsl"
@@ -39,6 +40,9 @@ module Durable
       # An agent is a directory: instructions.md, tools/, skills/, sandbox/.
       @project = project.is_a?(Project) ? project : (project == false ? nil : Project.load(cwd, user_skills: user_skills))
       @sandbox = sandbox || Sandbox.resolve(@project ? @project.sandbox_config : { "hostWorkspace" => cwd })
+      # The bind-mount source and every tool's cwd; one mkdir at boot beats a
+      # spawn failure on the first command.
+      FileUtils.mkdir_p(@project.workspace_dir) if @project&.agent?
       @store = Store.spawn(kind: storage, path: path, metadata: { "cwd" => cwd })
       @hub = Observer.spawn(store: @store)
       @session = Session.new(@store)

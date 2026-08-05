@@ -985,6 +985,8 @@ module Durable
       if rest.nil? || rest.empty?
         emit("  #{sb.describe}")
         emit(s(:dim, "  backend #{sb.backend_name}#{sb.isolated? ? "" : " — commands run on this machine"}"))
+        emit(s(:dim, "  #{sb.mount_description}"))
+        emit(s(:dim, "  egress #{sb.config["allowAll"] ? "open" : (sb.config["allowHosts"] || []).join(", ")}"))
         emit(s(:yellow, "  fallback: #{sb.config["fallbackReason"]}")) if sb.config["fallbackReason"]
         return
       end

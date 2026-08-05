@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "fileutils"
 require_relative "tools"
 require_relative "sandbox/microsandbox"
 require_relative "sandbox/host_auth"
@@ -76,7 +77,13 @@ module Durable
         "env" => config["env"] || {}
       }
       if config["mountWorkspace"]
-        opts["volumes"] = { workdir => { "bind" => host_workspace } }
+        # A bind mount, explicitly: the guest writes straight through to the
+        # host directory (that is the point — you can read the work afterwards),
+        # with nosuid/nodev because nothing in a workspace needs either.
+        opts["volumes"] = {
+          workdir => { "bind" => host_workspace, "readonly" => false,
+                       "nosuid" => true, "nodev" => true }
+        }
       end
       network = network_options(config)
       opts["network"] = network unless network.empty?
@@ -252,6 +259,8 @@ module Durable
         @mutex.synchronize do
           return self if @started
 
+          ensure_workspace!
+
           @vm.create(sandbox_name, Sandbox.create_options(@config, host_workspace, workdir))
           @started = true
           provision! if @config["provision"]
@@ -260,8 +269,17 @@ module Durable
         self
       end
 
+      # The bind source has to exist before the mount does — and a local run
+      # needs the same directory for the same reason.
+      def ensure_workspace!
+        FileUtils.mkdir_p(host_workspace) unless File.directory?(host_workspace)
+      rescue SystemCallError
+        nil
+      end
+
       # => { "stdout", "stderr", "exitCode" }
       def exec(command, timeout: 120, cancel: nil)
+        ensure_workspace!
         if @vm
           start
           @vm.exec("sh", args: ["-lc", command], cwd: workdir, timeout: timeout, cancel: cancel)
@@ -289,10 +307,12 @@ module Durable
       end
 
       def read_file(path)
+        ensure_workspace!
         @vm ? (start && @vm.read_file(absolute(path))) : File.read(File.expand_path(path, host_workspace))
       end
 
       def write_file(path, content)
+        ensure_workspace!
         if @vm
           start
           @vm.write_file(absolute(path), content)
@@ -312,6 +332,12 @@ module Durable
         nil
       end
 
+      def mount_description
+        return "no workspace mount" unless @config["mountWorkspace"]
+
+        "bind #{host_workspace} → #{workdir} (rw)"
+      end
+
       def describe
         if @vm
           extras = []
@@ -319,7 +345,7 @@ module Durable
           extras << "mise #{(@config["mise"] || []).join(",")}" unless (@config["mise"] || []).empty?
           extras << (@config["allowAll"] ? "network open" : "net #{(@config["allowHosts"] || []).size} hosts")
           "microsandbox #{@config["image"]} (#{@config["cpus"]} cpu, #{@config["memory"]}MB" \
-            "#{extras.empty? ? "" : ", #{extras.join(", ")}"}) → #{workdir}"
+            "#{extras.empty? ? "" : ", #{extras.join(", ")}"}) #{mount_description}"
         else
           "local (no isolation) → #{host_workspace}"
         end

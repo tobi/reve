@@ -111,8 +111,9 @@ workspace/             the work: /workspace in the sandbox, cwd for every comman
 ```
 
 The split matters: the agent's own definition lives in the agent directory, and the
-material it works on lives in `workspace/`, which is mounted at `/workspace` and is the
-working directory for every command — so a relative path means the same thing on the host
+material it works on lives in `workspace/`, which is **bind-mounted** at `/workspace`
+(read-write, `nosuid`, `nodev` — the only mount) and is the working directory for every
+command — so a relative path means the same thing on the host
 and inside the VM. `workspace/AGENTS.md` ships pointing at the toolchain (`fd`, `rg`,
 `ast-grep`, `jq`, `gh`, `mise`), and both AGENTS.md files are in scope, outermost first.
 

@@ -194,6 +194,28 @@ group "inline instructions in agent.rb work too" do
   end
 end
 
+group "the workspace directory is created for the bind mount" do
+  Dir.mktmpdir do |root|
+    File.write(File.join(root, "instructions.md"), "Be useful.")
+    p = Durable::Project.load(root, user_skills: false)
+    eq "loading a project creates nothing", false, File.directory?(File.join(root, "workspace"))
+    eq "but the workspace never falls back to the agent directory",
+       File.join(root, "workspace"), p.workspace_dir
+    model = fake_model(root, [assistant_text("ok")])
+    h, = Durable::Harness.create(storage: "memory", model: model, cwd: root, user_skills: false)
+    eq "opening the agent makes it, because it is a mount source and a cwd", true,
+       File.directory?(File.join(root, "workspace"))
+    h.close
+    eq "which is what the sandbox binds", File.join(root, "workspace"), p.sandbox_config["hostWorkspace"]
+
+    FileUtils.rm_rf(File.join(root, "workspace"))
+    client = Durable::Sandbox.resolve(p.sandbox_config.merge("backend" => "local"), warn_io: nil)
+    r = client.exec("pwd")
+    eq "a local run recreates it rather than failing", true, File.directory?(File.join(root, "workspace"))
+    eq "and starts there", File.join(root, "workspace"), r["stdout"].strip
+  end
+end
+
 group "the workspace is mapped, and the agent's own files are not" do
   Dir.mktmpdir do |root|
     Durable::Project.init(root, name: "mapped")
@@ -201,11 +223,16 @@ group "the workspace is mapped, and the agent's own files are not" do
     h, = Durable::Harness.create(storage: "memory", model: model, cwd: root, user_skills: false)
     eq "tools run in workspace/", File.join(root, "workspace"), h.config["cwd"]
     eq "the agent directory is remembered separately", root, h.config["agentRoot"]
-    eq "the sandbox mounts workspace/ at /workspace",
-       [File.join(root, "workspace"), "/workspace"],
-       [Durable::Sandbox.create_options(h.sandbox.config, h.sandbox.host_workspace,
-                                        h.sandbox.workdir).dig("volumes", "/workspace", "bind"),
-        h.sandbox.workdir]
+    volume = Durable::Sandbox.create_options(h.sandbox.config, h.sandbox.host_workspace,
+                                             h.sandbox.workdir).dig("volumes", "/workspace")
+    eq "workspace/ is bind-mounted at /workspace, read-write",
+       { "bind" => File.join(root, "workspace"), "readonly" => false, "nosuid" => true, "nodev" => true },
+       volume
+    eq "and it is the only mount", ["/workspace"],
+       Durable::Sandbox.create_options(h.sandbox.config, h.sandbox.host_workspace,
+                                       h.sandbox.workdir)["volumes"].keys
+    eq "the mount is what the client reports",
+       "bind #{File.join(root, "workspace")} → /workspace (rw)", h.sandbox.mount_description
     eq "both AGENTS.md files are in scope, outermost first",
        [File.join(root, "AGENTS.md"), File.join(root, "workspace", "AGENTS.md")],
        h.agents_md.map { _1["path"] }
@@ -283,7 +310,9 @@ group "sandbox: create options speak microsandbox's wire shape" do
   cfg = Durable::Sandbox.config("provision" => false, "githubAuth" => false)
   opts = Durable::Sandbox.create_options(cfg, "/host/ws", "/workspace")
   eq "memory is memory_mib", 2048, opts["memory_mib"]
-  eq "the workspace is a bind volume", { "bind" => "/host/ws" }, opts.dig("volumes", "/workspace")
+  eq "the workspace is a bind volume, rw and hardened",
+     { "bind" => "/host/ws", "readonly" => false, "nosuid" => true, "nodev" => true },
+     opts.dig("volumes", "/workspace")
   eq "env travels", "noninteractive", opts.dig("env", "DEBIAN_FRONTEND")
   eq "network policy attached", true, opts.key?("network")
   eq "no empty secrets key", false, opts.key?("secrets")

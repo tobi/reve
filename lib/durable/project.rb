@@ -65,10 +65,15 @@ module Durable
     # /workspace inside the VM, and the agent's own definition is not in it.
     WORKSPACE = "workspace"
 
-    def workspace_dir
-      dir = File.join(@root, WORKSPACE)
-      File.directory?(dir) ? dir : @root
-    end
+    # For an agent, always <root>/workspace — never a fallback to the agent
+    # directory, because that would bind-mount the agent's own definition into
+    # the sandbox, which is the thing this split exists to prevent. Loading a
+    # project creates nothing: the directory appears at init, or the first time
+    # the sandbox needs it.
+    #
+    # A plain checkout (rbagent --plain) has no workspace; the checkout is the
+    # work.
+    def workspace_dir = agent? ? File.join(@root, WORKSPACE) : @root
 
     def workspace? = File.directory?(File.join(@root, WORKSPACE))
     def name = @config["name"] || File.basename(@root)
