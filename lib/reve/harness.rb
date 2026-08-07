@@ -212,6 +212,10 @@ module Reve
 
     def set_model(spec)
       m = spec.is_a?(String) ? Provider::Models.resolve(@models_config, spec) : spec
+      if !m && spec.is_a?(String)
+        matches = Array(@discovered_models).select { _1["modelId"] == spec }
+        m = matches.first if matches.size == 1
+      end
       return { "ok" => false, "error" => { "code" => "unknown_model" } } unless m
 
       @config["model"] = m
@@ -224,13 +228,21 @@ module Reve
 
     def available_models(probe: true) = Provider::Models.list(@models_config, probe: probe)
 
-    def model_completions
+    def model_completions(probe: false)
       providers = (@models_config["providers"] || {})
-      ids = providers.values.flat_map { (_1["models"] || []).map { |model| model["id"] } }
+      catalog = if probe
+                  now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+                  if !@model_catalog_at || now - @model_catalog_at > 15
+                    @discovered_models = available_models(probe: true)
+                    @model_catalog_at = now
+                  end
+                  @discovered_models
+                else
+                  available_models(probe: false)
+                end
+      ids = catalog.map { _1["modelId"] }
       unique_ids = ids.tally.select { |_id, count| count == 1 }.keys
-      qualified = providers.flat_map do |provider, config|
-        (config["models"] || []).map { |model| "#{provider}/#{model["id"]}" }
-      end
+      qualified = catalog.map { "#{_1["provider"]}/#{_1["modelId"]}" }
       current = [@model && "#{@model["provider"]}/#{@model["modelId"]}", @model && @model["modelId"]]
       (providers.keys + qualified + unique_ids + current.compact).uniq.sort
     end

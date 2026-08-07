@@ -18,7 +18,7 @@ group "models.yml belongs to the agent directory" do
        %w[llamacpp openai], config.fetch("providers").keys.sort
     eq "OpenAI's default model is explicit", "gpt-5.6-luna",
        config.dig("providers", "openai", "models", 0, "id")
-    eq "llama.cpp uses environment names", ["LLAMA_CPP_BASE", "LLAMA_API_KEY"],
+    eq "llama.cpp uses explicit-$ environment references", ["$LLAMA_CPP_BASE", "$LLAMA_API_KEY"],
        [config.dig("providers", "llamacpp", "baseUrl"), config.dig("providers", "llamacpp", "apiKey")]
   end
 end
@@ -44,6 +44,26 @@ group "explicit config is local and deterministic" do
   end
 end
 
+group "/model catalog discovery queries every provider" do
+  calls = []
+  original = M.method(:live_ids)
+  no_probe = ENV.delete("REVE_NO_PROBE")
+  M.define_singleton_method(:live_ids) do |provider|
+    calls << provider["baseUrl"]
+    ["live-model"]
+  end
+  cfg = { "providers" => { "endpoint" => {
+    "api" => "openai-responses", "baseUrl" => "https://models.example/v1",
+    "models" => [{ "id" => "configured-model" }]
+  } } }
+  found = M.list(cfg, probe: true).map { _1["modelId"] }
+  eq "the configured endpoint is queried", ["https://models.example/v1"], calls
+  eq "live ids augment configured ids", %w[configured-model live-model], found
+ensure
+  ENV["REVE_NO_PROBE"] = no_probe if no_probe
+  M.define_singleton_method(:live_ids, original)
+end
+
 group "missing and unknown choices fail locally" do
   eq "missing explicit file is graceful", { "providers" => {} }, M.load("/definitely/missing.yml")
   cfg = { "providers" => { "fake" => { "api" => "fake", "models" => [{ "id" => "one" }] } } }
@@ -57,9 +77,9 @@ group "provider URLs, API keys and headers resolve only through model constructi
   ENV["REVE_TEST_HEADER"] = "resolved-header"
   config = { "providers" => { "test" => {
     "api" => "openai-responses",
-    "baseUrl" => "REVE_TEST_BASE",
-    "apiKey" => "REVE_TEST_KEY",
-    "headers" => { "X-Resolved" => "REVE_TEST_HEADER", "X-Literal" => "literal" },
+    "baseUrl" => "$REVE_TEST_BASE",
+    "apiKey" => "$REVE_TEST_KEY",
+    "headers" => { "X-Resolved" => "$REVE_TEST_HEADER", "X-Literal" => "literal" },
     "models" => [{ "id" => "tiny" }]
   } } }
   model = M.resolve(config, "test/tiny", probe: false)
@@ -68,11 +88,43 @@ group "provider URLs, API keys and headers resolve only through model constructi
   eq "env header resolves", "resolved-header", model.dig("headers", "X-Resolved")
   eq "literal header remains literal", "literal", model.dig("headers", "X-Literal")
   eq "missing env name becomes empty", "", M.resolve({ "providers" => { "x" => {
-    "apiKey" => "REVE_MISSING_KEY", "models" => [{ "id" => "m" }]
+    "apiKey" => "$REVE_MISSING_KEY", "models" => [{ "id" => "m" }]
   } } }, "x/m", probe: false)["apiKey"]
-  eq "literal key remains literal", "sk-literal", M.resolve({ "providers" => { "x" => {
+  eq "literal key remains literal for programmatic configuration", "sk-literal", M.resolve({ "providers" => { "x" => {
     "apiKey" => "sk-literal", "models" => [{ "id" => "m" }]
   } } }, "x/m", probe: false)["apiKey"]
+end
+
+group "models.yml requires explicit dollar-prefixed environment references" do
+  Dir.mktmpdir do |root|
+    path = File.join(root, "models.yml")
+    File.write(path, "providers:\n  bad:\n    baseUrl: API_BASE\n    apiKey: API_KEY\n")
+    error = begin
+      M.load(path)
+      nil
+    rescue ArgumentError => e
+      e.message
+    end
+    eq "bare API key names are rejected", true, error.include?("apiKey must be a $ENV_VAR")
+
+    File.write(path, "providers:\n  bad:\n    baseUrl: API_BASE\n    apiKey: $API_KEY\n")
+    error = begin
+      M.load(path)
+      nil
+    rescue ArgumentError => e
+      e.message
+    end
+    eq "bare base URL names are rejected", true, error.include?("baseUrl environment reference must start with $")
+
+    File.write(path, "providers:\n  bad:\n    baseUrl: https://example.test/v1\n    apiKey: $(cat /tmp/key)\n")
+    error = begin
+      M.load(path)
+      nil
+    rescue ArgumentError => e
+      e.message
+    end
+    eq "shell substitutions are never executed", true, error.include?("apiKey must be a $ENV_VAR")
+  end
 end
 
 done

@@ -206,12 +206,13 @@ compaction requests are exempt because their cold prefixes are expected.
 
 ## Local configuration
 
-`models.yml` is YAML and belongs to the agent root. Values in `baseUrl`, `apiKey`, and
-`headers` that look like uppercase environment-variable names are resolved when the model
-is built; literal values remain literal. Generated agents default to
-`openai/gpt-5.6-luna`. OpenAI is active in the template; the llama.cpp provider reads
-`LLAMA_CPP_BASE` and `LLAMA_API_KEY`. Provider headers are sent by both supported HTTP
-providers. No model file is read from `$HOME` or from a global Reve directory.
+`models.yml` is YAML and belongs to the agent root. Environment references require an
+explicit `$`: for example, `baseUrl: $LLAMA_CPP_BASE` and `apiKey: $LLAMA_API_KEY`.
+Every `apiKey` in YAML must be a `$ENV_VAR` reference; literal and bare-name API keys are
+rejected. Generated agents default to `openai/gpt-5.6-luna`, and OpenAI is active in the
+template. `/model` and its autocomplete refresh each configured endpoint through
+`<baseUrl>/models`, retaining static declarations when an endpoint is unavailable. No
+model file is read from `$HOME` or from a global Reve directory.
 
 The project uses `openai-responses`, `anthropic-messages`, and a scripted `fake` provider
 for deterministic tests. Provider-specific differences live in each provider's `compat`

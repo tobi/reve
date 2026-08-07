@@ -16,7 +16,8 @@ module Reve
       TEMPLATE = File.expand_path("../../../models.yml", __dir__).freeze
       FILENAME = "models.yml"
 
-      ENV_NAMED = /\A\$?[A-Z][A-Z0-9_]*\z/
+      ENV_NAMED = /\A\$[A-Z][A-Z0-9_]*\z/
+      BASE_ENV_NAMED = ENV_NAMED
 
       module_function
 
@@ -24,7 +25,9 @@ module Reve
         file = path || config_path(config_paths(root))
         return { "providers" => {} } unless file && File.file?(file)
 
-        YAML.safe_load(File.read(file), permitted_classes: [], aliases: false) || {}
+        config = YAML.safe_load(File.read(file), permitted_classes: [], aliases: false) || {}
+        validate_references!(config, file)
+        config
       end
 
       def config_paths(root = nil)
@@ -81,7 +84,7 @@ module Reve
       end
 
       def live_ids(pcfg, timeout: 2.0)
-        base = resolve_env_named(pcfg["baseUrl"]).to_s
+        base = resolve_base_url(pcfg["baseUrl"]).to_s
         return [] if base.empty? || (pcfg["api"] || "").start_with?("anthropic")
 
         uri = URI("#{base.chomp("/")}/models")
@@ -102,16 +105,15 @@ module Reve
         []
       end
 
-      # Configured models are listed immediately. Providers with no local list
-      # are queried at `/models`, which is the common OpenAI-compatible
-      # discovery endpoint. A failed probe is harmless and leaves the list empty.
+      # `/model` and `/models` query every configured provider's OpenAI-style
+      # `/models` endpoint. Keep configured metadata and add live-only ids; a
+      # failed endpoint remains usable from its static declarations.
       def list(config, probe: true)
         (config["providers"] || {}).flat_map do |pname, pcfg|
           configured = pcfg["models"] || []
-          models = configured
-          if models.empty? && probe && !ENV["REVE_NO_PROBE"]
-            models = live_ids(pcfg).map { { "id" => _1 } }
-          end
+          live = probe && !ENV["REVE_NO_PROBE"] ? live_ids(pcfg) : []
+          configured_by_id = configured.to_h { [_1["id"], _1] }
+          models = configured + live.reject { configured_by_id.key?(_1) }.map { { "id" => _1 } }
           models.map { build(pname, pcfg, _1) }
         end
       end
@@ -123,7 +125,7 @@ module Reve
           "modelId" => model["id"],
           "name" => model["name"] || model["id"],
           "api" => pcfg["api"] || "anthropic-messages",
-          "baseUrl" => resolve_env_named(pcfg["baseUrl"]),
+          "baseUrl" => resolve_base_url(pcfg["baseUrl"]),
           "apiKey" => resolve_env_named(
             pcfg["apiKey"] || (pcfg.dig("env", "apiKeyEnv") && ENV[pcfg.dig("env", "apiKeyEnv")])
           ),
@@ -143,7 +145,30 @@ module Reve
         ENV[value.delete_prefix("$")].to_s
       end
 
-      # Header values follow the same convention as apiKey.
+      def resolve_base_url(value)
+        return value unless value.is_a?(String) && value.match?(BASE_ENV_NAMED)
+
+        ENV[value.delete_prefix("$")].to_s
+      end
+
+      def validate_references!(config, file)
+        (config["providers"] || {}).each do |provider, provider_config|
+          if provider_config.key?("apiKey")
+            value = provider_config["apiKey"]
+            unless value.is_a?(String) && value.match?(ENV_NAMED)
+              raise ArgumentError,
+                    "#{file}: provider #{provider.inspect} apiKey must be a $ENV_VAR reference"
+            end
+          end
+          base = provider_config["baseUrl"]
+          if base.is_a?(String) && base.match?(/\A[A-Z][A-Z0-9_]*\z/)
+            raise ArgumentError,
+                  "#{file}: provider #{provider.inspect} baseUrl environment reference must start with $"
+          end
+        end
+      end
+
+      # Header values follow the same explicit-$ convention as apiKey.
       def resolve_headers(pcfg)
         (pcfg["headers"] || {}).each_with_object({}) do |(k, v), out|
           out[k] = resolve_env_named(v)

@@ -642,7 +642,7 @@ module Reve
       case cmd
       when "skill" then @h.skills.map { _1["name"] }.sort
       when "lane" then @h.lanes.map { _1["name"] }
-      when "model" then @h.model_completions
+      when "model" then @h.model_completions(probe: true)
       when "think" then THINK_LEVELS
       when "tools" then Reve::Tools.names
       when "help" then COMMANDS
@@ -1003,8 +1003,10 @@ module Reve
         emit(r["ok"] ? s(:dim, "  #{r["model"]["provider"]}/#{r["model"]["modelId"]}") : s(:yellow, "  unknown model"))
       else
         st = lane_handle.state
-        emit("  #{st.dig("model", "provider")}/#{st.dig("model", "modelId")} " \
-             "#{s(:dim, "thinking=#{st["thinkingLevel"]}")}")
+        current = "#{st.dig("model", "provider")}/#{st.dig("model", "modelId")}"
+        emit("  #{current} #{s(:dim, "thinking=#{st["thinkingLevel"]}")}")
+        choices = @h.model_completions(probe: true).select { _1.include?("/") }
+        choices.each { emit("  #{_1 == current ? s(:green, "●") : s(:dim, "·")} #{_1}") }
       end
     end
 
