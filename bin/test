@@ -6,9 +6,31 @@
 root = File.expand_path("..", __dir__)
 files = Dir.glob(File.join(root, "test", "test_*.rb")).sort
 failed = []
+timeout = Integer(ENV.fetch("TEST_TIMEOUT", "60"))
 files.each do |f|
   puts "\n\e[1m#{File.basename(f)}\e[0m"
-  system(RbConfig.ruby, f) || failed << f
+  $stdout.flush
+  # Each suite owns a process group. If it exceeds the deadline, kill the whole
+  # group — not merely the `timeout` wrapper — so no Ruby, sleep, compiler, or
+  # sandbox child can survive and poison the next run.
+  pid = Process.spawn(RbConfig.ruby, f, pgroup: true)
+  deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+  status = nil
+  until status
+    _, status = Process.waitpid2(pid, Process::WNOHANG)
+    break if status
+
+    if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      warn "\e[31mTIMEOUT after #{timeout}s: #{File.basename(f)}\e[0m"
+      Process.kill("TERM", -pid) rescue nil
+      sleep 0.2
+      Process.kill("KILL", -pid) rescue nil
+      _, status = Process.waitpid2(pid) rescue [nil, nil]
+      break
+    end
+    sleep 0.02
+  end
+  failed << f unless status&.success?
 end
 puts
 if failed.empty?

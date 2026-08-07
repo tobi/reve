@@ -1,12 +1,12 @@
 # frozen_string_literal: true
 
 # rake is a default gem, so this adds no dependency — the stdlib-only rule is
-# about what rbagent needs at runtime, and that is still nothing.
+# about what reve needs at runtime, and that is still nothing.
 require "rake/clean"
-require_relative "lib/durable/version"
+require_relative "lib/reve/version"
 
-GEM_NAME = "rbagent"
-GEM_FILE = "#{GEM_NAME}-#{Durable::VERSION}.gem"
+GEM_NAME = "reve"
+GEM_FILE = "#{GEM_NAME}-#{Reve::VERSION}.gem"
 CLOBBER.include(GEM_FILE, "pkg")
 
 task default: %i[lint rbs test]
@@ -50,13 +50,13 @@ end
 desc "build and install the gem locally"
 task install: :build do
   sh "gem", "install", "--local", GEM_FILE
-  # gem install keeps every older version around; one installed rbagent is
+  # gem install keeps every older version around; one installed reve is
   # enough, and a stale one on PATH is a confusing bug report.
   sh "gem", "cleanup", GEM_NAME do |ok, _|
     warn "gem cleanup failed; older versions are still installed" unless ok
   end
   puts
-  puts "installed #{GEM_NAME} #{Durable::VERSION} — run `rbagent init` in a directory to start one"
+  puts "installed #{GEM_NAME} #{Reve::VERSION} — run `reve init` in a directory to start one"
 
   # rubygems warns that the executable will not run and then leaves it there.
   # Say what to do about it, with the actual path.
@@ -65,9 +65,9 @@ task install: :build do
   next if on_path
 
   puts
-  puts "  \e[33mrbagent is installed in #{bindir}, which is not on your PATH\e[0m"
+  puts "  \e[33mreve is installed in #{bindir}, which is not on your PATH\e[0m"
   hints = [["export PATH=\"#{bindir}:$PATH\"", "add this to your shell profile"],
-           ["#{bindir}/rbagent --help", "or run it directly"]]
+           ["#{bindir}/reve --help", "or run it directly"]]
   hints << ["mise reshim", "if ruby comes from mise"] if which("mise")
   width = hints.map { _1.first.length }.max
   hints.each { |cmd, note| puts "    #{cmd.ljust(width)}   \e[2m# #{note}\e[0m" }
@@ -84,10 +84,10 @@ end
 
 desc "build, install, and check the installed binary runs"
 task verify: :install do
-  sh "rbagent", "--help"
+  sh "reve", "--help"
 end
 
 desc "print the version"
 task :version do
-  puts Durable::VERSION
+  puts Reve::VERSION
 end

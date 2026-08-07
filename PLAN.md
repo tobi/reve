@@ -1,6 +1,6 @@
-# Durable coding agent in pure Ruby, on Ractors
+# Reve coding agent in pure Ruby, on Ractors
 
-Implementation plan. The durable-harness design it follows is documented by omp at
+Implementation plan. The durable-harness design it follows is documented by Pi at
 [harness-v2.md](https://github.com/earendil-works/pi/blob/main/packages/agent/docs/harness-v2.md);
 this document maps it onto Ruby 4 Ractors and records what we build, in which order, and
 what we deliberately leave out.
@@ -58,7 +58,7 @@ runtime. Records and entries are JSON on the wire and JSON on disk — one repre
 | events (passive) | fire-and-forget JSON to the observer hub |
 | `watch()` snapshot + gapless stream | the hub is single-threaded: it mirrors lane state from the event stream, so "capture snapshot + register port" is one atomic hub operation. The Port itself is the buffer; `start` is the consumer's first `receive` |
 | tools | one Ractor per call: args JSON in, result JSON out, no shared state |
-| telemetry | `rbagent.*`-shaped span events on a separate hub topic |
+| telemetry | `reve.*`-shaped span events on a separate hub topic |
 
 Things a Ractor forces us to do differently, all improvements:
 
@@ -72,7 +72,7 @@ Things a Ractor forces us to do differently, all improvements:
 ## 2. Deliverables
 
 ```
-lib/durable/
+lib/reve/
   ipc.rb            Port helpers, JSON codec, request/reply, ractor-local reply ports
   ids.rb            entry/record/run id allocation
   records.rb        record + entry constructors and the record catalog (§5)
@@ -88,7 +88,7 @@ lib/durable/
   provider/         models.yml loading, anthropic-messages SSE, fake provider (§16)
   tools/            bash, read, write, edit, ls, grep, glob
   tui.rb            streaming renderer + slash commands
-bin/rbagent         CLI entry
+bin/reve         CLI entry
 test/               parity + crash-site tests (§20)
 ```
 
@@ -113,7 +113,7 @@ test/               parity + crash-site tests (§20)
 10. **Deferred requests.** Park/redeem path, exercised by the fake provider.
 11. **Project context.** AGENTS.md (static, from the repo root down; nested, on first
     touch, appended to the tool result that touched it).
-12. **Skills.** SKILL.md discovery in `.agents/skills`, `.agent/skills`, `.rbagent/skills` and
+12. **Skills.** SKILL.md discovery in `.agents/skills`, `.agent/skills`, `.reve/skills` and
     the `~/` equivalents; frontmatter validation with diagnostics (name shape, description
     length, collisions); the Agent Skills XML section in the system prompt; `/skill` to run
     one now.
@@ -134,8 +134,8 @@ test/               parity + crash-site tests (§20)
 
 An agent is a directory, and the files in it are its definition: `instructions.md` (the
 authority in the system prompt), `agent.rb` (config), `tools/*.rb` (Ruby DSL), `skills/`,
-`sandbox/sandbox.rb`, `workspace/` (the work), and `.rbagent/sessions/` for the durable
-logs. `rbagent init` scaffolds all of it, and rbagent refuses to launch outside such a
+`sandbox/sandbox.rb`, `workspace/` (the work), and `.reve/sessions/` for the durable
+logs. `reve init` scaffolds all of it, and reve refuses to launch outside such a
 directory (`--plain` overrides).
 
 `workspace/` is the working directory for every tool and is mounted at `/workspace` in the
@@ -160,14 +160,15 @@ parser when it is not, and turned into the JSON schema the model sees — litera
 become enums, `@param` lines become descriptions, `Proc#parameters` decides requiredness.
 Typed blocks are invoked with keywords; the older `|args, ctx|` form still works.
 
-`sig/durable.rbs` covers the library's public surface and `rake rbs` resolves it.
+`sig/reve.rbs` covers the library's public surface and `rake rbs` resolves it.
 
 ## 3b. Sandbox policy
 
-The default sandbox is a provisioned debian microVM (git, ripgrep, fd, jq,
-build-essential, mise with node) whose egress is **deny-by-default with github.com the only
-allowed destination**. Package mirrors are allowed only while provisioning is enabled, so an
-agent that bakes its own image gets the github-only policy and nothing more.
+The mandatory sandbox is a provisioned debian microVM, embedded through the
+`microsandbox-rb` Rust extension (git, ripgrep, fd, jq, build-essential, mise with node).
+There is no local, CLI, or Fiddle fallback. Egress is **deny-by-default with github.com the
+only allowed destination**. Package mirrors are allowed only while provisioning is enabled,
+so an agent that bakes its own image gets the github-only policy and nothing more.
 
 GitHub access uses the host's own credential without copying it into the VM:
 microsandbox's secret proxy substitutes the value into requests to the allowed hosts, and
@@ -186,9 +187,8 @@ the guest only ever holds a placeholder. Discovery order is `$GITHUB_TOKEN`/`$GH
 * Telemetry: span events on the hub, no exporters.
 * Channels, connections, subagents and schedules from eve's model are out of scope for now;
   the directory layout leaves room for them.
-* The microsandbox backend is bound but not exercised against a real microVM here (no `msb`
-  installed); its ABI is covered by a stub library built at test time, and the network
-  policy and secret entries are covered as wire-shape tests.
+* The normal suite mocks the `microsandbox-rb` public API; real microVM coverage is an
+  opt-in integration concern. There is only one production adapter.
 
 ## 5. Invariants we test
 

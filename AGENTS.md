@@ -1,12 +1,16 @@
-# rbagent
+# reve
 
-A durable coding agent in pure Ruby (stdlib only, no gems) on Ractors. The design is
-omp's durable harness (see PLAN.md); PLAN.md maps it onto Ractors and records what is in and
+A durable coding agent in Ruby on Ractors. The design is
+Pi's durable harness (see PLAN.md); PLAN.md maps it onto Ractors and records what is in and
 out of scope.
 
 ## Rules
 
-- Stdlib only. No gems, ever — that constraint is the point of the project.
+- **Sandbox or no Reve.** Microsandbox is provided exclusively by the mandatory
+  `microsandbox-rb` gem. Reve must refuse to start if the VM cannot boot. Every shell
+  command — model `bash`, project `ctx.sh`, and user `!command` — executes inside that VM.
+  Never retain, add, or silently select a host/local shell fallback, even for tests,
+  diagnostics, degraded operation, or convenience.
 - Everything loads before any Ractor spawns: a non-main Ractor cannot `require`.
 - Constants reachable from a Ractor must be shareable (`Ractor.make_shareable`, or a
   frozen literal). `<<~TXT.strip` is *not* frozen — add `.freeze`.
@@ -17,12 +21,14 @@ out of scope.
 - Every new behaviour gets a test in `test/`, and recovery behaviour gets a crash-site
   test that kills a real child process.
 - Project code (`tools/*.rb`, hooks, the sandbox connection) runs in the host Ractor,
-  because blocks and live handles cannot cross a Ractor boundary. Built-in tools run in
-  their own Ractor.
-- FFI means `fiddle`, not the ffi gem. Bind C ABIs through one call helper and test them
-  against a stub shared library built at test time.
+  because blocks and live handles cannot cross a Ractor boundary. “Host Ractor” describes
+  orchestration only: it does not authorize host effects. Sandboxed built-ins dispatch
+  through the VM handle; other built-ins may run in their own Ractor only when they do not
+  execute processes.
+- Do not maintain a second microsandbox transport. Use the public `microsandbox-rb` API and
+  test the adapter against Ruby fakes; real-microVM tests are opt-in integration tests.
 
 ## Commands
 
     bin/test          run every suite, each in its own process
-    bin/rbagent       the agent itself
+    bin/reve       the agent itself

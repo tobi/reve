@@ -9,7 +9,7 @@ Dir.mktmpdir do |dir|
                          assistant_tool("write", { "path" => File.join(dir, "hello.txt"), "content" => "hi" }),
                          assistant_text("wrote it")
                        ])
-    h, susp = Durable::Harness.create(storage: "memory", model: model, system_prompt: "test", cwd: dir)
+    h, susp = test_harness(storage: "memory", model: model, system_prompt: "test", cwd: dir)
     eq "nothing suspended on a fresh session", [], susp
     r = h.prompt("create hello.txt")
     eq "run completed", true, r["ok"]
@@ -30,10 +30,34 @@ Dir.mktmpdir do |dir|
     h.close
   end
 
+  group "model bash has exactly one execution path: the sandbox" do
+    calls = []
+    vm = Object.new
+    vm.define_singleton_method(:create) { |_name, _options| { "handle" => 1 } }
+    vm.define_singleton_method(:stop) { true }
+    vm.define_singleton_method(:exec) do |command, args: [], **options|
+      calls << [command, args, options]
+      { "stdout" => "sandbox-kernel\n", "stderr" => "", "exitCode" => 0, "cancelled" => false }
+    end
+    sandbox = Reve::Sandbox::Client.new(vm, Reve::Sandbox.config(
+      "hostWorkspace" => dir, "provision" => false, "githubAuth" => false
+    ))
+    model = fake_model(dir, [assistant_tool("bash", { "command" => "uname -a" }), assistant_text("done")])
+    h, = test_harness(storage: "memory", model: model, sandbox: sandbox, cwd: dir)
+    h.prompt("identify the kernel")
+    result = entries_of(h.session).find { _1.dig("message", "role") == "toolResult" }
+    eq "the model receives only the VM result", "sandbox-kernel\n",
+       result.dig("message", "content", 0, "text")
+    eq "bash dispatches to the sandbox as sh -lc", ["sh", ["-lc", "uname -a"]], calls.first.first(2)
+    eq "the result records the sandbox transport", "microsandbox-rb",
+       result.dig("message", "details", "sandbox")
+    h.close
+  end
+
   group "busy lane rejects a second operation" do
     model = fake_model(dir, [{ "role" => "assistant", "content" => [{ "type" => "text", "text" => "slow" }],
                                "stopReason" => "stop", "sleep" => 1.0 }])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir)
+    h, = test_harness(storage: "memory", model: model, cwd: dir)
     t = Thread.new { h.prompt("slow one") }
     sleep 0.3
     second = h.prompt("me too")
@@ -48,7 +72,7 @@ Dir.mktmpdir do |dir|
                          assistant_tool("bash", { "command" => "sleep 1; echo done" }),
                          assistant_text("saw the steer")
                        ])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir)
+    h, = test_harness(storage: "memory", model: model, cwd: dir)
     t = Thread.new { h.prompt("run something slow") }
     sleep 0.5
     eq "steer accepted while the tool runs", true, h.steer("focus on the tests")["ok"]
@@ -67,7 +91,7 @@ Dir.mktmpdir do |dir|
 
   group "abort during a tool: synthetic result, closing message, aborted outcome" do
     model = fake_model(dir, [assistant_tool("bash", { "command" => "sleep 5; echo never" })])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir)
+    h, = test_harness(storage: "memory", model: model, cwd: dir)
     t = Thread.new { h.prompt("start a long job") }
     sleep 0.6
     a = h.abort!
@@ -87,7 +111,7 @@ Dir.mktmpdir do |dir|
 
   group "abort signals a running tool instead of waiting it out" do
     model = fake_model(dir, [assistant_tool("bash", { "command" => "sleep 60; echo never" })])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir)
+    h, = test_harness(storage: "memory", model: model, cwd: dir)
     t = Thread.new { h.prompt("start something long") }
     sleep 1.0
     t0 = Time.now
@@ -106,7 +130,7 @@ Dir.mktmpdir do |dir|
     err = { "role" => "assistant", "content" => [], "stopReason" => "error",
             "errorMessage" => "overloaded", "retryable" => true }
     model = fake_model(dir, [err, err, assistant_text("third time")])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir,
+    h, = test_harness(storage: "memory", model: model, cwd: dir,
                                  retry_policy: { "maxAttempts" => 5, "baseMs" => 10 })
     r = h.prompt("flaky")
     eq "run recovers", true, r["ok"]
@@ -121,7 +145,7 @@ Dir.mktmpdir do |dir|
     err = { "role" => "assistant", "content" => [], "stopReason" => "error",
             "errorMessage" => "nope", "retryable" => true }
     model = fake_model(dir, [err, err])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir,
+    h, = test_harness(storage: "memory", model: model, cwd: dir,
                                  retry_policy: { "maxAttempts" => 2, "baseMs" => 10 })
     r = h.prompt("hopeless")
     eq "outcome failed", "failed", r["outcome"]
@@ -138,7 +162,7 @@ Dir.mktmpdir do |dir|
     end
     model = fake_model(dir, [{ "role" => "assistant", "content" => calls, "stopReason" => "toolUse" },
                              assistant_text("all three done")])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir)
+    h, = test_harness(storage: "memory", model: model, cwd: dir)
     t0 = Time.now
     r = h.prompt("three things at once")
     elapsed = Time.now - t0
@@ -156,7 +180,7 @@ Dir.mktmpdir do |dir|
     model = fake_model(dir, [assistant_tool("bash", { "command" => "echo secret" }),
                              assistant_tool("read", { "path" => __FILE__ }, id: "tc2"),
                              assistant_text("ok")])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir)
+    h, = test_harness(storage: "memory", model: model, cwd: dir)
     h.on_hook("before_run") { |_e| { "messages" => [{ "role" => "user",
                                                       "content" => [{ "type" => "text", "text" => "injected" }] }] } }
     h.on_hook("before_tool") { |e| e["toolName"] == "bash" ? { "block" => { "reason" => "no shell today" } } : nil }
@@ -180,7 +204,7 @@ Dir.mktmpdir do |dir|
   group "deferred writes apply at the checkpoint, after the assistant entry" do
     model = fake_model(dir, [{ "role" => "assistant", "content" => [{ "type" => "text", "text" => "thinking" }],
                                "stopReason" => "stop", "sleep" => 0.8 }])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir)
+    h, = test_harness(storage: "memory", model: model, cwd: dir)
     t = Thread.new { h.prompt("hello") }
     sleep 0.3
     h.main.set_persisted("thinkingLevel", "high")
@@ -197,7 +221,7 @@ Dir.mktmpdir do |dir|
     model = fake_model(dir, Array.new(6) { { "role" => "assistant",
                                              "content" => [{ "type" => "text", "text" => "lane reply" }],
                                              "stopReason" => "stop", "sleep" => 0.6 } })
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir)
+    h, = test_harness(storage: "memory", model: model, cwd: dir)
     base = h.session.append_message({ "role" => "user", "content" => [{ "type" => "text", "text" => "shared" }] })
     res = h.create_lane("slack:1", base["id"])
     eq "lane created", true, res["ok"]
@@ -219,7 +243,7 @@ Dir.mktmpdir do |dir|
 
   group "watch(): snapshot first, then a gapless event stream" do
     model = fake_model(dir, [assistant_text("hi there")])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir)
+    h, = test_harness(storage: "memory", model: model, cwd: dir)
     w = h.watch("main")
     eq "snapshot is lane-scoped", "main", w.snapshot["lane"]
     eq "snapshot has no operation", nil, w.snapshot["operation"]
@@ -246,7 +270,7 @@ Dir.mktmpdir do |dir|
 
   group "manual compaction: summary entry, kept suffix, nothing-to-compact" do
     model = fake_model(dir, [assistant_text("one"), assistant_text("two"), assistant_text("SUMMARY OF EVERYTHING")])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir,
+    h, = test_harness(storage: "memory", model: model, cwd: dir,
                                  compaction: { "keepRecentTokens" => 8 })
     empty = h.compact
     eq "nothing to compact on an empty session", "nothing_to_compact", empty.dig("error", "code")
@@ -272,7 +296,7 @@ Dir.mktmpdir do |dir|
 
   group "navigation moves the leaf atomically with operation_finished" do
     model = fake_model(dir, [assistant_text("one"), assistant_text("two"), assistant_text("BRANCH SUMMARY")])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir)
+    h, = test_harness(storage: "memory", model: model, cwd: dir)
     h.prompt("first")
     target = entries_of(h.session).last["id"]
     h.prompt("second")

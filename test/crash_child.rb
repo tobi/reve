@@ -3,12 +3,13 @@
 # A child process that runs one prompt against a JSONL session and dies at a
 # scripted crash site. Used by test_recovery.rb: recovery must be provable
 # against real process death, not a simulated one.
-require_relative "../lib/durable"
+require_relative "helper"
 require "json"
+include TestKit
 
-script = JSON.parse(File.read(ENV.fetch("DURABLE_FAKE_SCRIPT")))
-session_path = ENV.fetch("DURABLE_SESSION")
-prompt = ENV.fetch("DURABLE_PROMPT")
+script = JSON.parse(File.read(ENV.fetch("REVE_FAKE_SCRIPT")))
+session_path = ENV.fetch("REVE_SESSION")
+prompt = ENV.fetch("REVE_PROMPT")
 
 crash_at =
   if script["crashAfterAccept"] then { "site" => "after_accept" }
@@ -21,8 +22,8 @@ crash_at =
 model = { "provider" => "fake", "modelId" => "fake-1", "api" => "fake", "baseUrl" => "", "apiKey" => "",
           "contextWindow" => 200_000, "maxTokens" => 4096, "name" => "fake" }
 
-harness, suspended = Durable::Harness.create(storage: "jsonl", path: session_path, model: model,
-                                             system_prompt: "test", cwd: File.dirname(session_path))
+harness, suspended = test_harness(storage: "jsonl", path: session_path, model: model,
+                                  system_prompt: "test", cwd: File.dirname(session_path))
 harness.main.update_runtime("crashAt" => crash_at) if crash_at
 
 unless suspended.empty?

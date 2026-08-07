@@ -9,7 +9,7 @@ def cached_reply(text, input: 4000, cache_read: 3800)
 end
 
 group "usage is normalised: input includes what was cached" do
-  acc = Durable::Provider::Anthropic::Accumulator.new({ "provider" => "a", "modelId" => "m" })
+  acc = Reve::Provider::Anthropic::Accumulator.new({ "provider" => "a", "modelId" => "m" })
   acc.handle({ "type" => "message_start",
                "message" => { "usage" => { "input_tokens" => 100, "cache_read_input_tokens" => 900,
                                            "cache_creation_input_tokens" => 50 } } })
@@ -25,8 +25,8 @@ group "anthropic asks for caching explicitly" do
   body = nil
   # Build the request the way the provider does, without sending it.
   msgs = [{ "role" => "user", "content" => [{ "type" => "text", "text" => "hi" }] }]
-  provider_messages = Durable::Provider::Anthropic.to_provider_messages(msgs)
-  Durable::Provider::Anthropic.mark_cache_breakpoint(provider_messages)
+  provider_messages = Reve::Provider::Anthropic.to_provider_messages(msgs)
+  Reve::Provider::Anthropic.mark_cache_breakpoint(provider_messages)
   eq "the newest message carries a breakpoint", { "type" => "ephemeral" },
      provider_messages.last["content"].last["cache_control"]
   body = { "system" => [{ "type" => "text", "text" => "sys", "cache_control" => { "type" => "ephemeral" } }] }
@@ -36,7 +36,7 @@ end
 Dir.mktmpdir do |dir|
   group "a stable prefix produces no warning, and the stats show the hits" do
     model = fake_model(dir, [cached_reply("one"), cached_reply("two"), cached_reply("three")])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir, user_skills: false)
+    h, = test_harness(storage: "memory", model: model, cwd: dir)
     warnings = []
     h.on_event { |e| warnings << e if e["type"] == "cache_invalidated" }
     h.prompt("first")
@@ -53,7 +53,7 @@ Dir.mktmpdir do |dir|
 
   group "a deliberate break is announced, not alarming" do
     model = fake_model(dir, [cached_reply("one"), cached_reply("two")])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir, user_skills: false)
+    h, = test_harness(storage: "memory", model: model, cwd: dir)
     warnings = []
     h.on_event { |e| warnings << e if e["type"] == "cache_invalidated" }
     h.prompt("first")
@@ -69,7 +69,7 @@ Dir.mktmpdir do |dir|
 
   group "an unexpected prefix change is the loud one" do
     model = fake_model(dir, [cached_reply("one"), cached_reply("two")])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir, user_skills: false)
+    h, = test_harness(storage: "memory", model: model, cwd: dir)
     warnings = []
     h.on_event { |e| warnings << e if e["type"] == "cache_invalidated" }
     h.prompt("first")
@@ -91,11 +91,15 @@ Dir.mktmpdir do |dir|
 
   group "compaction breaks the cache on purpose" do
     model = fake_model(dir, [cached_reply("one"), cached_reply("two"),
-                             cached_reply("SUMMARY"), cached_reply("three")])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir, user_skills: false,
+                             cached_reply("SUMMARY", input: 5000, cache_read: 0), cached_reply("three")])
+    h, = test_harness(storage: "memory", model: model, cwd: dir,
                                  compaction: { "keepRecentTokens" => 8 })
     warnings = []
-    h.on_event { |e| warnings << e if e["type"] == "cache_invalidated" }
+    misses = []
+    h.on_event do |e|
+      warnings << e if e["type"] == "cache_invalidated"
+      misses << e if e["type"] == "cache_miss"
+    end
     h.prompt("first")
     h.prompt("second")
     h.compact
@@ -104,19 +108,24 @@ Dir.mktmpdir do |dir|
     eq "warned once, for the compaction", 1, warnings.size
     eq "marked expected", true, warnings.first["expected"]
     eq "cause is the compaction", "compaction", warnings.first["cause"]
+    eq "the deliberately cold compaction request is exempt", [], misses
     h.close
   end
 
-  group "a provider that forgets to cache is reported as a miss" do
-    model = fake_model(dir, [cached_reply("one"), cached_reply("two", input: 5000, cache_read: 0)])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir, user_skills: false)
+  group "more than 30% uncached input warns, except a new session" do
+    model = fake_model(dir, [cached_reply("cold", input: 5000, cache_read: 0),
+                             cached_reply("edge", input: 5000, cache_read: 3500),
+                             cached_reply("miss", input: 5000, cache_read: 3499)])
+    h, = test_harness(storage: "memory", model: model, cwd: dir)
     warnings = []
-    h.on_event { |e| warnings << e if e["type"] == "cache_invalidated" }
+    h.on_event { |e| warnings << e if e["type"] == "cache_miss" }
     h.prompt("first")
     h.prompt("second")
+    h.prompt("third")
     sleep 0.2
-    eq "the zero-hit request is flagged", true,
-       warnings.any? { _1["reasons"].any? { |r| r.include?("no cached tokens") } }
+    eq "cold first request is exempt and exactly 30% is fine", 1, warnings.size
+    eq "31-ish percent is reported", true, warnings.first["missRate"] > 0.30
+    eq "warning names uncached input", true, warnings.first["reason"].include?("uncached input")
     eq "counted as a miss", 1, h.state.dig("cache", "misses")
     h.close
   end

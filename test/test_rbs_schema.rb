@@ -3,7 +3,7 @@
 require_relative "helper"
 include TestKit
 
-S = Durable::RbsSchema
+S = Reve::RbsSchema
 
 group "rbs is used when it is there, and not needed when it is not" do
   eq "rbs ships with this ruby", true, S.rbs_available?
@@ -117,7 +117,7 @@ Dir.mktmpdir do |root|
   RUBY
 
   group "a typed tool declares itself from its signature" do
-    loaded = Durable::ToolDSL.load_dir(File.join(root, "tools"))
+    loaded = Reve::ToolDSL.load_dir(File.join(root, "tools"))
     eq "all three load", %w[old_style weather with_ctx], loaded["tools"].map(&:name).sort
     weather = loaded["tools"].find { _1.name == "weather" }.declaration
     eq "description from the comment", "Get the weather for a city.", weather["description"]
@@ -133,35 +133,35 @@ Dir.mktmpdir do |root|
   end
 
   group "a typed tool is called with keywords" do
-    loaded = Durable::ToolDSL.load_dir(File.join(root, "tools"))
-    ctx = Durable::ToolDSL::Context.new(sandbox: nil, cwd: root)
+    loaded = Reve::ToolDSL.load_dir(File.join(root, "tools"))
+    ctx = Reve::ToolDSL::Context.new(sandbox: nil, cwd: root)
     weather = loaded["tools"].find { _1.name == "weather" }
     eq "keywords detected", true, weather.keywords?
     eq "defaults apply for the arguments the model omitted", "Berlin/metric/1",
-       Durable::ToolDSL.invoke(weather, { "city" => "Berlin" }, ctx).dig("content", 0, "text")
+       Reve::ToolDSL.invoke(weather, { "city" => "Berlin" }, ctx).dig("content", 0, "text")
     eq "and the given ones arrive", "Berlin/imperial/3",
-       Durable::ToolDSL.invoke(weather, { "city" => "Berlin", "units" => "imperial", "days" => 3 }, ctx)
+       Reve::ToolDSL.invoke(weather, { "city" => "Berlin", "units" => "imperial", "days" => 3 }, ctx)
                        .dig("content", 0, "text")
     eq "an argument the block does not accept is dropped, not an error", "Berlin/metric/1",
-       Durable::ToolDSL.invoke(weather, { "city" => "Berlin", "nonsense" => 1 }, ctx).dig("content", 0, "text")
+       Reve::ToolDSL.invoke(weather, { "city" => "Berlin", "nonsense" => 1 }, ctx).dig("content", 0, "text")
 
     with_ctx = loaded["tools"].find { _1.name == "with_ctx" }
-    eq "ctx: is injected when asked for", "Durable::ToolDSL::Context:x",
-     Durable::ToolDSL.invoke(with_ctx, { "path" => "x" }, ctx).dig("content", 0, "text")
+    eq "ctx: is injected when asked for", "Reve::ToolDSL::Context:x",
+     Reve::ToolDSL.invoke(with_ctx, { "path" => "x" }, ctx).dig("content", 0, "text")
     eq "ctx is not in the schema", %w[path], with_ctx.declaration.dig("parameters", "properties").keys
 
     old = loaded["tools"].find { _1.name == "old_style" }
     eq "the |args, ctx| form still gets a hash", "hello world",
-       Durable::ToolDSL.invoke(old, { "name" => "world" }, ctx).dig("content", 0, "text")
+       Reve::ToolDSL.invoke(old, { "name" => "world" }, ctx).dig("content", 0, "text")
   end
 
   group "the typed schema is what the model receives" do
     model = fake_model(root, [assistant_tool("weather", { "city" => "Berlin" }), assistant_text("done")])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: root, user_skills: false)
+    h, = test_harness(storage: "memory", model: model, cwd: root)
     h.prompt("weather in Berlin")
-    sent = File.readlines("#{ENV["DURABLE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
+    sent = File.readlines("#{ENV["REVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
     weather = sent.first["messages"] && nil
-    declaration = JSON.parse(File.read("#{ENV["DURABLE_FAKE_SCRIPT"]}.requests").lines.first)
+    declaration = JSON.parse(File.read("#{ENV["REVE_FAKE_SCRIPT"]}.requests").lines.first)
     eq "the tool ran with its defaults filled in", "Berlin/metric/1",
        entries_of(h.session).find { _1.dig("message", "role") == "toolResult" }
          .dig("message", "content", 0, "text")
@@ -180,10 +180,10 @@ group "sig/ describes the library, and rbs agrees" do
     loader.add(path: Pathname(File.expand_path("../sig", __dir__)))
     env = RBS::Environment.from_loader(loader).resolve_type_names
     names = env.class_decls.keys.map(&:to_s)
-    eq "the harness is declared", true, names.include?("::Durable::Harness")
+    eq "the harness is declared", true, names.include?("::Reve::Harness")
     eq "so are the session and the sandbox", true,
-       %w[::Durable::Session ::Durable::Sandbox ::Durable::Project].all? { names.include?(_1) }
-    eq "and the typed-tool machinery", true, names.include?("::Durable::RbsSchema")
+       %w[::Reve::Session ::Reve::Sandbox ::Reve::Project].all? { names.include?(_1) }
+    eq "and the typed-tool machinery", true, names.include?("::Reve::RbsSchema")
   rescue LoadError
     eq "rbs unavailable, nothing to check", true, true
   end

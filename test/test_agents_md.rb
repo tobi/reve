@@ -13,29 +13,29 @@ Dir.mktmpdir do |root|
   File.write(File.join(nested, "gen.rb"), "# generated\n")
 
   group "discovery: repo root down to cwd, outermost first" do
-    files = Durable::AgentsMd.discover(repo)
+    files = Reve::AgentsMd.discover(repo)
     eq "found the root file", [File.join(repo, "AGENTS.md")], files.map { _1["path"] }
     eq "content read", true, files.first["content"].include?("always use tabs")
-    deeper = Durable::AgentsMd.discover(File.join(repo, "lib"))
+    deeper = Reve::AgentsMd.discover(File.join(repo, "lib"), root: repo)
     eq "from a subdirectory the root file is still found", true,
        deeper.map { _1["path"] }.include?(File.join(repo, "AGENTS.md"))
     eq "and it comes before the closer ones", File.join(repo, "AGENTS.md"), deeper.first["path"]
   end
 
   group "the system prompt carries them" do
-    sp = Durable::Prompt.system_prompt(cwd: repo)
+    sp = Reve::Prompt.system_prompt(cwd: repo)
     eq "instructions embedded", true, sp.include?("always use tabs")
     eq "path is attributed", true, sp.include?("<project_instructions path=")
     eq "no AGENTS.md → plain prompt", false,
-       Durable::Prompt.system_prompt(cwd: root).include?("<project_instructions")
+       Reve::Prompt.system_prompt(cwd: root).include?("<project_instructions")
   end
 
   group "a fresh harness loads them without being asked" do
     model = fake_model(root, [assistant_text("ok")])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: repo)
+    h, = test_harness(storage: "memory", model: model, cwd: repo)
     eq "harness reports the files", [File.join(repo, "AGENTS.md")], h.agents_md.map { _1["path"] }
     h.prompt("hello")
-    requests = File.readlines("#{ENV["DURABLE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
+    requests = File.readlines("#{ENV["REVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
     eq "the provider actually saw them", true, requests.first["system"].include?("always use tabs")
     h.close
   end
@@ -44,7 +44,7 @@ Dir.mktmpdir do |root|
     model = fake_model(root, [assistant_tool("read", { "path" => File.join(nested, "gen.rb") }),
                               assistant_tool("read", { "path" => File.join(nested, "gen.rb") }, id: "tc2"),
                               assistant_text("understood")])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: repo)
+    h, = test_harness(storage: "memory", model: model, cwd: repo)
     h.prompt("read the generated file")
     results = entries_of(h.session).select { _1.dig("message", "role") == "toolResult" }
     texts = results.map { |r| r.dig("message", "content").map { _1["text"] }.join }
@@ -58,9 +58,9 @@ Dir.mktmpdir do |root|
 
   group "nested files outside the workspace are ignored" do
     eq "no injection above cwd", nil,
-       Durable::AgentsMd.nested_for(File.join(root, "elsewhere.rb"), repo, [])
+       Reve::AgentsMd.nested_for(File.join(root, "elsewhere.rb"), repo, [])
     eq "cwd's own file is not 'nested'", nil,
-       Durable::AgentsMd.nested_for(File.join(repo, "x.rb"), repo, [])
+       Reve::AgentsMd.nested_for(File.join(repo, "x.rb"), repo, [])
   end
 end
 

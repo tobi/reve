@@ -8,17 +8,17 @@ include TestKit
 CHILD = File.expand_path("crash_child.rb", __dir__)
 
 def run_child(script_path, session_path, prompt, extra_env = {})
-  env = { "DURABLE_FAKE_SCRIPT" => script_path, "DURABLE_SESSION" => session_path,
-          "DURABLE_PROMPT" => prompt }.merge(extra_env)
+  env = { "REVE_FAKE_SCRIPT" => script_path, "REVE_SESSION" => session_path,
+          "REVE_PROMPT" => prompt }.merge(extra_env)
   # The recovering parent uses the same script: a resumed run continues where
   # the dead process stopped, including the provider's response cursor.
-  ENV["DURABLE_FAKE_SCRIPT"] = script_path
+  ENV["REVE_FAKE_SCRIPT"] = script_path
   out = IO.popen(env, ["ruby", CHILD], err: [:child, :out], &:read)
   [out, $?.exitstatus]
 end
 
 def open_session(path)
-  h, susp = Durable::Harness.create(storage: "jsonl", path: path,
+  h, susp = test_harness(storage: "jsonl", path: path,
                                     model: { "provider" => "fake", "modelId" => "fake-1", "api" => "fake",
                                              "baseUrl" => "", "apiKey" => "", "contextWindow" => 200_000,
                                              "maxTokens" => 4096, "name" => "fake" },
@@ -211,8 +211,8 @@ Dir.mktmpdir do |dir|
                                         assistant_tool("bash", { "command" => "sleep 20" }),
                                         assistant_text("after the kill")
                                       ] }))
-    env = { "DURABLE_FAKE_SCRIPT" => script, "DURABLE_SESSION" => session, "DURABLE_PROMPT" => "sleep a lot" }
-    ENV["DURABLE_FAKE_SCRIPT"] = script
+    env = { "REVE_FAKE_SCRIPT" => script, "REVE_SESSION" => session, "REVE_PROMPT" => "sleep a lot" }
+    ENV["REVE_FAKE_SCRIPT"] = script
     pid = Process.spawn(env, "ruby", CHILD, out: "/dev/null", err: "/dev/null")
     sleep 2.5
     Process.kill("KILL", pid)
@@ -249,7 +249,7 @@ group "detaching is not aborting: an open operation stays resumable" do
                                           "stopReason" => "stop", "sleep" => 30 },
                                         assistant_text("finished after resume")
                                       ] }))
-    ENV["DURABLE_FAKE_SCRIPT"] = script
+    ENV["REVE_FAKE_SCRIPT"] = script
     h, = open_session(session)
     Thread.new { h.prompt("start something slow") }
     sleep 1.0

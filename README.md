@@ -1,356 +1,249 @@
-# rbagent — a durable coding agent in pure Ruby, on Ractors
+# Reve
 
-An implementation of the [durable harness-v2 design](https://github.com/earendil-works/pi/blob/main/packages/agent/docs/harness-v2.md)
-in stdlib-only Ruby 4. No gems. The plan and the mapping from the design to Ractors is in
-[PLAN.md](PLAN.md).
+Reve is a durable coding agent in Ruby on Ractors. Model-authored commands always run in
+a microsandbox microVM through the mandatory `microsandbox-rb` gem. The defining rule is
+simple:
 
+> **The folder is the agent.**
+
+There is no machine-wide Reve profile, no home-directory prompt, no global model file, and
+no session store outside the agent folder. Copy the folder and you copy the agent: its
+identity, instructions, model configuration, skills, tools, workspace, channel example,
+and durable history.
+
+## Start with an agent folder
+
+```text
+reve/                         the agent root
+├── instructions.md            identity, purpose, and standing instructions
+├── models.yml                 provider and model configuration owned by this agent
+├── agent.rb                   optional Ruby configuration DSL
+├── channels/
+│   └── tui.rb                 the one shipped channel, a small visitor adapter
+├── tools/
+│   └── example.rb             optional project tools written in Ruby
+├── sandbox/
+│   └── sandbox.rb             optional sandbox policy
+├── workspace/                 the VM-visible, agent-editable mind and worktree
+│   ├── AGENTS.md              abbreviated stateful-agent kernel
+│   ├── SOUL.md                identity, voice, boundaries, and timezone
+│   ├── KNOWLEDGE.md           index into knowledge/
+│   ├── DREAM.md               memory-consolidation protocol
+│   ├── HEARTBEAT.yml          dynamically reloaded background task schedule
+│   ├── knowledge/             mutable durable facts
+│   ├── notes/                 append-only daily narrative
+│   └── skills/                all skills, including heartbeat authoring guidance
+└── .reve/
+    ├── sessions/              JSONL durable session logs
+    └── logs/                  oversized tool output
 ```
-$ bin/rbagent
-rbagent · durable harness on ractors · ruby 4.0.6
-model anthropic-gw/claude-opus-5  tools 7  lane main  /help for commands
 
-› math.rb has a bug in add. Fix it and verify.
-  → read path=/tmp/rbdemo/math.rb
-  ✓ read      1  def add(a,b)=a-b
-  → edit path=/tmp/rbdemo/math.rb oldText=def add(a,b)=a-b newText=def add(a,b)=a+b
-  ✓ edit edited /tmp/rbdemo/math.rb
-  → bash command=ruby -r./math -e 'p add(2,3)==5'
-  ✓ bash true
-· `a-b` → `a+b`. Verified.
-· completed 2494in/94out
-```
-
-## Why this is interesting
-
-The design's central claim is **durability**: a prompt is an operation, every effect is
-preceded by an intent record naming the ids it will produce, and a crash at *any* point
-leaves a state that recovery can either complete or close. Nothing partial is ever
-observable.
-
-Its structural precondition is **one writer per session**. In Ruby that is not a
-convention you hope holds — a Ractor owns the storage and no other Ractor can reach it.
-`test/test_storage.rb` proves the point by writing from a second Ractor: the write still
-goes through the one store.
-
-The recovery claims are tested against *real process death*: `test/test_recovery.rb`
-forks a child, kills it (scripted crash sites and `SIGKILL`), reopens the JSONL session in
-the parent and resumes. Nine crash sites, including a real model-less variant of every
-trace in §6 of the design.
-
-## Run it
+Create the complete structure in the directory you are in:
 
 ```bash
-bin/rbagent                          # interactive
-bin/rbagent -p "fix the failing test"   # one-shot, streams to stdout
-bin/rbagent -c                       # continue the newest session for this directory
-bin/rbagent -r                       # continue and resume whatever a crash left open
-bin/rbagent --list                   # sessions for this directory
-bin/test                             # the whole suite
-rake install                         # build and install the gem locally
-rake test lint version               # the rest of the tasks
+bin/reve init .
+bundle install
+bundle exec bin/reve
 ```
 
-Models come from the bundled `models.yml` in the repo root, overridden by
-`~/.agent/models.yml` or `~/.config/rbagent/models.yml` (a legacy `.json` is still read).
-`-m` takes `provider/model-id`, a bare `model-id`, or just a `provider` — the last
-form asks the endpoint what it is serving right now (`GET /v1/models`) and falls
-back to the configured list when it cannot be reached. The default is `vllm`, i.e.
-whatever the local inference server has loaded.
+`reve init` is idempotent. It never writes to `$HOME`, a global cache, or another
+project. `models.yml` is copied into the new root and becomes the only model configuration
+that this agent reads. The generated `channels/tui.rb` is intentionally small enough to
+serve as a channel implementation example.
 
-The provider layer speaks `openai-responses` and `anthropic-messages` streaming, plus a
-scripted `fake` provider for the tests. Per-provider quirks live in the `compat` block of
-models.yml (`maxTokensField`, `supportsDeveloperRole`, `supportsReasoningEffort`, …), not
-in the code.
+The launcher refuses to run in a directory that is not an agent. This prevents an agent
+from silently attaching itself to an arbitrary checkout. The only durable paths are under
+the agent root, and `--session` is rejected when it points outside `.reve/sessions`.
+Launching `reve` reopens the named `main` conversation by default (adopting the newest
+legacy session on first use). `reve -c research` opens another persistent named
+conversation. Use `/new` to rotate the selected conversation to a fresh durable session
+without rebooting the microVM.
 
-Sessions are JSONL, one file per session, one line per mutation:
+## The one channel: inline TUI
 
-```jsonl
-{"kind":"header","version":4,"id":"fddb…","cwd":"/tmp/rbdemo"}
-{"kind":"record","type":"operation_started","lane":"main","intent":{"kind":"run",…}}
-{"kind":"entry","lane":"main","type":"message","id":"e_…","message":{"role":"user",…}}
-{"kind":"record","type":"task_attempt","task":"step","attempt":1,…}
-{"kind":"entry","lane":"main","type":"message","message":{"role":"assistant",…}}
-{"kind":"record","type":"tool_started","toolName":"edit","resultEntryId":"e_…","replay":"never"}
-{"kind":"entry","lane":"main","type":"message","message":{"role":"toolResult",…}}
-{"kind":"record","type":"operation_finished","outcome":"completed"}
-```
+Reve deliberately implements exactly one channel: the terminal UI. It does not use an
+alternate screen buffer. Output stays in normal terminal scrollback, while one owned input
+line is hidden, printed above, and redrawn after every event. This keeps command history,
+copy/paste, and terminal scrollback useful.
 
-Delete every `record` line and a complete, valid conversation remains. That is an
-invariant, and a test.
-
-## An agent is a directory
-
-Launch `rbagent` in a directory and it takes its setup from the files it finds — eve's model
-([eve.dev](https://eve.dev): "an instructions.md file is all you need to run an agent").
-
-```
-$ rbagent init
-initialised /tmp/agentdir
-  + agent.rb
-  + instructions.md
-  + tools/example.rb
-  + skills/release-notes/SKILL.md
-  + sandbox/sandbox.rb
-  + AGENTS.md
-  + workspace/AGENTS.md
-
-  edit instructions.md, then run rbagent in this directory
-```
-
-rbagent refuses to start anywhere else: an agent with no instructions is a chat window
-with your filesystem attached. `rbagent init` makes one; `rbagent --plain` overrides.
-
-```
-instructions.md        what this agent is and how it works
-agent.rb               its configuration: model, thinking, tools, sandbox
-tools/*.rb             tools in the Ruby DSL
-skills/*/SKILL.md      skills (also .agents/skills, .pi/skills)
-sandbox/sandbox.rb     swap the sandbox backend or bootstrap it
-workspace/             the work: /workspace in the sandbox, cwd for every command
-.rbagent/sessions/     the durable logs of this agent's runs
-```
-
-The split matters: the agent's own definition lives in the agent directory, and the
-material it works on lives in `workspace/`, which is **bind-mounted** at `/workspace`
-(read-write, `nosuid`, `nodev` — the only mount) and is the working directory for every
-command — so a relative path means the same thing on the host
-and inside the VM. `workspace/AGENTS.md` ships pointing at the toolchain (`fd`, `rg`,
-`ast-grep`, `jq`, `gh`, `mise`), and both AGENTS.md files are in scope, outermost first.
-
-The prompt is a *list* of files, not one file: `instructions.md` is the job, `SOUL.md` is the
-character, and `agent.rb` can name as many as you like — each arrives in its own tagged
-block, in order.
+The library renderer is `Reve::InteractiveAgentTUI`. The generated `channels/tui.rb` is a
+visitor adapter, not a second renderer:
 
 ```ruby
-agent do
-  model "vllm"
-  instructions "instructions.md", "SOUL.md", "docs/style.md"
-end
-```
+module Reve
+  module Channels
+    class TUI
+      def initialize(harness, suspended, lane: "main")
+        @renderer = Reve::InteractiveAgentTUI.new(harness, suspended, lane: lane)
+      end
 
-`instructions.md` carries frontmatter for the things an agent needs to say about itself,
-and its body becomes the authority in the system prompt:
-
-```markdown
----
-name: haiku-bot
-model: vllm
-sandbox: local
----
-
-You are haiku-bot. You answer everything as a single haiku, then stop.
-```
-
-Nothing is required: in a plain checkout with none of these files rbagent is still an
-ordinary coding agent, which is why it works in any repository.
-
-## Tools are Ruby, and they can be typed
-
-`tools/` is a folder of small Ruby files. The typed declarations become the JSON schema the
-model sees, and `replay` is the recovery contract from the harness design.
-
-A tool's parameters are a type signature, and Ruby has a notation for that — so write the
-signature as an **RBS comment** and the schema is derived from it, once:
-
-```ruby
-tool "weather" do
-  # Get the weather for a city.
-  # @param city  City name, e.g. "Berlin"
-  #: (city: String, ?units: ("metric" | "imperial"), ?days: Integer) -> String
-  replay :safe
-  run do |city:, units: "metric", days: 1, ctx:|
-    ctx.sh("curl -s wttr.in/#{city}?#{units == "metric" ? "m" : "u"}")
+      def visit(event) = @renderer.render(event)
+      def run = @renderer.run
+      def submit(text) = @renderer.submit(text)
+    end
   end
 end
 ```
 
-The model receives `city` (required string), `units` (an **enum** of the two literals) and
-`days` (integer), each with the `@param` line as its description, and the block is called
-with keywords — defaults included, `ctx:` injected if it asks. RBS ships with Ruby, so its
-real parser does the work; a small fallback parser covers the common forms when it is
-absent. `sig/durable.rbs` describes the library itself, and `rake rbs` keeps it honest.
+That is the whole channel boundary. It delegates to high-level harness operations and
+visits observer events. A future channel would implement the same small handoff without
+changing storage, lanes, providers, or tools.
 
-```ruby
-tool "syllables" do
-  description "Roughly count syllables in a line of text"
-  string :line, "The line to measure", required: true
-  replay :safe                      # recovery may re-run this after a crash
+The host Ractor owns the terminal entry box and renderer. Lane Ractors own durable work.
+Input is translated into lane messages; rendering consumes the observer stream:
 
-  run { |args, _ctx| "#{args["line"].scan(/[aeiouy]+/i).size} syllables" }
-end
-
-tool "test_suite" do
-  description "Run the test suite in the sandbox"
-  sandbox true                      # runs inside the sandbox, not on the host
-  run { |_args, ctx| ctx.sh("bin/test") }
-end
+```mermaid
+flowchart LR
+  U[stdin / inline entry box] --> H[host Ractor]
+  H --> C[channels/tui.rb visitor]
+  C --> R[InteractiveAgentTUI renderer]
+  H -->|prompt| L[main lane Ractor]
+  H -->|/steer / /followup / /abort / /resume| L
+  L -->|JSON events| O[observer hub Ractor]
+  O --> C
+  L --> S[store Ractor]
+  S --> J[(agent/.reve/sessions/*.jsonl)]
 ```
 
-A project tool's body is a Ruby block, and a block cannot cross a Ractor boundary — so
-project tools run in the host Ractor and lanes reach them by RPC, exactly like hooks. Their
-`tool_started` records look like any other tool's, so recovery treats them identically.
-A tool file with a syntax error is a startup diagnostic, not a crash, and a tool may not
-shadow a built-in.
+Useful commands include:
 
-## Sandbox
-
-Every agent has a sandbox: the place its commands run. The default is `:auto` — a microVM
-when microsandbox is installed, this machine otherwise — and it comes provisioned:
-debian with git, ripgrep, fd, jq and build-essential, plus **mise** for language runtimes,
-activated for every shell (shims on `PATH`, because `/bin/sh` is dash). Provisioning runs
-once per named sandbox, so the second launch boots straight into a ready toolchain.
-
-**Egress is deny-by-default: github.com and nothing else.** An agent that can reach the
-whole internet is an agent that can exfiltrate the whole workspace. And it reaches GitHub
-as *you*: the host's credential (`$GITHUB_TOKEN`, `gh auth token`, or the git credential
-helper) is lent to the sandbox as a microsandbox secret — scoped to the GitHub hosts,
-substituted into requests by the proxy, and never present inside the VM.
-
-```ruby
-sandbox do
-  backend :auto              # :microsandbox to insist, :local to opt out
-  mise "node@lts", "python@3.12"
-  packages "postgresql-client"
-
-  allow "rubygems.org"                            # add to the egress allowlist
-  # allow_all                                     # opt out of the policy
-  # github_auth false                             # do not lend the token
-  secret "OPENAI_API_KEY", hosts: ["api.openai.com"]
-
-  bootstrap "bundle install"
-end
+```text
+/help                 command reference
+/steer <text>         queue guidance at the next checkpoint
+/next <text>          queue text for the next run
+/followup <text>      add a follow-up while work is active
+/abort                abort and durably reconcile the current operation
+/resume               resume a suspended operation
+/compact [instr]      compact the current branch, optionally with summary instructions
+/new                  create and switch to a fresh durable session
+/model [spec]         inspect or select the local models.yml model
+/lanes                inspect lane state
 ```
 
-The `microsandbox` backend is [microsandbox](https://github.com/superradcompany/microsandbox)
-bound through its C ABI with **fiddle** — the stdlib's FFI, because this project takes no
-gems:
+## Background heartbeats
 
-```c
-char *msb_sandbox_create(uint64_t cancel_id, const char *name,
-                         const char *opts_json, uint8_t *buf, size_t buf_len);
+`workspace/HEARTBEAT.yml` declares periodic tasks that run in unattached durable lanes
+while the `main` conversation is open. Reve fingerprints and reloads the file every
+scheduler scan. Each task selects a model and lane, chooses whether to continue that
+lane, and may run a `vm-exec` prerequisite. A nonzero prerequisite skips the model turn
+and is logged. Host execution is deliberately unsupported.
+
+The model must return exactly `SILENCE`, `Message: one paragraph`, or `Steer: command`.
+Messages and steering are durably queued into main; malformed output is reported as a
+heartbeat error. Before each run, Reve refreshes
+`workspace/RECENT_CONVERSATIONS.md` from a bounded tail of main's durable context, so
+`DREAM.md` can consolidate recent work without mounting `.reve/` in the VM. The generated
+`heartbeat` skill documents every option.
+
+## Durable architecture
+
+Every mutation follows the same sequence: record intent, perform the effect, then append
+the result with the identifiers named by the intent. A crash leaves either a completed
+operation or enough information for recovery to finish it. Records are metadata; entries
+are the conversation tree.
+
+```mermaid
+flowchart TB
+  subgraph Host[host Ractor]
+    Channel[channel visitor]
+    Hooks[hooks and project tools]
+  end
+  subgraph Lanes[lane Ractors]
+    Main[main lane]
+    Other[other lanes]
+  end
+  Store[one store Ractor]
+  Hub[observer hub Ractor]
+  Files[(agent/.reve/sessions)]
+  Tools[tool Ractors]
+  Provider[provider stream]
+
+  Channel --> Main
+  Channel --> Other
+  Main --> Hooks
+  Main --> Provider
+  Main --> Tools
+  Main --> Store
+  Other --> Store
+  Store --> Files
+  Main --> Hub
+  Other --> Hub
+  Hub --> Channel
 ```
 
-Every call takes a cancellation token, JSON options and an output buffer, and returns NULL
-on success or a `char *` JSON error to free with `msb_free_string`. That maps onto one Ruby
-method (`Microsandbox#call`), so adding a call is one line in a signature table. Abort
-reaches into a blocking VM call through the same token. When the library is not installed,
-`resolve` says so in yellow and falls back to local execution rather than pretending.
+The store is the single writer for one session. JSON strings and `Ractor::Port`s are the
+only values crossing Ractor boundaries. A tool call is isolated in its own Ractor unless a
+project tool or sandbox connection must remain in the host Ractor. Lanes serialize their
+own operation, queue, abort, retry, compaction, and recovery state.
 
-The bindings are tested against a stub shared library built at test time
-(`test/support/msb_stub.c`) that implements the same ABI — argument marshalling, the buffer
-protocol, base64 payloads, the error convention and cancellation, all verified without KVM.
+## Mandatory sandbox and dynamic skills
 
-## Architecture
+Reve depends on `microsandbox-rb`. There is no local mode, CLI transport, Fiddle fallback,
+or host shell: if the gem or embedded runtime cannot boot the configured VM, Reve refuses
+to start. Model `bash`, project `ctx.sh`, and user `!command` all execute through the same
+live VM handle. `workspace/` is the only writable bind mount; host-side file helpers are
+strictly confined to that bind source, including symlink resolution.
 
-```
-                    ┌──────────────┐
-   stdin/TUI ─────► │ host (main)  │ ──► hooks (closures live only here)
-                    └──┬────┬──────┘
-          commands     │    │  watch() → snapshot + live events
-                 ┌─────▼─┐  │   ┌──────────────┐
-                 │ lane  │──┼──►│ observer hub │──► watchers
-                 │ main  │  │   └──────┬───────┘
-                 └───┬───┘  │          │
-                 ┌───▼───┐  │          │
-                 │ lane  │  │          │
-                 │slack:1│  │          │
-                 └───┬───┘  ▼          ▼
-                    ┌──────────────────────┐
-                    │ store (single writer)│  JSONL / memory
-                    └──────────────────────┘
-                 ┌────────┐ ┌────────┐
-   tool batch ──►│ tool R │ │ tool R │  one Ractor per call, args in / result out
-                 └────────┘ └────────┘
-```
+The first launch creates and provisions a VM. Clean shutdown stops it but preserves its
+root disk and definition; later launches restart that named VM instead of reinstalling
+APT, mise, Node, and npm packages. A sandbox policy or toolchain change intentionally
+replaces and reprovisions it. Reve also avoids model-endpoint discovery during startup.
 
-Everything between Ractors is JSON strings and `Ractor::Port`s — both shareable, so no
-deep copies and no isolation errors at runtime.
+At every run boundary Reve rereads full `workspace/AGENTS.md`, full
+`workspace/SOUL.md`, and the first 100 lines of `workspace/KNOWLEDGE.md`. They enter the
+durable turn context rather than the stable system prefix, so edits apply immediately
+without destroying prompt-cache continuity across tool steps.
 
-| file | what it is |
-|---|---|
-| `lib/durable/ipc.rb` | port-based request/reply, per-thread reply ports, `DEFER` |
-| `lib/durable/storage/*` | the four parts of a session, one `seq`; memory + JSONL (torn-tail truncation) |
-| `lib/durable/store.rb` | the single-writer Ractor and the `Session`/`SessionTree` client |
-| `lib/durable/records.rb` | the §5 record catalog, provisioned entry ids |
-| `lib/durable/agent_loop.rb` | `stream_assistant`, tool phases 1/2/3, the batch driver |
-| `lib/durable/lane.rb` | lane Ractor: run/compaction/navigation procedures, checkpoints, **the recovery reduction** |
-| `lib/durable/harness.rb` | lanes, hooks, config, `watch()` |
-| `lib/durable/observer.rb` | event hub, lane mirrors, gapless snapshots |
-| `lib/durable/provider/*` | models.yml, anthropic SSE, scripted fake |
-| `lib/durable/tools.rb` | bash/read/write/edit/ls/glob/grep, each with declared replay safety |
-| `lib/durable/prompt.rb` | system prompt (tools, guidelines, project context, skills, cwd) |
-| `lib/durable/agents_md.rb` | AGENTS.md discovery, static and nested-on-demand |
-| `lib/durable/skills.rb` | Agent Skills: SKILL.md discovery, validation, prompt section |
-| `lib/durable/compaction.rb` | cut point, kept suffix, structured summary, file lists |
-| `lib/durable/term.rb` | cbreak mode, a line editor, right-aligned columns |
-| `lib/durable/tui.rb` | the terminal client — an ordinary consumer of `watch()` |
+All skills live in VM-editable `workspace/skills/` and are fingerprinted at each turn
+boundary. When any file there changes,
+Reve reloads the catalog and prepends an `<available_skills_update>` to the new user turn.
+This exposes newly created skills to modern models without rewriting the system prompt and
+invalidating its cached prefix.
 
-## What the harness gives you
+For the same reason, Reve watches provider cache usage. A normal request with more than
+30% uncached input emits a visible cache-miss warning. The first request in a session and
+compaction requests are exempt because their cold prefixes are expected.
 
-* **Lanes.** One session, many parallel positions in the conversation tree. `main` always
-  exists; `harness.create_lane("slack:1719…", entry_id)` makes another. Lanes run at the
-  same time (real Ractor parallelism), share history, and own their own operation log,
-  queues and model.
-* **Steering / follow-ups / next-run.** Durable at acceptance (a `queue_enqueued` record),
-  applied at the next checkpoint so provider context only ever grows at the tail. Steering
-  dies on abort; next-run survives.
-* **Deferred writes.** `set_model` and friends mid-step become `write_deferred` records
-  and land after the in-flight assistant message — never before it.
-* **Abort.** Signals the running tool (its Ractor gets a cancel message and kills its child
-  process), durable on return; reconciliation (synthetic tool results, closing message,
-  `operation_finished aborted`) finishes in the background, and completes on resume if the
-  process dies first.
-* **Retries.** The attempt count is a record, so a crash-restart loop cannot reset it.
-* **Compaction** automatically at a checkpoint (inside the run's records) or as its own
-  operation. It walks back from the newest entry until `keepRecentTokens` is spent, cuts at
-  a turn boundary, and writes a compaction entry naming `firstKeptEntryId`: the context
-  becomes `[structured summary] + [recent turns, verbatim] + [everything after]`. A turn
-  too large to keep whole is split, with its prefix summarized separately. Read and
-  modified file lists are extracted mechanically rather than left to the model, and a
-  second compaction updates the previous summary instead of starting over.
-  **Navigation** moves a lane's leaf atomically with `operation_finished`.
-* **Deferred provider requests.** A handle persisted in an assistant message parks the
-  lane; a later process redeems it without paying for a new request.
-* **AGENTS.md, automatically.** Every AGENTS.md from the repo root down to the working
-  directory joins the system prompt as `<project_instructions>`. A nested AGENTS.md deeper
-  in the tree is loaded the first time a tool touches a path under it and rides along on
-  that tool's result — late context arrives at the tail, never before the assistant message
-  that did not see it.
-* **Skills.** `SKILL.md` files under `.agents/skills/`, `.agent/skills/`, `.rbagent/skills/`
-  and their `~/` counterparts. Names and descriptions go into the system prompt in the
-  Agent Skills XML shape so the model can pick one and `read` it; `/skill <name>` loads the
-  body into the conversation immediately. Over-long descriptions (>1024 chars), invalid
-  names and name collisions are reported at startup, and the skill still loads.
-* **A session goal.** `/goal <text>` writes a custom entry on the lane's branch and every
-  request on that lane carries it in the system prompt. It is branch state, so it is
-  per lane, survives compaction, and is a deferred write when set mid-run.
-* **Prompt caching, watched.** Providers report usage with `input` as the *total* prompt and
-  `cacheRead` as the part that was cached, so the hit rate is one division. Every request is
-  fingerprinted (system prompt, tool set, each message) and compared with the previous one:
-  a prefix that diverged prints a red `PROMPT CACHE INVALIDATED` with the reason and the
-  message index, and a provider that reports zero cached tokens for an unchanged prefix is
-  flagged as a miss. Deliberate breaks (a new goal, a model switch, a compaction) are
-  announced quietly instead. `/cache` shows the running hit rate — steady state is >90%.
-* **Hooks** (`before_run`, `before_tool`, `after_tool`, `transform_context`,
-  `after_response`, `before_compaction`, `before_navigation`, `before_run_end`,
-  `before_resume`) intercept; **events** only observe. `before_tool` fails closed.
+## Local configuration
 
-```ruby
-harness, suspended = Durable::Harness.create(storage: "jsonl", path: path, model: "claude-opus-5")
-suspended.each { |s| harness.lane(s["lane"]).resume }
+`models.yml` is YAML and belongs to the agent root. Values in `baseUrl`, `apiKey`, and
+`headers` that look like uppercase environment-variable names are resolved when the model
+is built; literal values remain literal. Generated agents default to
+`openai/gpt-5.6-luna`. OpenAI is active in the template; the llama.cpp provider reads
+`LLAMA_CPP_BASE` and `LLAMA_API_KEY`. Provider headers are sent by both supported HTTP
+providers. No model file is read from `$HOME` or from a global Reve directory.
 
-harness.on_hook("before_tool") do |ev|
-  { "block" => { "reason" => "not in this workspace" } } if ev["toolName"] == "bash"
-end
+The project uses `openai-responses`, `anthropic-messages`, and a scripted `fake` provider
+for deterministic tests. Provider-specific differences live in each provider's `compat`
+block rather than in scattered conditionals.
 
-Thread.new { harness.prompt("fix the failing test") }
-harness.steer("start with the parser")        # durable when it returns
-harness.abort!                                # durable when it returns
+## Durable records
+
+Sessions are append-only JSONL under `.reve/sessions/`:
+
+```jsonl
+{"kind":"header","version":4,"id":"...","cwd":"workspace"}
+{"kind":"record","type":"operation_started","lane":"main","intent":{"kind":"run"}}
+{"kind":"entry","lane":"main","type":"message","message":{"role":"user"}}
+{"kind":"record","type":"tool_started","resultEntryId":"e_...","replay":"never"}
+{"kind":"entry","lane":"main","type":"message","message":{"role":"toolResult"}}
+{"kind":"record","type":"operation_finished","outcome":"completed"}
 ```
 
-## Scope
+Recovery is tested against real child-process termination. Tool intent records provision
+result IDs before effects. Safe tools may be replayed only when both the recorded and
+current declarations say `safe`; effectful tools receive a synthetic interrupted result.
 
-Implemented: memory + JSONL storage, lanes, runs, steps, retries, tools, abort,
-compaction, navigation, deferred requests, forks, snapshots/events, hooks, recovery, TUI.
-Not implemented (see PLAN.md §4): SQLite backend, v3 session compatibility, subagents,
-telemetry exporters.
+## Development
+
+```bash
+bin/test                 # every test file in its own process
+rake lint                # syntax-check the project
+rake test                # run the complete suite
+rake rbs                 # validate signatures when RBS is available
+bin/reve --version
+```
+
+The repository itself is also an ordinary Reve agent folder for development purposes.
+Tests create isolated temporary agent folders and fake providers; they do not consult a
+user profile or write persistent state outside their fixture folder.

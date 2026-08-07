@@ -7,7 +7,7 @@ Dir.mktmpdir do |dir|
   group "follow-ups continue the same run; before_run_end can add one" do
     model = fake_model(dir, [assistant_text("first answer"), assistant_text("second answer"),
                              assistant_text("third answer")])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir)
+    h, = test_harness(storage: "memory", model: model, cwd: dir)
     once = [true]
     h.on_hook("before_run_end") do |_e|
       if once[0]
@@ -28,7 +28,7 @@ Dir.mktmpdir do |dir|
     model = fake_model(dir, [{ "role" => "assistant", "content" => [{ "type" => "text", "text" => "slow" }],
                                "stopReason" => "stop", "sleep" => 2.0 },
                              assistant_text("with the seeded message")])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir)
+    h, = test_harness(storage: "memory", model: model, cwd: dir)
     t = Thread.new { h.prompt("first") }
     sleep 0.3
     eq "nextRun accepted during a run", true, h.next_run("remember this for later")["ok"]
@@ -50,7 +50,7 @@ Dir.mktmpdir do |dir|
   group "auto-compaction at a checkpoint, inside the run's own records" do
     long = "x " * 4000
     model = fake_model(dir, [assistant_text(long), assistant_text("SUMMARY"), assistant_text("done")])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir,
+    h, = test_harness(storage: "memory", model: model, cwd: dir,
                                  compaction: { "threshold" => 0.00002, "keepRecentTokens" => 200 })
     h.on_hook("before_run_end") do |_e|
       @once ||= 0
@@ -71,16 +71,16 @@ Dir.mktmpdir do |dir|
 
   group "fork: entries only, no records, starts idle" do
     model = fake_model(dir, [assistant_tool("ls", { "path" => dir }), assistant_text("listed")])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir)
+    h, = test_harness(storage: "memory", model: model, cwd: dir)
     h.prompt("list the dir")
     forked = File.join(dir, "forked.jsonl")
-    Durable::Fork.to_file(h.session, forked)
+    Reve::Fork.to_file(h.session, forked)
     lines = File.readlines(forked).map { JSON.parse(_1) }
     eq "no records were copied", 0, lines.count { _1["kind"] == "record" }
     eq "entries were copied", 4, lines.count { _1["kind"] == "entry" }
     eq "parent linkage recorded", h.session.metadata["id"], lines.first["parentSessionId"]
 
-    h2, susp2 = Durable::Harness.create(storage: "jsonl", path: forked, model: model, cwd: dir)
+    h2, susp2 = test_harness(storage: "jsonl", path: forked, model: model, cwd: dir)
     eq "the fork opens idle", [], susp2
     eq "and carries the conversation", 4, entries_of(h2.session).size
     eq "leaf is the copied tip", true, !h2.state["leafId"].nil?
@@ -90,7 +90,7 @@ Dir.mktmpdir do |dir|
 
   group "watch_session(): inventory without transcripts" do
     model = fake_model(dir, [assistant_text("ok"), assistant_text("ok")])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir)
+    h, = test_harness(storage: "memory", model: model, cwd: dir)
     h.create_lane("slack:9", nil)
     w = h.watch_session
     eq "lists every lane, main included", %w[main slack:9], w.snapshot["lanes"].map { _1["name"] }.sort
@@ -101,7 +101,7 @@ Dir.mktmpdir do |dir|
 
   group "lane deletion keeps entries, drops the pointer" do
     model = fake_model(dir, [assistant_text("ok")])
-    h, = Durable::Harness.create(storage: "memory", model: model, cwd: dir)
+    h, = test_harness(storage: "memory", model: model, cwd: dir)
     h.create_lane("tmp", nil)
     h.lane("tmp").prompt("hello from the lane")
     before = h.session.find_entries.size
@@ -113,12 +113,12 @@ Dir.mktmpdir do |dir|
   end
 
   group "tool declarations and replay safety are declared, not guessed" do
-    eq "read is replay-safe", "safe", Durable::Tools.replay_of("read")
-    eq "bash is never replayed", "never", Durable::Tools.replay_of("bash")
+    eq "read is replay-safe", "safe", Reve::Tools.replay_of("read")
+    eq "bash is never replayed", "never", Reve::Tools.replay_of("bash")
     eq "every tool has a schema", true,
-       Durable::Tools.declarations.all? { _1["parameters"]["type"] == "object" }
+       Reve::Tools.declarations.all? { _1["parameters"]["type"] == "object" }
     eq "the registry is shareable across Ractors", true,
-       Ractor.new { Durable::Tools.names.size }.value == Durable::Tools.names.size
+       Ractor.new { Reve::Tools.names.size }.value == Reve::Tools.names.size
   end
 end
 
