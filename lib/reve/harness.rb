@@ -233,7 +233,9 @@ module Reve
       catalog = if probe
                   now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
                   if !@model_catalog_at || now - @model_catalog_at > 15
-                    @discovered_models = available_models(probe: true)
+                    result = Provider::Models.catalog(@models_config, probe: true)
+                    @discovered_models = result["models"]
+                    @model_catalog_diagnostics = result["diagnostics"]
                     @model_catalog_at = now
                   end
                   @discovered_models
@@ -246,6 +248,8 @@ module Reve
       current = [@model && "#{@model["provider"]}/#{@model["modelId"]}", @model && @model["modelId"]]
       (providers.keys + qualified + unique_ids + current.compact).uniq.sort
     end
+
+    def model_catalog_diagnostics = @model_catalog_diagnostics || []
 
     def resolve_model(spec) = Provider::Models.resolve(@models_config, spec)
 

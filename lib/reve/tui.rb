@@ -1007,6 +1007,10 @@ module Reve
         emit("  #{current} #{s(:dim, "thinking=#{st["thinkingLevel"]}")}")
         choices = @h.model_completions(probe: true).select { _1.include?("/") }
         choices.each { emit("  #{_1 == current ? s(:green, "●") : s(:dim, "·")} #{_1}") }
+        @h.model_catalog_diagnostics.each do |diagnostic|
+          emit(s(:red, "  ! #{diagnostic["provider"]} model discovery failed:"))
+          diagnostic["message"].to_s.lines.each { emit(s(:red, "    #{_1.rstrip}")) }
+        end
       end
     end
 

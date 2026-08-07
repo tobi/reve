@@ -211,8 +211,12 @@ explicit `$`: for example, `baseUrl: $LLAMA_CPP_BASE` and `apiKey: $LLAMA_API_KE
 Every `apiKey` in YAML must be a `$ENV_VAR` reference; literal and bare-name API keys are
 rejected. Generated agents default to `openai/gpt-5.6-luna`, and OpenAI is active in the
 template. `/model` and its autocomplete refresh each configured endpoint through
-`<baseUrl>/models`, retaining static declarations when an endpoint is unavailable. No
-model file is read from `$HOME` or from a global Reve directory.
+`<baseUrl>/models`, parsing OpenAI `data` arrays and common `models` arrays without
+hardcoded model ids. Discovery failures are printed with provider, URL, HTTP status, and
+the complete response body; static declarations remain available. Provider request
+configuration errors are returned in-band with provider/model and resolved environment
+context rather than faulting a lane. No model file is read from `$HOME` or from a global
+Reve directory.
 
 The project uses `openai-responses`, `anthropic-messages`, and a scripted `fake` provider
 for deterministic tests. Provider-specific differences live in each provider's `compat`

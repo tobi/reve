@@ -48,7 +48,7 @@ group "/model catalog discovery queries every provider" do
   calls = []
   original = M.method(:live_ids)
   no_probe = ENV.delete("REVE_NO_PROBE")
-  M.define_singleton_method(:live_ids) do |provider|
+  M.define_singleton_method(:live_ids) do |provider, **_options|
     calls << provider["baseUrl"]
     ["live-model"]
   end
@@ -59,6 +59,9 @@ group "/model catalog discovery queries every provider" do
   found = M.list(cfg, probe: true).map { _1["modelId"] }
   eq "the configured endpoint is queried", ["https://models.example/v1"], calls
   eq "live ids augment configured ids", %w[configured-model live-model], found
+  eq "OpenAI data JSON is parsed", ["a"], M.model_ids({ "data" => [{ "id" => "a" }] })
+  eq "models JSON accepts id, model, name and strings", %w[a b c d],
+     M.model_ids({ "models" => [{ "id" => "a" }, { "model" => "b" }, { "name" => "c" }, "d"] })
 ensure
   ENV["REVE_NO_PROBE"] = no_probe if no_probe
   M.define_singleton_method(:live_ids, original)

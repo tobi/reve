@@ -83,40 +83,78 @@ module Reve
         build(pname, pcfg, chosen)
       end
 
-      def live_ids(pcfg, timeout: 2.0)
+      def live_ids(pcfg, timeout: 2.0, strict: false)
         base = resolve_base_url(pcfg["baseUrl"]).to_s
-        return [] if base.empty? || (pcfg["api"] || "").start_with?("anthropic")
+        if base.empty?
+          raise ArgumentError, "baseUrl #{pcfg["baseUrl"].inspect} resolved to an empty value"
+        end
+        return [] if (pcfg["api"] || "").start_with?("anthropic")
 
         uri = URI("#{base.chomp("/")}/models")
+        unless uri.is_a?(URI::HTTP) && uri.host
+          raise ArgumentError, "models endpoint is not HTTP: #{uri}"
+        end
         http = Net::HTTP.new(uri.host, uri.port)
         http.use_ssl = uri.scheme == "https"
         http.open_timeout = timeout
         http.read_timeout = timeout
         req = Net::HTTP::Get.new(uri)
-        key = pcfg["apiKey"].to_s
-        key = resolve_env_named(key)
+        key = resolve_env_named(pcfg["apiKey"].to_s)
+        if pcfg["apiKey"].to_s.start_with?("$") && key.empty?
+          raise ArgumentError, "apiKey #{pcfg["apiKey"]} is not set in the environment"
+        end
         req["authorization"] = "Bearer #{key}" unless key.empty?
         resolve_headers(pcfg).each { |name, value| req[name] = value }
         res = http.request(req)
-        return [] unless res.code.to_i == 200
+        unless res.code.to_i == 200
+          raise ArgumentError, "GET #{uri} returned HTTP #{res.code} #{res.message}\n" \
+                               "Response body (#{res.body.to_s.bytesize} bytes):\n#{res.body}"
+        end
 
-        (JSON.parse(res.body)["data"] || []).map { _1["id"] }.compact
+        model_ids(JSON.parse(res.body))
       rescue StandardError
+        raise if strict
+
         []
       end
 
-      # `/model` and `/models` query every configured provider's OpenAI-style
-      # `/models` endpoint. Keep configured metadata and add live-only ids; a
-      # failed endpoint remains usable from its static declarations.
-      def list(config, probe: true)
-        (config["providers"] || {}).flat_map do |pname, pcfg|
-          configured = pcfg["models"] || []
-          live = probe && !ENV["REVE_NO_PROBE"] ? live_ids(pcfg) : []
-          configured_by_id = configured.to_h { [_1["id"], _1] }
-          models = configured + live.reject { configured_by_id.key?(_1) }.map { { "id" => _1 } }
-          models.map { build(pname, pcfg, _1) }
-        end
+      def model_ids(document)
+        rows = if document.is_a?(Array)
+                 document
+               elsif document.is_a?(Hash)
+                 document["data"] || document["models"] || []
+               else
+                 []
+               end
+        rows.filter_map do |row|
+          row.is_a?(Hash) ? (row["id"] || row["model"] || row["name"]) : row.to_s
+        end.reject(&:empty?).uniq
       end
+
+      def catalog(config, probe: true)
+        diagnostics = []
+        models = (config["providers"] || {}).flat_map do |pname, pcfg|
+          configured = pcfg["models"] || []
+          live = if probe && !ENV["REVE_NO_PROBE"]
+                   begin
+                     live_ids(pcfg, strict: true)
+                   rescue StandardError => e
+                     diagnostics << { "provider" => pname, "message" => e.message }
+                     []
+                   end
+                 else
+                   []
+                 end
+          configured_by_id = configured.to_h { [_1["id"], _1] }
+          combined = configured + live.reject { configured_by_id.key?(_1) }.map { { "id" => _1 } }
+          combined.map { build(pname, pcfg, _1) }
+        end
+        { "models" => models, "diagnostics" => diagnostics }
+      end
+
+      # `/model` and `/models` query every configured provider's model-catalog
+      # JSON endpoint. Static declarations survive an unavailable endpoint.
+      def list(config, probe: true) = catalog(config, probe: probe)["models"]
 
       def build(pname, pcfg, model)
         {
@@ -126,6 +164,8 @@ module Reve
           "name" => model["name"] || model["id"],
           "api" => pcfg["api"] || "anthropic-messages",
           "baseUrl" => resolve_base_url(pcfg["baseUrl"]),
+          "baseUrlSource" => pcfg["baseUrl"],
+          "apiKeySource" => pcfg["apiKey"] || pcfg.dig("env", "apiKeyEnv"),
           "apiKey" => resolve_env_named(
             pcfg["apiKey"] || (pcfg.dig("env", "apiKeyEnv") && ENV[pcfg.dig("env", "apiKeyEnv")])
           ),
@@ -137,8 +177,7 @@ module Reve
         }
       end
 
-      # A value that looks like an env-var name is one. `$OPENAI_API_KEY` and
-      # `OPENAI_API_KEY` both name ENV["OPENAI_API_KEY"].
+      # Environment references are explicit: only `$OPENAI_API_KEY` names ENV.
       def resolve_env_named(value)
         return value unless value.is_a?(String) && value.match?(ENV_NAMED)
 

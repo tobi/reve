@@ -24,7 +24,11 @@ module Reve
       # raises. `abort_check` is polled both between chunks and — via
       # run_abortable — while the socket is silent, which is where a thinking
       # model spends most of its time.
-      def stream_json(url:, headers:, body:, acc:, timeout:, abort_check: nil, &on_event)
+      def stream_json(url:, headers:, body:, acc:, timeout:, abort_check: nil, model: nil, &on_event)
+        if (message = configuration_error(model, url))
+          return acc.error(message, retryable: false)
+        end
+
         uri = URI(url)
         http = Net::HTTP.new(uri.host, uri.port)
         http.use_ssl = uri.scheme == "https"
@@ -40,6 +44,38 @@ module Reve
         Provider.run_abortable(abort_check, acc) do
           pump(http, req, acc, abort_check, &on_event)
         end
+      rescue URI::Error, ArgumentError => e
+        acc.error("Provider endpoint configuration error: url=#{url.inspect}; #{e.class}: #{e.message}",
+                  retryable: false)
+      rescue StandardError => e
+        provider = model && model["provider"] || "unknown"
+        model_id = model && model["modelId"] || "unknown"
+        acc.error("Provider transport setup error for #{provider}/#{model_id}: " \
+                  "url=#{url.inspect}; #{e.class}: #{e.message}", retryable: false)
+      end
+
+      def configuration_error(model, url)
+        uri = URI.parse(url.to_s)
+        valid = uri.is_a?(URI::HTTP) && !uri.host.to_s.empty?
+        provider = model && model["provider"] || "unknown"
+        model_id = model && model["modelId"] || "unknown"
+        source = model && model["baseUrlSource"]
+        resolved = model && model["baseUrl"]
+        unless valid
+          hint = source.to_s.start_with?("$") ? " Set environment variable #{source}." : ""
+          return "Provider configuration error for #{provider}/#{model_id}: " \
+                 "baseUrl source=#{source.inspect} resolved=#{resolved.inspect}; " \
+                 "expected an http:// or https:// URL.#{hint}"
+        end
+        key_source = model && model["apiKeySource"]
+        if key_source.to_s.start_with?("$") && model["apiKey"].to_s.empty?
+          return "Provider configuration error for #{provider}/#{model_id}: " \
+                 "apiKey #{key_source} is not set in the environment."
+        end
+        nil
+      rescue URI::Error
+        "Provider configuration error for #{provider}/#{model_id}: " \
+          "baseUrl source=#{source.inspect} resolved=#{resolved.inspect}; expected an HTTP URL."
       end
 
       # The blocking part, so it can run in a killable thread.
@@ -47,8 +83,10 @@ module Reve
         http.request(req) do |res|
           code = res.code.to_i
           unless code == 200
-            return acc.error("HTTP #{code}: #{res.read_body.to_s[0, 2000]}",
-                             retryable: RETRYABLE_STATUS.include?(code))
+            body = res.read_body.to_s
+            message = "HTTP #{code} #{res.message}\nURL: #{req.uri}\n" \
+                      "Response body (#{body.bytesize} bytes):\n#{body}"
+            return acc.error(message, retryable: RETRYABLE_STATUS.include?(code))
           end
 
           buffer = +""

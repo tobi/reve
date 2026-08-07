@@ -86,6 +86,31 @@ group "openai-responses: truncation and failure are in-band" do
   eq "and carries the message", "boom", m["errorMessage"]
 end
 
+group "provider configuration failures are contextual and in-band" do
+  bad = VLLM.merge("baseUrl" => "", "baseUrlSource" => "$LLAMA_CPP_BASE",
+                    "apiKey" => "", "apiKeySource" => "$LLAMA_API_KEY")
+  message = R.stream(model: bad, messages: [], system: "test", tools: [])
+  eq "the lane receives an error message", "error", message["stopReason"]
+  eq "it names provider, model, source and resolved URL", true,
+     message["errorMessage"].include?("vllm/glm52") &&
+       message["errorMessage"].include?("$LLAMA_CPP_BASE") &&
+       message["errorMessage"].include?("resolved=\"\"")
+  eq "it tells the user which environment variable to set", true,
+     message["errorMessage"].include?("Set environment variable $LLAMA_CPP_BASE")
+
+  body = "complete provider detail " * 300
+  response = Struct.new(:code, :message) do
+    define_method(:read_body) { body }
+  end.new("400", "Bad Request")
+  transport = Object.new
+  transport.define_singleton_method(:request) { |_request, &block| block.call(response) }
+  request = Net::HTTP::Post.new(URI("https://models.example/v1/responses"))
+  failed = R::Accumulator.new(VLLM)
+  result = Reve::Provider::HTTP.pump(transport, request, failed, nil)
+  eq "HTTP failures retain the complete response", true,
+     result["errorMessage"].include?(body) && result["errorMessage"].include?("URL: https://models.example/v1/responses")
+end
+
 group "model resolution: provider-only asks the endpoint" do
   cfg = { "providers" => { "vllm" => { "baseUrl" => "http://127.0.0.1:1", "api" => "openai-responses",
                                        "models" => [{ "id" => "glm52", "contextWindow" => 250_000 }] } } }

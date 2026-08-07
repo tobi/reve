@@ -310,6 +310,7 @@ module Reve
     def set_model: (String | Hash[String, untyped]) -> Hash[String, untyped]
     def available_models: (?probe: bool) -> Array[Hash[String, untyped]]
     def model_completions: (?probe: bool) -> Array[String]
+    def model_catalog_diagnostics: () -> Array[Hash[String, untyped]]
     def resolve_model: (String) -> Hash[String, untyped]?
     def start_heartbeat: () -> untyped
     def background_lane?: (String) -> bool

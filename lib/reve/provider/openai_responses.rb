@@ -38,7 +38,7 @@ module Reve
         HTTP.stream_json(url: HTTP.endpoint(model, "responses"),
                          headers: { "authorization" => HTTP.bearer(model) }.merge(model["headers"] || {}),
                          body: request_body(model, messages, system, tools, thinking, max_tokens),
-                         acc: Accumulator.new(model), timeout: timeout,
+                         acc: Accumulator.new(model), timeout: timeout, model: model,
                          abort_check: abort_check, &on_event)
       end
 

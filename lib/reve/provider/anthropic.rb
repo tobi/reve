@@ -47,7 +47,7 @@ module Reve
         HTTP.stream_json(url: HTTP.endpoint(model, "v1/messages"),
                          headers: headers(model, tools, thinking),
                          body: request_body(model, messages, system, tools, thinking, max_tokens),
-                         acc: Accumulator.new(model), timeout: timeout,
+                         acc: Accumulator.new(model), timeout: timeout, model: model,
                          abort_check: abort_check, &on_event)
       end
 
