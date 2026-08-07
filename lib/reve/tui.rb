@@ -446,7 +446,11 @@ module Reve
     end
 
     def text_of(msg)
-      (msg["content"] || []).select { _1["type"] == "text" }.map { _1["text"] }.join
+      parts = (msg["content"] || []).select { _1["type"] == "text" }
+      if msg["role"] == "user"
+        parts = parts.reject { _1["text"].to_s.start_with?("<workspace_context>") }
+      end
+      parts.map { _1["text"] }.join
     end
 
     # ── banner ────────────────────────────────────────────────────────────

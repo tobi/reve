@@ -39,7 +39,7 @@ module Reve
                    cwd: Dir.pwd, tool_execution: "parallel", models_config: nil, agents_md: true,
                    skills: true, skill_dirs: [], user_skills: true, project: nil, sandbox: nil,
                    conversation: "main")
-      # An agent is a directory: instructions.md, tools/, skills/, sandbox/.
+      # An agent is a directory: instructions.md, agent.rb, tools/, sandbox.rb, workspace/.
       @project = project.is_a?(Project) ? project : (project == false ? nil : Project.load(cwd, user_skills: user_skills))
       @sandbox = sandbox || Sandbox.resolve(@project ? @project.sandbox_config : { "hostWorkspace" => cwd })
       # The bind-mount source and every tool's cwd; one mkdir at boot beats a

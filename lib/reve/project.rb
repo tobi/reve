@@ -16,7 +16,7 @@ module Reve
   #   agent.rb             optional: model, thinking level, active tools, sandbox
   #   tools/*.rb           optional: tools written in the Ruby DSL
   #   workspace/skills/*/SKILL.md optional: mutable skills visible inside the VM
-  #   sandbox/sandbox.rb   optional: swap the sandbox backend or bootstrap it
+  #   sandbox.rb           optional: configure the mandatory microVM
   #   .reve/sessions/   where the durable session logs live
   #
   # Nothing here is required: with no files at all reve is a plain coding
@@ -246,10 +246,12 @@ module Reve
     def tool(name) = @tools.find { _1.name == name }
     def tool_declarations = @tools.map(&:declaration)
 
-    # ── sandbox/ ──────────────────────────────────────────────────────────
+    # ── sandbox.rb ────────────────────────────────────────────────────────
 
     def load_sandbox
-      path = %w[sandbox/sandbox.rb sandbox.rb].map { File.join(@root, _1) }.find { File.file?(_1) }
+      # Root sandbox.rb is canonical; the nested path remains a read-only
+      # compatibility fallback for agents generated before Reve 0.8.
+      path = %w[sandbox.rb sandbox/sandbox.rb].map { File.join(@root, _1) }.find { File.file?(_1) }
       from_file =
         if path
           begin
@@ -301,19 +303,20 @@ module Reve
 
     SCAFFOLD = {
       "agent.rb" => <<~'RUBY',
+        #!/usr/bin/env reve
         # What this agent is, in code. instructions.md is its prose; this file is
         # its configuration.
 
         agent do
           model "openai/gpt-5.6-luna"  # configured in this agent's models.yml
-          thinking :off                # off | low | medium | high
+          thinking :low                # off | low | medium | high
 
           # instructions.md stays outside the VM; mutable identity and memory live
           # in workspace/ so the agent can maintain them itself.
           instructions "instructions.md", "workspace/SOUL.md"
 
           # tools :read, :write, :edit, :bash   # restrict the active set
-          # Microsandbox is mandatory; sandbox/sandbox.rb configures its policy.
+          # Microsandbox is mandatory; ./sandbox.rb configures its policy.
         end
       RUBY
       "instructions.md" => <<~'MD',
@@ -429,7 +432,7 @@ module Reve
         2. Group the commits into Added / Changed / Fixed.
         3. Write them to CHANGELOG.md under a new version heading.
       MD
-      "sandbox/sandbox.rb" => <<~'RUBY',
+      "sandbox.rb" => <<~'RUBY',
         # The sandbox every command runs in.
         #
         # workspace/ is mounted at /workspace and is the working directory, so a
@@ -439,9 +442,9 @@ module Reve
         # Microsandbox is mandatory. Reve uses the microsandbox-rb gem's embedded
         # runtime and refuses to run without it; there is no host/local mode.
         #
-        # Egress is deny-by-default: github.com only, using your own GitHub
-        # credential — lent through microsandbox's secret proxy, so the token
-        # never enters the VM. Add hosts explicitly with `allow`.
+        # Egress is deny-by-default. GitHub hosts are reachable, but no host
+        # credential is lent implicitly. The scoped secret example below shows
+        # explicit placeholder substitution without putting the token in the VM.
 
         sandbox do
           image "debian:trixie-slim"
@@ -453,16 +456,22 @@ module Reve
           provision true
           packages "ca-certificates", "curl", "git", "gh", "build-essential", "jq",
                    "unzip", "ripgrep", "fd-find", "file", "less"
-          mise "node@lts"
-          npm "@ast-grep/cli"
+          mise "node@lts", "ast-grep@latest"
 
+          # Host-scoped substitution: the VM sees only this fake placeholder;
+          # microsandbox substitutes the real value on requests to these hosts.
           allow "github.com", "api.github.com", "raw.githubusercontent.com",
-                "objects.githubusercontent.com", "codeload.github.com"
+                "objects.githubusercontent.com", "codeload.github.com" do
+            if ENV.key?("GITHUB_TOKEN")
+              secret "GITHUB_TOKEN", value: ENV.fetch("GITHUB_TOKEN"),
+                     placeholder: "reve-github-token"
+            end
+          end
           allow_all false
-          github_auth true
 
-          # secret "OPENAI_API_KEY", value: ENV.fetch("OPENAI_API_KEY"),
-          #        hosts: ["api.openai.com"]
+          # allow "api.openai.com" do
+          #   secret "OPENAI_API_KEY", value: ENV.fetch("OPENAI_API_KEY")
+          # end
           # bootstrap "bundle install"
         end
       RUBY
@@ -566,6 +575,14 @@ module Reve
       unchanged = []
       candidates = []
       approved = update == true ? nil : Array(update).map(&:to_s)
+      # Preserve old agents while flattening the scaffold. Moving an edited
+      # policy is safe; replacing it with the new template is still opt-in.
+      legacy_sandbox = File.join(root, "sandbox", "sandbox.rb")
+      canonical_sandbox = File.join(root, "sandbox.rb")
+      if File.file?(legacy_sandbox) && !File.exist?(canonical_sandbox)
+        FileUtils.mv(legacy_sandbox, canonical_sandbox)
+        Dir.rmdir(File.dirname(legacy_sandbox)) rescue nil
+      end
       scaffold = SCAFFOLD.merge(Provider::Models::FILENAME => Provider::Models.template)
       scaffold.each do |rel, template|
         path = File.join(root, rel)
@@ -591,6 +608,8 @@ module Reve
         File.binwrite(path, content)
         created << rel
       end
+      agent_file = File.join(root, "agent.rb")
+      File.chmod(File.stat(agent_file).mode | 0o111, agent_file) if File.file?(agent_file)
       FileUtils.mkdir_p(File.join(root, ".reve", "sessions"))
       gitignore = File.join(root, ".gitignore")
       existing = File.file?(gitignore) ? File.read(gitignore) : ""

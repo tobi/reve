@@ -28,6 +28,15 @@ group "file tools are confined to the workspace bind source" do
   end
 end
 
+group "internal workspace context is model-visible but hidden from user echo" do
+  tui = Reve::InteractiveAgentTUI.allocate
+  message = { "role" => "user", "content" => [
+    { "type" => "text", "text" => "<workspace_context>\nsecret context\n</workspace_context>" },
+    { "type" => "text", "text" => "what I typed" }
+  ] }
+  eq "only the user's query is displayed", "what I typed", tui.text_of(message)
+end
+
 group "a shell execution projects into context as the user's action" do
   entry = { "type" => "custom", "customType" => "bash_execution",
             "data" => { "command" => "rake test", "output" => "3 failures", "exitCode" => 1 } }

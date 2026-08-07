@@ -9,7 +9,7 @@ require_relative "sandbox/host_auth"
 module Reve
   # Every agent has a sandbox — the place its commands actually run.
   #
-  # `sandbox/sandbox.rb` customises one mandatory backend: microsandbox-rb's
+  # Agent-root `sandbox.rb` customises one mandatory backend: microsandbox-rb's
   # embedded microVM runtime. There is no local mode and no fallback. If the gem
   # or runtime cannot start, the agent refuses to execute model-authored code.
   #
@@ -21,10 +21,10 @@ module Reve
     # activated in /etc/profile.d, so `sh -lc` picks it up like a login shell).
     APT_PACKAGES = %w[ca-certificates curl git gh build-essential jq unzip
                       ripgrep fd-find file less].freeze
-    # Keep provisioning independent of GitHub's unauthenticated API limit: gh
-    # comes from Debian, Node from mise, and ast-grep from npm.
-    MISE_TOOLS = %w[node@lts].freeze
-    NPM_TOOLS = %w[@ast-grep/cli].freeze
+    # gh comes from Debian; mise installs Node and ast-grep directly (the
+    # registry resolves ast-grep through aqua), so npm is not a provisioner.
+    MISE_TOOLS = %w[node@lts ast-grep@latest].freeze
+    NPM_TOOLS = [].freeze
 
     DEFAULTS = Ractor.make_shareable({
       "backend" => "microsandbox",
@@ -48,9 +48,9 @@ module Reve
       # provisioning is enabled; turn it off (or bake an image) and the policy
       # is github-only.
       "provisionHosts" => %w[deb.debian.org security.debian.org ftp.debian.org
-                             mise.run mise.jdx.dev registry.npmjs.org nodejs.org
+                             mise.run mise.jdx.dev nodejs.org
                              github.com objects.githubusercontent.com],
-      "githubAuth" => true,
+      "githubAuth" => false,
       "secrets" => [],
       "bootstrap" => [],
       "env" => { "DEBIAN_FRONTEND" => "noninteractive", "MISE_YES" => "1" }
@@ -162,7 +162,7 @@ module Reve
       h.each_with_object({}) { |(k, v), acc| acc[k.to_s] = v }
     end
 
-    # The DSL for sandbox/sandbox.rb:
+    # The DSL for an agent's ./sandbox.rb:
     #
     #   sandbox do
     #     backend :microsandbox
@@ -188,8 +188,16 @@ module Reve
 
       # Network. `allow` adds hosts to the deny-by-default egress policy;
       # `allow_all` opts out of it entirely and says so in the UI.
-      def allow(*hosts)
-        (@allow ||= []).concat(hosts.flatten.map(&:to_s))
+      def allow(*hosts, &block)
+        names = hosts.flatten.map(&:to_s)
+        (@allow ||= []).concat(names)
+        return names unless block
+
+        previous = @secret_scope
+        @secret_scope = names
+        instance_eval(&block)
+      ensure
+        @secret_scope = previous if block
       end
 
       def allow_all(flag = true) = @config["allowAll"] = !!flag
@@ -197,10 +205,15 @@ module Reve
 
       # A host credential the sandbox may use without holding it: the value
       # stays outside the VM and is injected into requests to `hosts`.
-      def secret(env_var, hosts: [], value: nil)
-        (@secrets ||= []) << { "env_var" => env_var.to_s,
-                               "value" => value || ENV[env_var.to_s].to_s,
-                               "allow_hosts" => Array(hosts).map(&:to_s) }
+      def secret(env_var, hosts: nil, value:, placeholder: nil)
+        scoped_hosts = hosts.nil? ? Array(@secret_scope) : Array(hosts).map(&:to_s)
+        raise ArgumentError, "secret #{env_var} requires at least one host" if scoped_hosts.empty?
+        raise ArgumentError, "secret #{env_var} requires a non-empty value" if value.to_s.empty?
+
+        entry = { "env_var" => env_var.to_s, "value" => value.to_s,
+                  "allow_hosts" => scoped_hosts }
+        entry["placeholder"] = placeholder.to_s unless placeholder.to_s.empty?
+        (@secrets ||= []) << entry
       end
 
       ATTRIBUTES.each do |attr|

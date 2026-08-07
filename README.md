@@ -17,13 +17,12 @@ and durable history.
 reve/                         the agent root
 ├── instructions.md            identity, purpose, and standing instructions
 ├── models.yml                 provider and model configuration owned by this agent
-├── agent.rb                   optional Ruby configuration DSL
+├── agent.rb                   executable configuration DSL (`./agent.rb` launches Reve)
 ├── channels/
 │   └── tui.rb                 the one shipped channel, a small visitor adapter
 ├── tools/
 │   └── example.rb             optional project tools written in Ruby
-├── sandbox/
-│   └── sandbox.rb             optional sandbox policy
+├── sandbox.rb                 optional sandbox policy
 ├── workspace/                 the VM-visible, agent-editable mind and worktree
 │   ├── AGENTS.md              abbreviated stateful-agent kernel
 │   ├── SOUL.md                identity, voice, boundaries, and timezone
@@ -182,12 +181,15 @@ Reve depends on `microsandbox-rb`. There is no local mode, CLI transport, Fiddle
 or host shell: if the gem or embedded runtime cannot boot the configured VM, Reve refuses
 to start. Model `bash`, project `ctx.sh`, and user `!command` all execute through the same
 live VM handle. `workspace/` is the only writable bind mount; host-side file helpers are
-strictly confined to that bind source, including symlink resolution.
+strictly confined to that bind source, including symlink resolution. GitHub hosts are
+allowed by default, but credentials are never borrowed implicitly. `allow ... do;
+secret ...; end` explicitly scopes placeholder substitution to named hosts.
 
 The first launch creates and provisions a VM. Clean shutdown stops it but preserves its
 root disk and definition; later launches restart that named VM instead of reinstalling
-APT, mise, Node, and npm packages. A sandbox policy or toolchain change intentionally
-replaces and reprovisions it. Reve also avoids model-endpoint discovery during startup.
+APT and mise-managed tools. Node and ast-grep are both installed through mise; the
+default scaffold does not use npm provisioning. A sandbox policy or toolchain change
+intentionally replaces and reprovisions it. Reve also avoids model-endpoint discovery during startup.
 
 At every run boundary Reve rereads full `workspace/AGENTS.md`, full
 `workspace/SOUL.md`, and the first 100 lines of `workspace/KNOWLEDGE.md`. They enter the

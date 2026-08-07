@@ -134,7 +134,7 @@ test/               parity + crash-site tests (§20)
 
 An agent is a directory, and the files in it are its definition: `instructions.md` (the
 authority in the system prompt), `agent.rb` (config), `tools/*.rb` (Ruby DSL), `skills/`,
-`sandbox/sandbox.rb`, `workspace/` (the work), and `.reve/sessions/` for the durable
+`sandbox.rb`, `workspace/` (the work), and `.reve/sessions/` for the durable
 logs. `reve init` scaffolds all of it, and reve refuses to launch outside such a
 directory (`--plain` overrides).
 

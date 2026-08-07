@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "helper"
+require "open3"
 include TestKit
 
 group "reve init scaffolds an agent directory" do
@@ -8,10 +9,17 @@ group "reve init scaffolds an agent directory" do
     result = Reve::Project.init(dir, name: "notes-bot")
     eq "instructions.md is the centre of it", true, result["created"].include?("instructions.md")
     eq "agent.rb carries the configuration", true, result["created"].include?("agent.rb")
+    agent_path = File.join(dir, "agent.rb")
+    eq "agent.rb has the Reve shebang", "#!/usr/bin/env reve", File.open(agent_path, &:gets).strip
+    eq "agent.rb is executable", true, File.executable?(agent_path)
+    env = { "PATH" => "#{File.expand_path("../bin", __dir__)}:#{ENV.fetch("PATH")}" }
+    stdout, stderr, status = Open3.capture3(env, agent_path, "--version", chdir: "/tmp")
+    eq "executing agent.rb launches Reve from its own directory", [true, "reve #{Reve::VERSION}", ""],
+       [status.success?, stdout.strip, stderr.strip]
     eq "with tools, mutable skills and a sandbox alongside",
-       %w[sandbox/sandbox.rb tools/example.rb workspace/AGENTS.md workspace/skills/heartbeat/SKILL.md],
+       %w[sandbox.rb tools/example.rb workspace/AGENTS.md workspace/skills/heartbeat/SKILL.md],
        (result["created"] & %w[tools/example.rb workspace/skills/heartbeat/SKILL.md
-                               sandbox/sandbox.rb workspace/AGENTS.md]).sort
+                               sandbox.rb workspace/AGENTS.md]).sort
     eq "SOUL.md is editable inside the VM", true, result["created"].include?("workspace/SOUL.md")
     eq "memory and heartbeat files ship in workspace", true,
        %w[workspace/KNOWLEDGE.md workspace/DREAM.md workspace/HEARTBEAT.yml].all? do |file|
@@ -29,17 +37,34 @@ group "reve init scaffolds an agent directory" do
     eq "identical files are classified as unchanged", true, again["unchanged"].include?("instructions.md")
     eq "and says what it skipped", true, again["skipped"].include?("instructions.md")
 
-    sandbox_path = File.join(dir, "sandbox", "sandbox.rb")
+    sandbox_path = File.join(dir, "sandbox.rb")
     File.write(sandbox_path, "# an older or user-edited policy\n")
     offered = Reve::Project.init(dir)
     eq "a changed generated file is offered for update", true,
-       offered["updateCandidates"].include?("sandbox/sandbox.rb")
+       offered["updateCandidates"].include?("sandbox.rb")
     eq "it is not overwritten without approval", "# an older or user-edited policy\n",
        File.read(sandbox_path)
-    applied = Reve::Project.init(dir, update: ["sandbox/sandbox.rb"])
-    eq "an approved candidate is updated", ["sandbox/sandbox.rb"], applied["updated"]
+    applied = Reve::Project.init(dir, update: ["sandbox.rb"])
+    eq "an approved candidate is updated", ["sandbox.rb"], applied["updated"]
     eq "the current mandatory sandbox template was installed", true,
        File.read(sandbox_path).include?("Microsandbox is mandatory")
+    sandbox_template = File.read(sandbox_path)
+    eq "GitHub auth is not enabled implicitly", false, sandbox_template.include?("github_auth true")
+    eq "ast-grep is installed by mise without npm", true,
+       sandbox_template.include?('mise "node@lts", "ast-grep@latest"') && !sandbox_template.include?("npm ")
+  end
+end
+
+group "reve init moves the legacy nested sandbox without overwriting it" do
+  Dir.mktmpdir do |root|
+    legacy = File.join(root, "sandbox", "sandbox.rb")
+    FileUtils.mkdir_p(File.dirname(legacy))
+    File.write(legacy, "# custom policy\n")
+    result = Reve::Project.init(root)
+    eq "the policy moved to the agent root", "# custom policy\n", File.read(File.join(root, "sandbox.rb"))
+    eq "the legacy path is gone", false, File.exist?(legacy)
+    eq "the custom policy is still only an update candidate", true,
+       result["updateCandidates"].include?("sandbox.rb")
   end
 end
 
@@ -51,7 +76,7 @@ Dir.mktmpdir do |root|
     eq "it knows it is an agent", true, p.agent?
     eq "name from frontmatter", "notes-bot", p.name
     eq "model comes from agent.rb", "openai/gpt-5.6-luna", p.config["model"]
-    eq "thinking too", "off", p.config["thinkingLevel"]
+    eq "thinking defaults low", "low", p.config["thinkingLevel"]
     eq "instructions are the body, not the frontmatter", false, p.instructions.include?("name: notes-bot")
     eq "tools/ loaded", %w[sandboxed_uname word_count], p.tools.map(&:name).sort
     eq "workspace skills loaded", %w[heartbeat release-notes], p.skills.map { _1["name"] }.sort
@@ -299,8 +324,8 @@ group "sandbox: default image comes with the tools an agent reaches for" do
   eq "ripgrep and fd are in the package list", true,
      (cfg["packages"] & %w[ripgrep fd-find]).size == 2
   eq "gh comes from Debian, avoiding GitHub API discovery", true, cfg["packages"].include?("gh")
-  eq "mise supplies the runtime", %w[node@lts], cfg["mise"]
-  eq "ast-grep comes from npm", ["@ast-grep/cli"], cfg["npm"]
+  eq "mise supplies Node and ast-grep", %w[node@lts ast-grep@latest], cfg["mise"]
+  eq "npm provisioning is empty", [], cfg["npm"]
   script = Reve::Sandbox.provision_script(cfg)
   eq "mise is installed", true, script.include?("https://mise.run")
   eq "and activated for every shell", true, script.include?("/etc/profile.d/10-mise.sh")
@@ -309,8 +334,9 @@ group "sandbox: default image comes with the tools an agent reaches for" do
   eq "shims go on PATH, because /bin/sh is dash", true, script.include?("mise/shims")
   eq "fd gets its familiar name", true, script.include?("ln -sf /usr/bin/fdfind")
   eq "provisioning is idempotent", true, script.include?("[ -f /var/lib/reve/provisioned ]")
-  eq "runtimes installed globally", true, script.include?("mise use -g node@lts")
-  eq "npm tools installed globally", true, script.include?("npm install -g @ast-grep/cli")
+  eq "mise tools installed globally", true,
+     script.include?("mise use -g node@lts ast-grep@latest")
+  eq "no npm global install", false, script.include?("npm install -g")
 end
 
 group "sandbox: egress is deny-by-default, github only" do
@@ -424,6 +450,9 @@ group "sandbox DSL" do
         cpus 4
         memory 2048
         env "TZ", "UTC"
+        allow "github.com", "api.github.com" do
+          secret "GITHUB_TOKEN", value: "real-token", placeholder: "fake-token"
+        end
         bootstrap "pip install -r requirements.txt", "pytest --version"
       end
     RUBY
@@ -433,6 +462,13 @@ group "sandbox DSL" do
     eq "resources", [4, 2048], [cfg["cpus"], cfg["memory"]]
     eq "env", { "TZ" => "UTC" }, cfg["env"]
     eq "bootstrap commands in order", ["pip install -r requirements.txt", "pytest --version"], cfg["bootstrap"]
+    secret = cfg["secrets"].first
+    eq "allow block scopes its secret", %w[github.com api.github.com], secret["allow_hosts"]
+    eq "the VM receives a fake placeholder", "fake-token", secret["placeholder"]
+    eq "the real value remains in the proxy config", "real-token", secret["value"]
+    eq "GitHub auth is not implicit", false, cfg["githubAuth"]
+    eq "ast-grep comes from mise, not npm", [%w[node@lts ast-grep@latest], []],
+       [cfg["mise"], cfg["npm"]]
     eq "defaults filled in", "/workspace", cfg["workdir"]
   end
 end
