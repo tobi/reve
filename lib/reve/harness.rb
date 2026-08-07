@@ -222,7 +222,19 @@ module Reve
       { "ok" => true, "model" => m }
     end
 
-    def available_models = Provider::Models.list(@models_config)
+    def available_models(probe: true) = Provider::Models.list(@models_config, probe: probe)
+
+    def model_completions
+      providers = (@models_config["providers"] || {})
+      ids = providers.values.flat_map { (_1["models"] || []).map { |model| model["id"] } }
+      unique_ids = ids.tally.select { |_id, count| count == 1 }.keys
+      qualified = providers.flat_map do |provider, config|
+        (config["models"] || []).map { |model| "#{provider}/#{model["id"]}" }
+      end
+      current = [@model && "#{@model["provider"]}/#{@model["modelId"]}", @model && @model["modelId"]]
+      (providers.keys + qualified + unique_ids + current.compact).uniq.sort
+    end
+
     def resolve_model(spec) = Provider::Models.resolve(@models_config, spec)
 
     def emit_event(type, payload = {}) = emit_local(type, payload)

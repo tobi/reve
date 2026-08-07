@@ -83,7 +83,11 @@ Dir.mktmpdir do |dir|
 
   group "tab completion knows where the cursor is" do
     model = fake_model(dir, [assistant_text("ok")])
-    h, = test_harness(storage: "memory", model: model, cwd: dir)
+    models_config = { "providers" => {
+      "openai" => { "models" => [{ "id" => "gpt-5.6-luna" }] },
+      "llamacpp" => { "models" => [] }
+    } }
+    h, = test_harness(storage: "memory", model: model, cwd: dir, models_config: models_config)
     tui = Reve::InteractiveAgentTUI.new(h, [])
     line = Reve::Term::Line.new
     tui.instance_variable_set(:@line, line)
@@ -99,6 +103,12 @@ Dir.mktmpdir do |dir|
     eq "think levels", %w[off low medium high], complete.call("/think ").first
     eq "tool names", %w[read], complete.call("/tools re").first
     eq "lane names", ["main"], complete.call("/lane ").first
+    eq "model provider completion is local", ["openai", "openai/gpt-5.6-luna"],
+       complete.call("/model openai").first
+    eq "providers without static models still complete", ["llamacpp"],
+       complete.call("/model llama").first
+    eq "unambiguous model ids complete", ["gpt-5.6-luna"],
+       complete.call("/model gpt-").first
     Dir.chdir(dir) do
       eq "unknown command falls through to paths", ["lib/"], complete.call("/nope li").first
       eq "paths after !", ["lib/"], complete.call("!ls li").first

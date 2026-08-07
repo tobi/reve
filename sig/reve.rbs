@@ -308,7 +308,8 @@ module Reve
     def watch_session: () -> Watch
     def model: () -> Hash[String, untyped]
     def set_model: (String | Hash[String, untyped]) -> Hash[String, untyped]
-    def available_models: () -> Array[Hash[String, untyped]]
+    def available_models: (?probe: bool) -> Array[Hash[String, untyped]]
+    def model_completions: () -> Array[String]
     def resolve_model: (String) -> Hash[String, untyped]?
     def start_heartbeat: () -> untyped
     def background_lane?: (String) -> bool

@@ -642,7 +642,7 @@ module Reve
       case cmd
       when "skill" then @h.skills.map { _1["name"] }.sort
       when "lane" then @h.lanes.map { _1["name"] }
-      when "model" then @h.available_models.flat_map { ["#{_1["provider"]}/#{_1["modelId"]}", _1["modelId"]] }.uniq
+      when "model" then @h.model_completions
       when "think" then THINK_LEVELS
       when "tools" then Reve::Tools.names
       when "help" then COMMANDS
