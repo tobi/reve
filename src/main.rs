@@ -5,8 +5,9 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
+use leve::progress::Spinner;
 use leve::project::{self, Project};
-use leve::sandbox::{ExecOptions, Progress, Sandbox};
+use leve::sandbox::{ExecOptions, Sandbox};
 
 #[derive(Parser)]
 #[command(
@@ -15,8 +16,9 @@ use leve::sandbox::{ExecOptions, Progress, Sandbox};
     about = "A durable coding agent: Rust core, Lua scripting, mandatory microVM"
 )]
 struct Cli {
+    /// Omitted: open the terminal for the agent in this directory.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -43,18 +45,6 @@ enum Command {
     Info,
 }
 
-/// A spinner for the long first boot, which pulls an image and provisions.
-struct Spinner;
-
-impl Progress for Spinner {
-    fn stage(&self, label: &str) {
-        eprintln!("  \x1b[2m·\x1b[0m {label}");
-    }
-    fn finish(&self, label: &str) {
-        eprintln!("  \x1b[32m✓\x1b[0m {label}");
-    }
-}
-
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
@@ -68,7 +58,14 @@ async fn main() -> ExitCode {
 
 async fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
-    match cli.command {
+    let Some(command) = cli.command else {
+        // Bare `leve` is the thing `leve init` tells you to run.
+        let project = Project::load(std::env::current_dir()?)?;
+        let sandbox = start_sandbox(&project).await?;
+        leve::tui::session::run(project, sandbox).await?;
+        return Ok(ExitCode::SUCCESS);
+    };
+    match command {
         Command::Init { dir } => {
             let root = dir.unwrap_or(std::env::current_dir()?);
             let report = project::init(&root)?;
@@ -179,7 +176,7 @@ async fn start_sandbox(project: &Project) -> anyhow::Result<Arc<Sandbox>> {
         project.runtime.policy.clone(),
         project.workspace(),
         project.state_dir(),
-        &Spinner,
+        &Spinner::new(),
     )
     .await?;
     Ok(Arc::new(sandbox))

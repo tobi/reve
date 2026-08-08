@@ -134,7 +134,7 @@ impl Item {
             } => {
                 let mut meta = vec![status.glyph().to_string()];
                 if let Some(d) = duration {
-                    meta.push(format!("{:.1}s", d.as_secs_f32()));
+                    meta.push(duration_text(*d));
                 }
                 let mut head = vec![
                     Span::styled("◆ ", theme::danger()),
@@ -152,13 +152,22 @@ impl Item {
                 // reserved for the detail, and reusing it here would read as
                 // one.
                 let mut lines = markdown::wrap(&head, width, "", "  ");
+                // Tool output is almost always multi-line, and its line
+                // structure is the content: `wrap` breaks on spaces, so a
+                // newline would be swallowed and three lines would render as
+                // one run-on. Each source line gets its own gutter.
                 if let Some(detail) = detail {
-                    let spans = vec![Span::styled(detail.clone(), theme::code())];
-                    lines.extend(markdown::wrap(&spans, width, "  │ ", "  │ "));
+                    for source in detail.lines() {
+                        let spans = vec![Span::styled(source.to_string(), theme::code())];
+                        lines.extend(markdown::wrap(&spans, width, "  │ ", "  │ "));
+                    }
                 }
                 if let Some(outcome) = outcome {
-                    let spans = vec![Span::styled(outcome.clone(), theme::dim())];
-                    lines.extend(markdown::wrap(&spans, width, "  └ ", "    "));
+                    for (index, source) in outcome.lines().enumerate() {
+                        let spans = vec![Span::styled(source.to_string(), theme::dim())];
+                        let first = if index == 0 { "  └ " } else { "    " };
+                        lines.extend(markdown::wrap(&spans, width, first, "    "));
+                    }
                 }
                 lines
             }
@@ -237,6 +246,19 @@ impl Item {
                 markdown::wrap(&head, width, "", "  ")
             }
         }
+    }
+}
+
+/// A command that took 12ms should say so, not "0.0s", which reads as a
+/// stopwatch that failed to start.
+fn duration_text(d: std::time::Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if d.as_secs_f32() < 10.0 {
+        format!("{:.1}s", d.as_secs_f32())
+    } else {
+        format!("{:.0}s", d.as_secs_f32())
     }
 }
 
@@ -337,7 +359,7 @@ mod tests {
         .render(70);
         assert_eq!(
             plain(&lines),
-            vec!["◆ Ran command · List workspace contents · ✗ · 0.1s".to_string()]
+            vec!["◆ Ran command · List workspace contents · ✗ · 120ms".to_string()]
         );
         assert_eq!(first_style(&lines[0]).fg, Some(theme::DANGER));
     }
@@ -362,6 +384,59 @@ mod tests {
             rendered
                 .iter()
                 .any(|l| l.starts_with("  └ workdir escapes")),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn durations_read_naturally_at_every_scale() {
+        use std::time::Duration;
+        assert_eq!(duration_text(Duration::from_millis(12)), "12ms");
+        assert_eq!(duration_text(Duration::from_millis(2400)), "2.4s");
+        assert_eq!(duration_text(Duration::from_secs(32)), "32s");
+    }
+
+    #[test]
+    fn multi_line_tool_output_keeps_its_lines() {
+        // Regression: `wrap` breaks on spaces, so a detail containing newlines
+        // rendered as one run-on line — "Linux" + "root" + "/workspace" became
+        // "Linuxroot/workspace".
+        let lines = Item::Tool {
+            verb: "Ran".into(),
+            description: "uname -s; id -un; pwd".into(),
+            status: Status::Ok,
+            duration: None,
+            detail: Some("Linux\nroot\n/workspace".into()),
+            outcome: None,
+        }
+        .render(60);
+        let rendered = plain(&lines);
+        assert!(rendered.contains(&"  │ Linux".to_string()), "{rendered:?}");
+        assert!(rendered.contains(&"  │ root".to_string()), "{rendered:?}");
+        assert!(
+            rendered.contains(&"  │ /workspace".to_string()),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_multi_line_outcome_keeps_its_gutter_on_the_first_line_only() {
+        let lines = Item::Tool {
+            verb: "Ran".into(),
+            description: "build".into(),
+            status: Status::Failed,
+            duration: None,
+            detail: None,
+            outcome: Some("error: could not compile\ncaused by: missing semicolon".into()),
+        }
+        .render(60);
+        let rendered = plain(&lines);
+        assert!(
+            rendered.iter().any(|l| l.starts_with("  └ error:")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|l| l.starts_with("    caused by:")),
             "{rendered:?}"
         );
     }
