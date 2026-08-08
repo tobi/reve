@@ -60,6 +60,40 @@ group "Telegram rich output uses a monotonic state machine" do
        calls.last.last.dig("rich_message", "markdown").include?("**Done**")
 end
 
+group "Telegram permanently locks input and output to the first private sender" do
+  Dir.mktmpdir do |dir|
+    kv = Reve::Channels::KV.new(dir, "telegram-pairing-test")
+    harness = Struct.new(:main).new(Object.new)
+    context = Struct.new(:kv, :harness) do
+      def command(*) = nil
+    end.new(kv, harness)
+    telegram = Reve::Channels::Telegram.new(context)
+    sends = []
+    telegram.define_singleton_method(:api) do |_token, method, body|
+      sends << [method, body]
+      { "message_id" => sends.size }
+    end
+    first = { "chat" => { "type" => "private", "id" => 101 },
+              "from" => { "id" => 101 }, "text" => "/start" }
+    stranger = { "chat" => { "type" => "private", "id" => 202 },
+                 "from" => { "id" => 202 }, "text" => "hello" }
+    telegram.send(:receive, first)
+    telegram.send(:receive, stranger)
+
+    eq "the first sender and chat are persisted", [101, 101],
+       [kv.get("allowed_user_id"), kv.get("allowed_chat_id")]
+    eq "a stranger receives absolutely nothing", 1, sends.size
+    blocked = begin
+      telegram.send(:call_api, "sendRichMessage", "chat_id" => 202,
+                    "rich_message" => { "markdown" => "no" })
+      false
+    rescue RuntimeError
+      true
+    end
+    eq "every outbound send independently enforces the paired chat", true, blocked
+  end
+end
+
 group "channel commands parse JSON objects" do
   project = Struct.new(:root).new(Dir.mktmpdir)
   lane = Class.new do

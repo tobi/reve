@@ -340,8 +340,10 @@ Later sessions reconnect without resending it:
 /telegram-disconnect
 ```
 
-The first private Telegram user to send `/start` becomes the paired user. Every inbound
-prompt is durably submitted as `[channel=telegram] …`. The channel's system-message
+The sender of the first private Telegram message becomes the permanently paired user and
+chat. Every later inbound message must match both identities, and every outbound API call
+independently refuses any other chat. A first `/start` pairs without creating a model turn.
+Every inbound prompt is durably submitted as `[channel=telegram] …`. The channel's system-message
 injection tells the agent to treat that prefix as transport metadata and to write concise
 Telegram Rich Markdown.
 

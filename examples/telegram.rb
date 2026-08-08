@@ -200,14 +200,24 @@ module Reve
 
         user_id = message.dig("from", "id")
         chat_id = message.dig("chat", "id")
-        allowed = @kv.get("allowed_user_id")
-        if allowed.nil? && message["text"].to_s.start_with?("/start")
+        allowed_user = @kv.get("allowed_user_id")
+        allowed_chat = @kv.get("allowed_chat_id")
+        if allowed_user.nil?
+          # First private sender wins permanently. Persist both identities before
+          # sending anything, so every outbound path is already fail-closed.
           @kv.set("allowed_user_id", user_id)
+          @kv.set("allowed_chat_id", chat_id)
+          allowed_user = user_id
+          allowed_chat = chat_id
           call_api("sendRichMessage", "chat_id" => chat_id,
                                       "rich_message" => { "markdown" => "Paired with Reve." })
-          return
+          return if message["text"].to_s.start_with?("/start")
+        elsif allowed_chat.nil? && allowed_user.to_i == user_id.to_i
+          # One-time migration from the earlier user-only pairing format.
+          @kv.set("allowed_chat_id", chat_id)
+          allowed_chat = chat_id
         end
-        return unless allowed.to_i == user_id.to_i
+        return unless allowed_user.to_i == user_id.to_i && allowed_chat.to_i == chat_id.to_i
 
         text = message["text"].to_s.strip
         if %w[/stop stop].include?(text.downcase)
@@ -246,7 +256,15 @@ module Reve
         end
       end
 
-      def call_api(method, body) = api(@token, method, body)
+      def call_api(method, body)
+        if method.start_with?("send")
+          allowed_chat = @kv.get("allowed_chat_id")
+          target = body["chat_id"]
+          raise "refusing Telegram output to an unpaired chat" unless allowed_chat &&
+                                                                         target.to_i == allowed_chat.to_i
+        end
+        api(@token, method, body)
+      end
 
       def api(token, method, body)
         uri = URI("https://api.telegram.org/bot#{token}/#{method}")
