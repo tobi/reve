@@ -131,15 +131,26 @@ module Reve
       <<~SH.strip
         set -e
         [ -f #{PROVISION_MARKER} ] && exit 0
+        retry() {
+          attempts=0
+          until "$@"; do
+            attempts=$((attempts + 1))
+            [ "$attempts" -ge 5 ] && return 1
+            sleep "$attempts"
+          done
+        }
         mkdir -p /var/lib/reve
         if command -v apt-get > /dev/null; then
-          apt-get update -qq
-          apt-get install -y --no-install-recommends #{packages} > /dev/null
+          apt-get -o Acquire::Retries=5 update -qq
+          apt-get -o Acquire::Retries=5 install -y --no-install-recommends #{packages} > /dev/null
           # debian ships fd as fdfind; agents type fd
           [ -x /usr/bin/fdfind ] && ln -sf /usr/bin/fdfind /usr/local/bin/fd || true
         fi
         if ! command -v mise > /dev/null; then
-          curl -fsSL https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise sh
+          retry curl -fsSL --retry 5 --retry-all-errors --retry-delay 1 \
+            -o /tmp/mise-install.sh https://mise.run
+          retry env MISE_INSTALL_PATH=/usr/local/bin/mise sh /tmp/mise-install.sh
+          rm -f /tmp/mise-install.sh
         fi
         # Shims first: they work in dash, which is /bin/sh here, so every
         # `sh -lc` the agent runs already has the runtimes on PATH. The eval is
@@ -151,8 +162,8 @@ module Reve
         sed -i 's/^        //' /etc/profile.d/10-mise.sh
         chmod +x /etc/profile.d/10-mise.sh
         . /etc/profile.d/10-mise.sh
-        #{tools.empty? ? "" : "mise use -g #{tools} > /dev/null"}
-        #{npm_tools.empty? ? "" : "npm install -g #{npm_tools} > /dev/null"}
+        #{tools.empty? ? "" : "retry mise use -g #{tools} > /dev/null"}
+        #{npm_tools.empty? ? "" : "retry npm install -g #{npm_tools} > /dev/null"}
         touch #{PROVISION_MARKER}
       SH
     end

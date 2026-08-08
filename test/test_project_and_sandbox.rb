@@ -328,6 +328,9 @@ group "sandbox: default image comes with the tools an agent reaches for" do
   eq "ast-grep comes from npm without GitHub API discovery", ["@ast-grep/cli"], cfg["npm"]
   script = Reve::Sandbox.provision_script(cfg)
   eq "mise is installed", true, script.include?("https://mise.run")
+  eq "fresh-VM network operations retry while DNS settles", true,
+     script.include?("Acquire::Retries=5") && script.include?("retry mise use") &&
+       script.include?("retry npm install")
   eq "and activated for every shell", true, script.include?("/etc/profile.d/10-mise.sh")
   eq "a non-bash profile source cannot trip set -e", true,
      script.include?('eval "$(mise activate bash)" || true')
