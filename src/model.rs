@@ -30,31 +30,55 @@ pub struct ToolCall {
 }
 
 /// Why the model stopped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum StopReason {
     /// The turn is over.
+    #[default]
     Stop,
     /// The model wants tools run, then to be asked again.
     ToolUse,
 }
 
+/// What a turn cost.
+///
+/// `cached_input` drives the cache-miss warning: a normal request whose prefix
+/// mostly missed the cache means something invalidated it, and that is worth
+/// saying out loud rather than paying for quietly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input: u32,
+    pub output: u32,
+    pub cached_input: u32,
+}
+
+impl Usage {
+    /// Fraction of the input that had to be re-read, 0.0 to 1.0.
+    pub fn uncached_fraction(&self) -> f32 {
+        if self.input == 0 {
+            return 0.0;
+        }
+        1.0 - (self.cached_input as f32 / self.input as f32)
+    }
+}
+
 /// One assistant turn.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Assistant {
     #[serde(default)]
     pub text: String,
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
     pub stop_reason: StopReason,
+    #[serde(default)]
+    pub usage: Usage,
 }
 
 impl Assistant {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
-            tool_calls: Vec::new(),
-            stop_reason: StopReason::Stop,
+            ..Default::default()
         }
     }
 
@@ -67,6 +91,7 @@ impl Assistant {
                 arguments: arguments.as_object().cloned().unwrap_or_default(),
             }],
             stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
         }
     }
 
@@ -92,8 +117,36 @@ impl Assistant {
     }
 }
 
+/// What the lane is asking for.
+pub struct Request<'a> {
+    /// The conversation, oldest first.
+    pub context: &'a [Entry],
+    /// The stable system prefix.
+    pub system: &'a str,
+    /// Tools the model may call, as JSON schemas.
+    pub tools: &'a [ToolSchema],
+}
+
+/// A tool as the model sees it.
+#[derive(Debug, Clone)]
+pub struct ToolSchema {
+    pub name: String,
+    pub description: String,
+    pub schema: Value,
+}
+
+/// Where streamed text goes as it arrives.
+///
+/// A callback rather than a channel so a caller that does not care about
+/// streaming can pass a no-op and ignore the whole concern.
+pub type Deltas<'a> = &'a (dyn Fn(&str) + Send + Sync);
+
 pub trait Model: Send + Sync {
-    fn respond<'a>(&'a self, context: &'a [Entry]) -> BoxFuture<'a, Result<Assistant>>;
+    fn respond<'a>(
+        &'a self,
+        request: Request<'a>,
+        on_text: Deltas<'a>,
+    ) -> BoxFuture<'a, Result<Assistant>>;
 }
 
 /// A model that reads its turns from a script.
@@ -130,7 +183,11 @@ impl ScriptedModel {
 }
 
 impl Model for ScriptedModel {
-    fn respond<'a>(&'a self, _context: &'a [Entry]) -> BoxFuture<'a, Result<Assistant>> {
+    fn respond<'a>(
+        &'a self,
+        _request: Request<'a>,
+        on_text: Deltas<'a>,
+    ) -> BoxFuture<'a, Result<Assistant>> {
         Box::pin(async move {
             let index = self.cursor();
             let turn = self
@@ -139,6 +196,9 @@ impl Model for ScriptedModel {
                 .cloned()
                 .ok_or_else(|| ModelError(format!("script exhausted at turn {index}")))?;
             self.advance(index + 1);
+            if !turn.text.is_empty() {
+                on_text(&turn.text);
+            }
             Ok(turn)
         })
     }

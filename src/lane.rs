@@ -117,7 +117,12 @@ impl Lane<'_> {
                 .into_iter()
                 .cloned()
                 .collect();
-            let assistant = match self.model.respond(&context).await {
+            let request = crate::model::Request {
+                context: &context,
+                system: "",
+                tools: &[],
+            };
+            let assistant = match self.model.respond(request, &|_| {}).await {
                 Ok(assistant) => assistant,
                 Err(e) => {
                     self.record(
@@ -566,7 +571,8 @@ mod tests {
     impl Model for CancellingModel {
         fn respond<'a>(
             &'a self,
-            _context: &'a [Entry],
+            _request: crate::model::Request<'a>,
+            _on_text: crate::model::Deltas<'a>,
         ) -> crate::model::BoxFuture<'a, crate::model::Result<Assistant>> {
             Box::pin(async move {
                 self.tx.cancel();

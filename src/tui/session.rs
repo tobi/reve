@@ -12,7 +12,10 @@ use std::time::Instant;
 
 use tokio::sync::mpsc;
 
+use crate::model::{Model, Request, StopReason};
 use crate::project::Project;
+use crate::provider::HttpModel;
+use crate::provider::config::Models;
 use crate::sandbox::tokio_util_lite::{CancelTx, channel};
 use crate::sandbox::{ExecOptions, Sandbox};
 use crate::tui::app::{Action, App, Update};
@@ -50,10 +53,16 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
         .iter()
         .map(|t| t.name.clone())
         .collect();
-    let mut banner = String::from(
-        "What you type goes to the model. Prefix `!` to run a command in this agent's \
-         microVM instead",
-    );
+    // Resolve the model up front: a missing key should be a sentence at
+    // startup, not a failure on the user's first prompt.
+    let model = load_model(&project);
+    let mut banner = match &model {
+        Ok(_) => String::from(
+            "What you type goes to the model. Prefix `!` to run a command in this agent's \
+             microVM instead",
+        ),
+        Err(why) => format!("**No model.** {why}\n\nPrefix `!` to run a command in the microVM"),
+    };
     if tools.is_empty() {
         banner.push('.');
     } else {
@@ -83,14 +92,19 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
                         // `!` is the shell escape, exactly as it is in the
                         // durable record; anything else is for the model.
                         let item = if let Some(command) = text.strip_prefix('!') {
-                            run_command(&sandbox, command.trim(), rx).await
+                            Some(run_command(&sandbox, command.trim(), rx).await)
                         } else if let Some(name) = text.strip_prefix('/') {
-                            run_tool(&project, &sandbox, name).await
+                            Some(run_tool(&project, &sandbox, name).await)
                         } else {
-                            no_model_yet()
+                            match &model {
+                                Ok(model) => ask(model.as_ref(), &project, &text, &updates).await,
+                                Err(why) => Some(Item::Notice(format!("no model: {why}"))),
+                            }
                         };
 
-                        let _ = updates.send(Update::Item(item)).await;
+                        if let Some(item) = item {
+                            let _ = updates.send(Update::Item(item)).await;
+                        }
                         let _ = updates.send(Update::Working(None)).await;
                         cancel.take();
                     }
@@ -141,15 +155,77 @@ async fn run_command(
     }
 }
 
-/// Until a provider is wired, say so plainly rather than doing something else
-/// with the text. Silently running a prompt as a shell command was worse than
-/// refusing it.
-fn no_model_yet() -> Item {
-    Item::Notice(
-        "No provider is wired up yet, so there is nothing to send this to. \
-         Use `!command` to run something in the microVM in the meantime."
-            .into(),
-    )
+/// Resolve the configured model from the agent's own `models.yml`.
+fn load_model(project: &Project) -> std::result::Result<Arc<dyn Model>, String> {
+    let path = project.root.join("models.yml");
+    let models = Models::load(&path).map_err(|e| e.to_string())?;
+    let spec = project
+        .runtime
+        .agent
+        .model
+        .clone()
+        .ok_or_else(|| "agent.lua does not set a model".to_string())?;
+    let resolved = models.resolve(&spec).map_err(|e| e.to_string())?;
+    Ok(Arc::new(HttpModel::new(resolved)))
+}
+
+/// One model turn, streamed.
+///
+/// Text is forwarded as it arrives so the terminal can settle finished blocks
+/// into scrollback; only what is still in flight stays live.
+async fn ask(
+    model: &dyn Model,
+    project: &Project,
+    prompt: &str,
+    updates: &mpsc::Sender<Update>,
+) -> Option<Item> {
+    let context = vec![crate::records::Entry::message(
+        crate::records::MAIN_LANE,
+        serde_json::json!({"role": "user", "content": prompt}),
+    )];
+    let tools = crate::provider::tool_schemas(&project.runtime);
+    let instructions =
+        std::fs::read_to_string(project.root.join("instructions.md")).unwrap_or_default();
+
+    let sink = updates.clone();
+    let forward = move |delta: &str| {
+        // The renderer is async and this callback is not, so hand the chunk
+        // over without waiting; the channel is bounded and ordered.
+        let _ = sink.try_send(Update::Delta(delta.to_string()));
+    };
+
+    let request = Request {
+        context: &context,
+        system: instructions.trim(),
+        tools: &tools,
+    };
+    match model.respond(request, &forward).await {
+        Ok(turn) => {
+            let _ = updates.send(Update::EndMessage).await;
+            if turn.stop_reason == StopReason::ToolUse {
+                let names: Vec<String> = turn.tool_calls.iter().map(|c| c.name.clone()).collect();
+                // Executing them is the lane's job, and the lane is not wired
+                // to the terminal yet — so say what was asked for rather than
+                // pretending it happened.
+                Some(Item::Notice(format!(
+                    "the model asked to run {}; tool execution from the terminal is not \
+                     wired up yet",
+                    names.join(", ")
+                )))
+            } else if turn.usage.uncached_fraction() > 0.3 && turn.usage.input > 0 {
+                Some(Item::Notice(format!(
+                    "prompt cache miss: {:.0}% of {} input tokens were uncached",
+                    turn.usage.uncached_fraction() * 100.0,
+                    turn.usage.input
+                )))
+            } else {
+                // The reply already streamed into the transcript; there is
+                // nothing left to announce.
+                None
+            }
+        }
+        Err(e) => Some(Item::Notice(e.to_string())),
+    }
 }
 
 async fn run_tool(project: &Project, sandbox: &Arc<Sandbox>, name: &str) -> Item {

@@ -11,6 +11,7 @@ pub mod lua;
 pub mod model;
 pub mod progress;
 pub mod project;
+pub mod provider;
 pub mod records;
 pub mod sandbox;
 pub mod storage;
