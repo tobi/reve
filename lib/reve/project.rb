@@ -362,8 +362,9 @@ module Reve
         end
       RUBY
       "channels/tui.rb" => <<~'RUBY',
-        # The only channel Reve ships: a small visitor that delegates to the
-        # library's InteractiveAgentTUI renderer.
+        # Reve's default channel: a small visitor that delegates to the library's
+        # InteractiveAgentTUI renderer. Drop more adapters into channels/*.rb; they
+        # load before Ractors spawn and may add slash commands and prompt guidance.
         #
         # The host Ractor owns the entry box and rendering. The renderer sends
         # prompt, steer, follow-up, abort, and resume messages to lane Ractors;

@@ -170,10 +170,10 @@ There is no local, CLI, or Fiddle fallback. Egress is **deny-by-default with git
 only allowed destination**. Package mirrors are allowed only while provisioning is enabled,
 so an agent that bakes its own image gets the github-only policy and nothing more.
 
-GitHub access uses the host's own credential without copying it into the VM:
-microsandbox's secret proxy substitutes the value into requests to the allowed hosts, and
-the guest only ever holds a placeholder. Discovery order is `$GITHUB_TOKEN`/`$GH_TOKEN`,
-`gh auth token`, then the git credential helper.
+GitHub access may use an explicitly exported host credential without copying it into the
+VM: microsandbox's secret proxy substitutes the value into requests to allowed hosts, and
+the guest only ever holds a placeholder. Reve reads `$GITHUB_TOKEN` or `$GH_TOKEN`; it does
+not execute `gh auth token` or consult host credential helpers.
 
 ## 4. Scope cuts (explicit)
 
@@ -185,8 +185,9 @@ the guest only ever holds a placeholder. Discovery order is `$GITHUB_TOKEN`/`$GH
 * Deferred requests exist as a code path and are tested against the fake provider; no real
   batch-API provider.
 * Telemetry: span events on the hub, no exporters.
-* Channels, connections, subagents and schedules from eve's model are out of scope for now;
-  the directory layout leaves room for them.
+* Subagents remain out of scope. Channels are trusted file-drop adapters with commands,
+  namespaced KV state, prompt guidance, and observer subscriptions; schedules are durable
+  heartbeat lanes.
 * The normal suite mocks the `microsandbox-rb` public API; real microVM coverage is an
   opt-in integration concern. There is only one production adapter.
 

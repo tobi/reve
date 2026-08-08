@@ -24,7 +24,7 @@ module Reve
                after_response before_tool after_tool before_compaction before_navigation].freeze
 
     attr_reader :store, :hub, :session, :session_path, :conversation_name, :config, :suspended
-    attr_accessor :new_session_factory
+    attr_accessor :new_session_factory, :channel_runtime
 
     # Returns [harness, suspended_operations]. Opens the session, restores every
     # lane, starts no effects.
@@ -38,7 +38,7 @@ module Reve
                    active_tools: nil, thinking_level: "off", retry_policy: nil, compaction: nil,
                    cwd: Dir.pwd, tool_execution: "parallel", models_config: nil, agents_md: true,
                    skills: true, skill_dirs: [], user_skills: true, project: nil, sandbox: nil,
-                   conversation: "main")
+                   conversation: "main", channel_instructions: [])
       # An agent is a directory: instructions.md, agent.rb, tools/, sandbox.rb, workspace/.
       @project = project.is_a?(Project) ? project : (project == false ? nil : Project.load(cwd, user_skills: user_skills))
       @sandbox = sandbox || Sandbox.resolve(@project ? @project.sandbox_config : { "hostWorkspace" => cwd })
@@ -70,6 +70,7 @@ module Reve
       @skill_diagnostics = loaded["diagnostics"] + (@project&.diagnostics || [])
       @workspace_skill_fingerprint = Skills.workspace_fingerprint(cwd)
       @workspace_skills_announced = @skills.none? { Skills.workspace_skill?(_1, cwd) }
+      @channel_instructions = Array(channel_instructions).map(&:to_s).reject(&:empty?)
       @project_tools = @project ? @project.tools : []
       project_declarations = @project_tools.map { _1.declaration }
       active_names = active_tools || @project&.config&.dig("activeTools") ||
@@ -110,12 +111,16 @@ module Reve
     def project_tools = @project_tools
 
     def build_system_prompt(cwd, active_names)
-      if @project&.agent?
-        @project.system_prompt(tools: active_names, sandbox: @sandbox, skills: @static_skills)
-      else
-        base = Prompt.system_prompt(cwd: cwd, agents: @agents, skills: @static_skills, tools: active_names)
-        @sandbox&.isolated? ? "#{base}\n\nYour sandbox: #{@sandbox.describe}." : base
-      end
+      base = if @project&.agent?
+               @project.system_prompt(tools: active_names, sandbox: @sandbox, skills: @static_skills)
+             else
+               prompt = Prompt.system_prompt(cwd: cwd, agents: @agents, skills: @static_skills,
+                                              tools: active_names)
+               @sandbox&.isolated? ? "#{prompt}\n\nYour sandbox: #{@sandbox.describe}." : prompt
+             end
+      return base if @channel_instructions.empty?
+
+      "#{base}\n\n<channel_instructions>\n#{@channel_instructions.join("\n\n")}\n</channel_instructions>"
     end
 
     # Skills and the diagnostics collected while loading them (over-long
@@ -279,6 +284,7 @@ module Reve
       return if @closed
 
       @closed = true
+      @channel_runtime&.close
       @heartbeat&.stop
       @lanes.each_value(&:close)
       quietly { @sandbox&.stop if close_sandbox && @sandbox&.isolated? }

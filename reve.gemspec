@@ -25,6 +25,7 @@ Gem::Specification.new do |spec|
     "sig/**/*.rbs",
     "bin/reve",
     "channels/tui.rb",
+    "examples/**/*.rb",
     # The bundled model configuration: without it an installed gem has no
     # providers and every launch fails with "unknown model".
     "models.yml",

@@ -272,6 +272,57 @@ module Reve
     end
   end
 
+  module Channels
+    class Registration
+      attr_reader name: String
+      attr_reader adapter: untyped
+      attr_reader system_prompt: String
+    end
+
+    class Command
+      attr_reader name: String
+      attr_reader description: String
+      attr_reader schema: Hash[untyped, untyped]
+      attr_reader handler: Proc
+    end
+
+    def self.register: (String | Symbol, untyped, ?system_prompt: String?) -> Registration
+    def self.registrations: () -> Array[Registration]
+    def self.system_prompts: () -> Array[String]
+    def self.load_directory: (String) -> Array[untyped]
+
+    class KV
+      def initialize: (String, String | Symbol) -> void
+      def get: (String | Symbol, ?untyped) -> untyped
+      def set: (String | Symbol, untyped) -> untyped
+      def delete: (String | Symbol) -> untyped
+      def to_h: () -> Hash[String, untyped]
+    end
+
+    class Context
+      attr_reader harness: Harness
+      attr_reader project: Project
+      attr_reader name: String
+      attr_reader kv: KV
+      def command: (String | Symbol, description: String, ?schema: Hash[untyped, untyped]) { (Hash[String, untyped]) -> untyped } -> Command
+      def prompt: (String, ?lane: String) -> Hash[String, untyped]
+      def watch: (?String?) -> Watch
+    end
+
+    class Runtime
+      attr_reader harness: Harness
+      attr_reader project: Project
+      def initialize: (Harness, Project) -> void
+      def start: () -> Runtime
+      def close: () -> untyped
+      def register_command: (String | Symbol, description: String, ?schema: Hash[untyped, untyped]) { (Hash[String, untyped]) -> untyped } -> Command
+      def command_names: () -> Array[String]
+      def command_help: () -> Array[Command]
+      def command?: (String | Symbol) -> bool
+      def invoke: (String | Symbol, ?String?) -> untyped
+    end
+  end
+
   # ── harness ────────────────────────────────────────────────────────────
   class Harness
     HOOKS: Array[String]
@@ -283,6 +334,7 @@ module Reve
     attr_reader conversation_name: String
     attr_reader config: Hash[String, untyped]
     attr_reader suspended: Array[Hash[String, untyped]]
+    attr_accessor channel_runtime: Channels::Runtime?
 
     def self.create: (**untyped) -> [Harness, Array[Hash[String, untyped]]]
     def lane: (String) -> LaneHandle?

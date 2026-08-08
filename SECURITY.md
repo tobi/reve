@@ -37,5 +37,7 @@ Reve deliberately fails closed:
 - Durable intent records are written before effects so recovery does not guess whether an
   effectful operation should be replayed.
 
-The host Ruby process, the configured model providers, the `microsandbox-rb` native
-extension, and the upstream microsandbox runtime remain trusted components.
+The host Ruby process, files under `tools/*.rb` and `channels/*.rb`, configured model
+providers, the `microsandbox-rb` native extension, and the upstream microsandbox runtime
+remain trusted components. Channel adapters intentionally perform host-side transport I/O;
+install them only as trusted code. They do not authorize model-authored host commands.

@@ -5,6 +5,13 @@ All notable changes to Reve are documented here. The project follows
 
 ## [Unreleased]
 
+### Added
+
+- File-drop channel adapters with slash-command registration, namespaced host-side KV
+  storage, stable system-message guidance, and ordered observer subscriptions.
+- A stdlib-only Telegram rich-message channel example based on `tobi/pi-telegram`, with
+  pairing, polling, durable connection state, and a monotonic streaming state machine.
+
 ## [0.8.0] - 2026-08-08
 
 ### Added

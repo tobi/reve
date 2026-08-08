@@ -104,6 +104,9 @@ unless Reve::Project.agent_dir?(options[:cwd])
 end
 
 PROJECT = Reve::Project.load(options[:cwd])
+# Channel files are trusted launch code, like tools/*.rb. Load all of them
+# before the first Ractor so adapters may register commands and prompt guidance.
+Reve::Channels.load_directory(PROJECT.root)
 dir = PROJECT.sessions_dir
 FileUtils.mkdir_p(dir)
 
@@ -132,7 +135,8 @@ build_harness = lambda do |session_path, sandbox = nil|
     storage: options[:storage], path: options[:storage] == "jsonl" ? session_path : nil,
     model: options[:model_given] ? options[:model] : (PROJECT.config["model"] || options[:model]),
     cwd: options[:cwd], project: PROJECT, sandbox: sandbox,
-    conversation: options[:conversation]
+    conversation: options[:conversation],
+    channel_instructions: Reve::Channels.system_prompts
   )
   h.on_hook("before_tool") do |ev|
     target = ev.dig("args", "path")
@@ -147,6 +151,7 @@ build_harness = lambda do |session_path, sandbox = nil|
     build_harness.call(fresh_path, current.sandbox)
   end
   h.start_heartbeat if options[:conversation] == "main" && options[:print].nil? && prompt_arg.nil?
+  h.channel_runtime = Reve::Channels::Runtime.new(h, PROJECT).start
   [h, suspended_ops]
 end
 
@@ -209,8 +214,6 @@ if one_shot
   exit(result["ok"] ? 0 : 1)
 end
 
-channel_file = File.join(PROJECT.root, "channels", "tui.rb")
-load channel_file if File.file?(channel_file)
 channel = if defined?(Reve::Channels::TUI)
             Reve::Channels::TUI.new(harness, suspended)
           else

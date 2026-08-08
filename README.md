@@ -38,6 +38,24 @@ interruption never happened.
 There is no machine-wide Reve profile, home-directory prompt, global model file, or session
 store outside the agent directory.
 
+## Ractors are the runtime architecture
+
+Ractors are not a decorative implementation detail. The main Ractor owns trusted Ruby
+configuration, channel adapters, hooks, project-tool blocks, and the live microVM handle.
+Around it Reve creates:
+
+- **One store Ractor**, the only object allowed to mutate a session.
+- **One observer Ractor**, which atomically snapshots and subscribes channels to ordered
+  events.
+- **One Ractor per lane**, so main, heartbeat, and maintenance work can progress
+  independently while each lane serializes its own durable operation.
+- **Temporary tool Ractors** for shareable built-ins, providing real parallel batches and
+  message-based cancellation.
+
+Application payloads cross those boundaries as JSON through `Ractor::Port` RPC. The split
+is deliberate: microVMs isolate effects, append-only records isolate crashes, and Ractors
+isolate ownership and concurrent work.
+
 ## Install and create an agent
 
 Requirements:
@@ -70,7 +88,7 @@ reve/                         the agent root
 ├── models.yml                 provider and model configuration owned by this agent
 ├── agent.rb                   executable configuration DSL (`./agent.rb` launches Reve)
 ├── channels/
-│   └── tui.rb                 the one shipped channel, a small visitor adapter
+│   └── tui.rb                 default inline terminal adapter; add more files here
 ├── tools/
 │   └── example.rb             optional project tools written in Ruby
 ├── sandbox.rb                 optional sandbox policy
@@ -131,6 +149,40 @@ The launcher is executable, so the directory itself feels like an application:
 ```bash
 ./agent.rb -c refactor
 ```
+
+### Add a complex tool by dropping in one Ruby file
+
+Every `tools/*.rb` file is trusted launch code and is loaded before Ractors spawn. There is
+no plugin manifest, package step, or central registry to edit. For example,
+`tools/release_report.rb` can combine validation, sandbox commands, and structured input:
+
+```ruby
+require "shellwords"
+
+tool "release_report" do
+  description "Run release checks and summarize commits since a Git reference"
+  string :since, "Starting Git reference", required: true
+  boolean :include_tests, "Run the test suite", default: true
+  replay :safe
+
+  run do |args, ctx|
+    log = ctx.sh("git log --format='%h %s' #{Shellwords.escape(args["since"])}..HEAD")
+    checks = args.fetch("include_tests", true) ? ctx.sh("bin/test") : "tests skipped"
+    <<~REPORT
+      Commits:
+      #{log}
+
+      Verification:
+      #{checks}
+    REPORT
+  end
+end
+```
+
+Restart Reve and the model immediately sees the generated JSON schema for
+`release_report`. The Ruby block remains in the trusted host Ractor, while every `ctx.sh`
+command still runs in the mandatory microVM. A file can define multiple tools and use any
+Ruby standard-library logic needed to implement a complex integration.
 
 ### Give the VM narrowly scoped GitHub access
 
@@ -215,12 +267,20 @@ Read the diff, run focused tests, and report findings before proposing edits.
 Reve fingerprints the complete skill directory and exposes changes at the next turn
 boundary without rewriting the stable system prompt.
 
-## The one channel: inline TUI
+## Channels are file-drop adapters
 
-Reve deliberately implements exactly one channel: the terminal UI. It does not use an
-alternate screen buffer. Output stays in normal terminal scrollback, while one owned input
-line is hidden, printed above, and redrawn after every event. This keeps command history,
-copy/paste, and terminal scrollback useful.
+Reve ships an inline terminal channel, but the observer boundary makes new channels
+trivial to add. Every `channels/*.rb` file loads before Ractors spawn. A channel may:
+
+- Subscribe to atomic snapshots plus ordered live events.
+- Submit or steer durable lane work.
+- Register new `/commands` with JSON-object arguments.
+- Persist host-side credentials and cursors in a namespaced `.reve/channels.json` KV store.
+- Append stable channel-style guidance to the system message.
+
+The default TUI does not use an alternate screen buffer. Output stays in normal terminal
+scrollback, while one owned input line is hidden, printed above, and redrawn after every
+event. This keeps command history, copy/paste, and terminal scrollback useful.
 
 The library renderer is `Reve::InteractiveAgentTUI`. The generated `channels/tui.rb` is a
 visitor adapter, not a second renderer:
@@ -241,9 +301,60 @@ module Reve
 end
 ```
 
-That is the whole channel boundary. It delegates to high-level harness operations and
-visits observer events. A future channel would implement the same small handoff without
-changing storage, lanes, providers, or tools.
+That is the default channel boundary. It delegates to high-level harness operations and
+visits observer events. Other adapters compose with it without changing storage, lanes,
+providers, or tools.
+
+### Telegram channel example
+
+`examples/telegram.rb` is a complete stdlib-only adapter based on
+[`tobi/pi-telegram`](https://github.com/tobi/pi-telegram). Install it with one file copy:
+
+From a source checkout:
+
+```bash
+cp examples/telegram.rb /path/to/my-agent/channels/telegram.rb
+```
+
+From the installed gem:
+
+```bash
+GEM_DIR="$(ruby -e 'print Gem::Specification.find_by_name("reve-agent").gem_dir')"
+cp "$GEM_DIR/examples/telegram.rb" /path/to/my-agent/channels/telegram.rb
+cd /path/to/my-agent
+./agent.rb
+```
+
+Then connect using a BotFather token:
+
+```text
+/telegram-connect {"botToken":"123456:token"}
+```
+
+The command validates the token and stores it in the channel KV file with mode `0600`.
+Later sessions reconnect without resending it:
+
+```text
+/telegram-connect {}
+/telegram-status
+/telegram-disconnect
+```
+
+The first private Telegram user to send `/start` becomes the paired user. Every inbound
+prompt is durably submitted as `[channel=telegram] …`. The channel's system-message
+injection tells the agent to treat that prefix as transport metadata and to write concise
+Telegram Rich Markdown.
+
+Streaming output uses an explicit monotonic state machine:
+
+```text
+thinking  →  tools  →  answering  →  done
+```
+
+It opens a private `Working…` rich draft, adds live tool summaries, streams answer text,
+and persists the final rich message. Late events cannot move the renderer backward. The
+bot token, pairing ID, and update cursor remain host-side in `.reve/channels.json`; they
+never enter `workspace/` or the microVM.
 
 The host Ractor owns the terminal entry box and renderer. Lane Ractors own durable work.
 Input is translated into lane messages; rendering consumes the observer stream:

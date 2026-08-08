@@ -19,7 +19,8 @@ end
 
 desc "syntax-check every ruby file"
 task :lint do
-  files = Dir["lib/**/*.rb", "test/**/*.rb", "bin/*", "Rakefile", "*.gemspec"].select do |f|
+  files = Dir["lib/**/*.rb", "test/**/*.rb", "examples/**/*.rb", "channels/**/*.rb",
+              "bin/*", "Rakefile", "*.gemspec"].select do |f|
     File.file?(f) && (f.end_with?(".rb", ".gemspec", "Rakefile") || File.read(f, 64).start_with?("#!"))
   end
   bad = files.reject { |f| system(RbConfig.ruby, "-c", f, out: File::NULL, err: File::NULL) }

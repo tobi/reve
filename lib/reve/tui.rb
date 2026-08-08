@@ -631,7 +631,7 @@ module Reve
     # => [candidates, token, replace_start]
     def completion_for(buffer, token, start)
       if buffer.start_with?("/") && !buffer[0...start].include?(" ")
-        cmds = COMMANDS.select { _1.start_with?(token.delete_prefix("/")) }.map { "/#{_1}" }
+        cmds = command_names.select { _1.start_with?(token.delete_prefix("/")) }.map { "/#{_1}" }
         return [cmds, token, 0]
       end
       if buffer.start_with?("/")
@@ -649,8 +649,12 @@ module Reve
       when "model" then @h.model_completions(probe: true)
       when "think" then THINK_LEVELS
       when "tools" then Reve::Tools.names
-      when "help" then COMMANDS
+      when "help" then command_names
       end
+    end
+
+    def command_names
+      (COMMANDS + Array(@h.channel_runtime&.command_names)).uniq.sort
     end
 
     # Paths, for `!command <tab>` and for naming files in a prompt.
@@ -900,7 +904,13 @@ module Reve
       cmd, rest = line[1..].split(" ", 2)
       rest = rest&.strip
       case cmd
-      when "help", "?" then emit(HELP)
+      when "help", "?"
+        emit(HELP)
+        commands = @h.channel_runtime&.command_help || []
+        unless commands.empty?
+          emit("channels")
+          commands.each { emit("  /#{_1.name.ljust(20)} #{_1.description}") }
+        end
       when "exit", "quit", "q" then return :exit
       when "abort" then show(lane_handle.abort!)
       when "resume" then start_run { lane_handle.resume }
@@ -941,7 +951,21 @@ module Reve
       when "log" then cmd_log(rest)
       when "steer" then show(lane_handle.steer(rest.to_s))
       when "next" then show(lane_handle.next_run(rest.to_s))
-      else emit(s(:yellow, "  unknown command /#{cmd} — /help"))
+      else
+        if @h.channel_runtime&.command?(cmd)
+          result = @h.channel_runtime.invoke(cmd, rest)
+          if result.is_a?(String)
+            emit(result)
+          elsif result.is_a?(Hash) && result["message"]
+            emit(s(result["ok"] ? :green : :yellow, "  #{result["message"]}"))
+          elsif result.is_a?(Hash) && result["error"].is_a?(String)
+            emit(s(:yellow, "  #{result["error"]}"))
+          else
+            show(result)
+          end
+        else
+          emit(s(:yellow, "  unknown command /#{cmd} — /help"))
+        end
       end
       nil
     end

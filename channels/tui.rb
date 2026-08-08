@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
-# Reve has one channel by design: the terminal. This file is deliberately small
-# and intentionally boring. It is an example of the channel boundary, not a
-# second UI implementation.
+# Reve ships this terminal channel by default. It is deliberately small and
+# intentionally boring: channels are file-drop adapters, and examples/telegram.rb
+# demonstrates a second channel with commands, KV state, and prompt guidance.
 #
 # The process's host Ractor owns stdin/stdout and this visitor. The durable
 # harness owns lane Ractors. User input becomes messages sent to a lane:
@@ -13,8 +13,8 @@
 #   /abort    -> lane.abort!
 #
 # The renderer consumes the harness watch stream. It never reads session state
-# directly. This keeps a channel replaceable: HTTP, Slack, or a test visitor
-# can implement the same event handoff without changing the durable core.
+# directly. This keeps channels composable: Telegram, HTTP, Slack, or a test
+# visitor can implement the same event handoff without changing the durable core.
 module Reve
   module Channels
     class TUI
