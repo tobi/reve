@@ -21,6 +21,7 @@ use ratatui::widgets::{Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
 use super::item::{Inbox, Item, Status, Subagent};
+use super::stream::Stream;
 use super::theme;
 
 /// What the app wants the caller to do.
@@ -45,6 +46,11 @@ pub enum Update {
     Working(Option<String>),
     Subagents(Vec<Subagent>),
     Received(Inbox),
+    /// A chunk of assistant text. Settled blocks go to scrollback as they
+    /// complete; the rest is shown live until it settles.
+    Delta(String),
+    /// The assistant turn ended.
+    EndMessage,
 }
 
 /// A single-line editor. Small on purpose: history and completion belong to the
@@ -146,6 +152,11 @@ pub struct App {
     pub effort: String,
     pub location: String,
     working: Option<(String, Instant)>,
+    stream: Stream,
+    /// Whether this message has already printed its first line, which is the
+    /// one that carries the `◆`.
+    stream_opened: bool,
+    tail_height: u16,
     scrollback: Vec<Item>,
     interrupt_armed: bool,
     frame: usize,
@@ -165,6 +176,9 @@ impl App {
             effort: effort.into(),
             location: location.into(),
             working: None,
+            stream: Stream::new(),
+            stream_opened: false,
+            tail_height: 0,
             scrollback: Vec::new(),
             interrupt_armed: false,
             frame: 0,
@@ -189,6 +203,16 @@ impl App {
                 }
             }
             Update::Subagents(agents) => self.subagents = agents,
+            Update::Delta(text) => {
+                self.stream.push(&text);
+                self.flush_frozen();
+            }
+            Update::EndMessage => {
+                self.stream.finish();
+                self.flush_frozen();
+                self.stream = Stream::new();
+                self.stream_opened = false;
+            }
             Update::Received(message) => {
                 self.scrollback.push(Item::Received {
                     channel: message.channel.clone(),
@@ -197,6 +221,34 @@ impl App {
                 self.inbox.push(message);
             }
         }
+    }
+
+    /// Move settled markdown out of the stream and into the transcript.
+    ///
+    /// Only the first chunk of a message carries the `◆`; the rest continues
+    /// it, so a long reply reads as one block rather than a list of them.
+    fn flush_frozen(&mut self) {
+        let Some(text) = self.stream.take_frozen() else {
+            return;
+        };
+        // `take_frozen` is byte-exact so the durable record keeps every
+        // separator; the transcript spaces its own items, so drop them here.
+        let text = text.trim_end_matches('\n').to_string();
+        if text.is_empty() {
+            return;
+        }
+        let item = if self.stream_opened {
+            Item::AssistantContinued(text)
+        } else {
+            self.stream_opened = true;
+            Item::Assistant(text)
+        };
+        self.scrollback.push(item);
+    }
+
+    /// The in-flight text, drawn above the chrome while it streams.
+    pub fn stream_tail(&self, width: usize) -> Vec<Line<'static>> {
+        self.stream.tail(width)
     }
 
     /// Items that are finished with, to be pushed into terminal scrollback.
@@ -275,18 +327,33 @@ impl App {
     /// subagent strip, working line, rule, input, rule, status.
     pub const HEIGHT: u16 = 6;
 
+    /// Six rows of chrome, plus the in-flight text while a reply streams.
+    ///
+    /// The tail is the one thing allowed to change the height, because it only
+    /// does so as whole blocks settle into scrollback — not per token — and
+    /// because the alternative is showing nothing until a reply finishes.
     pub fn live_height(&self) -> u16 {
-        Self::HEIGHT
+        Self::HEIGHT + self.tail_height
     }
 
-    /// The live region: six fixed rows, bottom-aligned.
+    /// The live region: the in-flight text, then six fixed rows of chrome.
     pub fn render_live(&mut self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
         self.frame = self.frame.wrapping_add(1);
         let width = area.width as usize;
+        let tail = self.stream_tail(width);
+        self.tail_height = tail.len() as u16;
+
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(self.tail_height), Constraint::Min(6)])
+            .split(area);
+        if !tail.is_empty() {
+            Paragraph::new(tail).render(split[0], buf);
+        }
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1); 6])
-            .split(area);
+            .split(split[1]);
 
         if !self.subagents.is_empty() {
             Paragraph::new(self.subagent_strip(width)).render(chunks[0], buf);
@@ -298,7 +365,7 @@ impl App {
         Paragraph::new(self.input_line()).render(chunks[3], buf);
         Paragraph::new(Line::from(Span::styled("─".repeat(width), theme::faint())))
             .render(chunks[4], buf);
-        Paragraph::new(self.status_line()).render(chunks[5], buf);
+        Paragraph::new(self.status_line(width)).render(chunks[5], buf);
     }
 
     /// One live row for every subagent at once: state, name, age.
@@ -324,9 +391,35 @@ impl App {
                 theme::faint(),
             ));
         }
-        let used: usize = spans.iter().map(|s| s.content.width()).sum();
+        // Too many to name: collapse to counts rather than letting the row be
+        // clipped mid-name, which would misreport which agents exist.
         let hint = "↓ detail";
-        if used + hint.width() + 2 < width {
+        let mut used: usize = spans.iter().map(|s| s.content.width()).sum();
+        if used + hint.width() + 2 > width {
+            let running = self
+                .subagents
+                .iter()
+                .filter(|a| a.status == Status::Running)
+                .count();
+            let failed = self
+                .subagents
+                .iter()
+                .filter(|a| a.status == Status::Failed)
+                .count();
+            let done = self.subagents.len() - running - failed;
+            spans = vec![Span::styled("  ", theme::faint())];
+            if running > 0 {
+                spans.push(Span::styled(format!("⋯ {running} running"), theme::alert()));
+            }
+            if done > 0 {
+                spans.push(Span::styled(format!(" ✓ {done}"), theme::good()));
+            }
+            if failed > 0 {
+                spans.push(Span::styled(format!(" ✗ {failed}"), theme::danger()));
+            }
+            used = spans.iter().map(|s| s.content.width()).sum();
+        }
+        if used + hint.width() + 2 <= width {
             spans.push(Span::styled(
                 " ".repeat(width - used - hint.width() - 1),
                 theme::faint(),
@@ -338,7 +431,10 @@ impl App {
 
     /// Where the cursor should sit, given the live region's origin.
     pub fn cursor(&self, area: Rect) -> (u16, u16) {
-        (area.x + 2 + self.input.column(), area.y + 3)
+        (
+            area.x + 2 + self.input.column(),
+            area.y + self.tail_height + 3,
+        )
     }
 
     /// The shimmer that tells you it is alive without redrawing the world.
@@ -412,28 +508,61 @@ impl App {
         ])
     }
 
-    fn status_line(&self) -> Line<'static> {
-        let mut spans = vec![
-            Span::styled("  ", theme::faint()),
-            Span::styled(self.model.clone(), theme::accent()),
-            Span::styled(" · ", theme::dim()),
-            Span::styled(self.effort.clone(), theme::accent()),
-            Span::styled(" · ", theme::dim()),
-            Span::styled(self.location.clone(), theme::dim()),
-        ];
+    /// Model, effort, and where we are.
+    ///
+    /// The location is the part that gives way: it is the least surprising
+    /// thing on the line, and eliding it from the left keeps the end that
+    /// identifies it.
+    fn status_line(&self, width: usize) -> Line<'static> {
         let running = self
             .subagents
             .iter()
             .filter(|a| a.status == Status::Running)
             .count();
-        if running > 0 {
-            spans.push(Span::styled(
-                format!(" · {running} running"),
-                theme::alert(),
-            ));
+        let suffix = if running > 0 {
+            format!(" · {running} running")
+        } else {
+            String::new()
+        };
+        let fixed = 2 + self.model.width() + 3 + self.effort.width() + 3 + suffix.width();
+        let location = elide_left(&self.location, width.saturating_sub(fixed));
+
+        let mut spans = vec![
+            Span::styled("  ", theme::faint()),
+            Span::styled(self.model.clone(), theme::accent()),
+            Span::styled(" · ", theme::dim()),
+            Span::styled(self.effort.clone(), theme::accent()),
+        ];
+        if !location.is_empty() {
+            spans.push(Span::styled(" · ", theme::dim()));
+            spans.push(Span::styled(location, theme::dim()));
+        }
+        if !suffix.is_empty() {
+            spans.push(Span::styled(suffix, theme::alert()));
         }
         Line::from(spans)
     }
+}
+
+/// Keep the tail of a path: that is the part that identifies it.
+fn elide_left(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_string();
+    }
+    if width <= 1 {
+        return String::new();
+    }
+    let mut kept = String::new();
+    let mut used = 1; // the ellipsis
+    for ch in text.chars().rev() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > width {
+            break;
+        }
+        kept.insert(0, ch);
+        used += w;
+    }
+    format!("…{kept}")
 }
 
 /// Push finished items into the terminal's real scrollback.
@@ -684,6 +813,84 @@ mod tests {
     }
 
     #[test]
+    fn a_crowded_strip_collapses_to_counts_instead_of_being_clipped() {
+        let mut a = app();
+        a.apply(Update::Subagents(
+            (0..9)
+                .map(|i| Subagent {
+                    name: format!("audit-subsystem-{i}"),
+                    id: String::new(),
+                    status: if i == 0 {
+                        Status::Failed
+                    } else {
+                        Status::Running
+                    },
+                    note: String::new(),
+                    elapsed: Duration::from_secs(3),
+                })
+                .collect(),
+        ));
+        let strip: String = a
+            .subagent_strip(78)
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            strip.width() <= 78,
+            "it fits: {} — {strip:?}",
+            strip.width()
+        );
+        assert!(
+            strip.contains("8 running"),
+            "and still reports the truth: {strip:?}"
+        );
+        assert!(strip.contains("✗ 1"), "{strip:?}");
+        assert!(
+            strip.contains("↓ detail"),
+            "with detail still reachable: {strip:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_location_is_elided_from_the_left_rather_than_cut_off() {
+        let a = App::new(
+            "leve-spark-1.2",
+            "high",
+            "/home/tobi/src/deeply/nested/project/worktree-green-valley-793b",
+        );
+        let status: String = a
+            .status_line(50)
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            status.width() <= 50,
+            "it fits: {} — {status:?}",
+            status.width()
+        );
+        assert!(
+            status.contains("green-valley-793b"),
+            "the end survives: {status:?}"
+        );
+        assert!(status.contains('…'), "and the cut is visible: {status:?}");
+    }
+
+    #[test]
+    fn a_status_line_with_no_room_for_a_path_still_shows_the_model() {
+        let a = App::new("leve-spark-1.2", "high", "/very/long/path/indeed");
+        let status: String = a
+            .status_line(24)
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(status.width() <= 24, "{status:?}");
+        assert!(status.contains("leve-spark-1.2"), "{status:?}");
+    }
+
+    #[test]
     fn running_subagents_are_surfaced_in_the_status_line() {
         let mut a = app();
         a.apply(Update::Subagents(vec![Subagent {
@@ -694,7 +901,7 @@ mod tests {
             elapsed: Duration::from_secs(1),
         }]));
         let status: String = a
-            .status_line()
+            .status_line(78)
             .spans
             .iter()
             .map(|s| s.content.to_string())

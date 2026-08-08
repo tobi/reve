@@ -31,7 +31,7 @@ pub fn render(source: &str, width: usize, indent: &str) -> Vec<Line<'static>> {
         // than letting it be clipped, because the reader may want to copy it.
         if line.trim_start().starts_with("```") {
             match fenced.take() {
-                Some(body) => out.extend(code_block(&body, indent)),
+                Some(body) => out.extend(code_block(&body, indent, width)),
                 None => fenced = Some(Vec::new()),
             }
             continue;
@@ -75,7 +75,7 @@ pub fn render(source: &str, width: usize, indent: &str) -> Vec<Line<'static>> {
 
     // An unterminated fence still renders; a truncated stream is normal.
     if let Some(body) = fenced {
-        out.extend(code_block(&body, indent));
+        out.extend(code_block(&body, indent, width));
     }
     out
 }
@@ -104,13 +104,17 @@ fn bullet(line: &str) -> Option<(String, &str)> {
     None
 }
 
-fn code_block(body: &[String], indent: &str) -> Vec<Line<'static>> {
+/// Code keeps its own line structure, but is wrapped rather than clipped.
+///
+/// Silently cutting a line at the right edge loses content without saying so;
+/// a `│` gutter on the continuation shows that the break is ours and not the
+/// author's.
+fn code_block(body: &[String], indent: &str, width: usize) -> Vec<Line<'static>> {
+    let gutter = format!("{indent}│ ");
     body.iter()
-        .map(|line| {
-            Line::from(vec![
-                Span::styled(format!("{indent}│ "), theme::faint()),
-                Span::styled(line.clone(), theme::code()),
-            ])
+        .flat_map(|line| {
+            let spans = vec![Span::styled(line.clone(), theme::code())];
+            wrap(&spans, width, &gutter, &gutter)
         })
         .collect()
 }
@@ -345,6 +349,27 @@ mod tests {
         assert!(
             rendered.iter().any(|l| l.starts_with("│ ")),
             "and gutter-marked: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn code_is_wrapped_rather_than_silently_clipped() {
+        let source = "```\nlet total = alpha + beta + gamma + delta + epsilon;\n```";
+        let rendered = plain(&render(source, 28, ""));
+        for line in &rendered {
+            assert!(line.width() <= 28, "fits: {line:?} ({})", line.width());
+            assert!(
+                line.starts_with("│ "),
+                "the break is marked as ours: {line:?}"
+            );
+        }
+        let joined: String = rendered
+            .iter()
+            .map(|l| l.trim_start_matches("│ "))
+            .collect();
+        assert!(
+            joined.contains("epsilon;"),
+            "nothing was lost: {rendered:?}"
         );
     }
 

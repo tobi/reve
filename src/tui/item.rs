@@ -61,6 +61,9 @@ pub enum Item {
     User(String),
     /// What the model said. Markdown.
     Assistant(String),
+    /// More of the same message, arriving after part of it was already
+    /// printed. Same rendering, without a second `◆`.
+    AssistantContinued(String),
     /// A tool call.
     Tool {
         verb: String,
@@ -119,6 +122,8 @@ impl Item {
                 lines
             }
 
+            Item::AssistantContinued(text) => markdown::render(text, width, "  "),
+
             Item::Tool {
                 verb,
                 description,
@@ -143,7 +148,10 @@ impl Item {
                     theme::faint(),
                 ));
 
-                let mut lines = markdown::wrap(&head, width, "", "  │ ");
+                // The header continues on a plain indent; the `│` gutter is
+                // reserved for the detail, and reusing it here would read as
+                // one.
+                let mut lines = markdown::wrap(&head, width, "", "  ");
                 if let Some(detail) = detail {
                     let spans = vec![Span::styled(detail.clone(), theme::code())];
                     lines.extend(markdown::wrap(&spans, width, "  │ ", "  │ "));
