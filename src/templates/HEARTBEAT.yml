@@ -1,0 +1,11 @@
+# Background tasks, reloaded whenever this file changes.
+#
+# Each task runs in its own durable lane while the main conversation is open.
+# A task must reply with exactly SILENCE, "Message: ...", or "Steer: ...".
+tasks: []
+# tasks:
+#   - name: maintain
+#     every: 30m
+#     lane: maintenance
+#     prompt: Review the workspace and make one safe improvement.
+#     delivery: main

@@ -1,0 +1,14 @@
+# This agent's model configuration. Runtime reads only <agent>/models.yml —
+# there is no home-directory or global fallback.
+#
+# Every apiKey must be a $ENV_VAR reference; secrets do not belong in this file.
+providers:
+  openai:
+    baseUrl: https://api.openai.com/v1
+    api: openai-responses
+    apiKey: $OPENAI_API_KEY
+    models:
+      - id: gpt-5.6-luna
+        reasoning: true
+        contextWindow: 200000
+        maxTokens: 8192

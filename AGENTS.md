@@ -1,37 +1,47 @@
 # leve
 
-A durable coding agent in Ruby on Ractors. The design is
-Pi's durable harness (see PLAN.md); PLAN.md maps it onto Ractors and records what is in and
-out of scope.
+A durable coding agent. The core is a Rust crate; the scripting surface an agent author
+touches — configuration, project tools, sandbox policy — is Lua. The durable-harness
+design it follows is documented in `PLAN.md`, which maps it onto Rust modules and records
+what is built and what is pending.
 
 ## Rules
 
-- **Sandbox or no Leve.** Microsandbox is provided exclusively by the in-repo
-  `ext/leve_sandbox` native extension, which binds the official `microsandbox` Rust crate
-  (pinned `=0.6.8`) directly. There is no Ruby gem dependency for the sandbox and exactly
-  one transport. Leve must refuse to start if the extension or the microVM cannot boot.
-  Every shell command — model `bash`, project `ctx.sh`, and user `!command` — executes
-  inside that VM. Never retain, add, or silently select a host/local shell fallback, even
-  for tests, diagnostics, degraded operation, or convenience.
-- Everything loads before any Ractor spawns: a non-main Ractor cannot `require`.
-- Constants reachable from a Ractor must be shareable (`Ractor.make_shareable`, or a
-  frozen literal). `<<~TXT.strip` is *not* frozen — add `.freeze`.
-- No `Dir.chdir` in tools: it is process-global and tool Ractors run in parallel.
-- Between Ractors only JSON strings and `Ractor::Port`s travel.
-- Durability rule: write the intent record before the effect, name the ids it will
-  produce, then append the result with exactly those ids.
-- Every new behaviour gets a test in `test/`, and recovery behaviour gets a crash-site
-  test that kills a real child process.
-- Project code (`tools/*.rb`, hooks, the sandbox connection) runs in the host Ractor,
-  because blocks and live handles cannot cross a Ractor boundary. "Host Ractor" describes
-  orchestration only: it does not authorize host effects. Sandboxed built-ins dispatch
-  through the VM handle; other built-ins may run in their own Ractor only when they do not
-  execute processes.
-- There is exactly one sandbox transport, `ext/leve_sandbox`. Test the Ruby sandbox layer
-  against a Ruby fake via the injectable `native:` seam; real-microVM tests are opt-in.
+- **Sandbox or no Leve.** Leve links the `microsandbox` Rust crate directly (pinned
+  `=0.6.8` in `Cargo.toml`). There is exactly one transport, no FFI shim, no CLI, no
+  daemon, and no host-shell fallback — ever, not for tests, diagnostics, degraded
+  operation, or convenience. Every shell command a tool issues — `ctx.sh`, `leve exec` —
+  executes inside that VM. Leve must refuse to start if the microVM cannot boot. Never
+  retain, add, or silently select a host/local shell fallback.
+- **No host command path exposed to Lua.** A tool's Lua body runs on the host, but
+  `ctx.sh` is its only command path and it goes to the microVM. There is no `ctx.host_exec`
+  or equivalent. The host side orchestrates; it does not authorize host effects.
+- **Intent before effect.** Write the intent record before the effect, name the ids it
+  will produce, then append the result with exactly those ids. Ids are provisioned before
+  the effect they name. `append_entry_if_missing` makes a provisioned id idempotent, so
+  recovery re-runs freely.
+- **Single-owner session state.** `Storage` is deliberately not thread-safe and not shared.
+  Exactly one task owns it, which is how leve gets the single-writer guarantee
+  structurally instead of by convention. Do not wrap it in an `Arc<Mutex>` to "share" it —
+  serialize access through the owning task.
+- **One JSONL session, one writer, flush every append.** A crash can only tear the last
+  line; on reopen we truncate the torn tail and resume. A malformed line in the middle is
+  corruption and we refuse to open. An agent that reports work it did not persist is worse
+  than one that is slow.
+- **Lua is trusted launch code.** `agent.lua`, `sandbox.lua`, and `tools/*.lua` run on the
+  host before any work starts, exactly like the Rust they extend. They are not model
+  output and they are not sandboxed — they are configuration. What they must never do is
+  execute a command on the host: `ctx.sh` goes to the microVM, and it is the only way out
+  of a tool.
+- **Never silently overwrite files a user has edited.** `leve init` is idempotent: a
+  matching file is left `unchanged`, an edited file is reported `changed` and kept, a
+  missing file is created.
+- Every new behaviour gets a test. Keep `cargo test` green; the microVM tests stay opt-in.
 
 ## Commands
 
-    bin/test          run every suite, each in its own process
-    rake compile      build the ext/leve_sandbox native extension
-    bin/leve       the agent itself
+    cargo build                              build the crate and the `leve` binary
+    cargo test                               run the unit test suite
+    cargo test --test microvm -- --ignored   opt-in microVM integration tests
+    cargo clippy                             lint
+    cargo fmt                                format

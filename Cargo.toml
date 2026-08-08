@@ -1,0 +1,55 @@
+[package]
+name = "leve"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "A durable coding agent: Rust core, Lua scripting, mandatory microVM sandbox"
+license = "MIT"
+repository = "https://github.com/tobi/leve"
+default-run = "leve"
+
+[[bin]]
+name = "leve"
+path = "src/main.rs"
+
+[lib]
+name = "leve"
+path = "src/lib.rs"
+
+[dependencies]
+# The sandbox. Pinned exactly: leve is written against this API and a silent
+# minor bump would rebind us to something we never read.
+microsandbox = "=0.6.8"
+microsandbox-network = "=0.6.8"
+
+# Scripting. Lua is vendored so an agent directory needs no system Lua.
+mlua = { version = "0.11", features = ["lua54", "vendored", "send", "serialize", "async"] }
+
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process", "signal"] }
+futures = "0.3"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
+
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "webpki-roots", "http2", "charset"] }
+
+crossterm = "0.29"
+
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
+rand = "0.10"
+sha2 = "0.11"
+unicode-width = "0.2"
+shell-words = "1"
+glob = "0.3"
+regex = "1"
+
+[dev-dependencies]
+tempfile = "3"
+microsandbox = "=0.6.8"
+
+[profile.release]
+opt-level = 2

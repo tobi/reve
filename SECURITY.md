@@ -15,10 +15,10 @@ security advisory form:
 
 <https://github.com/tobi/leve/security/advisories/new>
 
-Include the Leve version, operating system, the pinned `microsandbox` crate version
-(`Leve::Sandbox::Native::MICROSANDBOX_VERSION`), reproduction steps, and potential impact.
-Remove API keys, model transcripts, session contents, and other private workspace data
-from reports.
+Include the Leve version (`leve --version`), operating system, the pinned `microsandbox`
+crate version (`=0.6.8`, the only sandbox dependency, declared in `Cargo.toml`), reproduction
+steps, and potential impact. Remove API keys, model transcripts, session contents, and
+other private workspace data from reports.
 
 Reports involving a host command escape, workspace bind escape, unscoped secret exposure,
 network-policy bypass, durable-record corruption, or recovery replay of an effectful tool
@@ -29,21 +29,26 @@ status update after the report has been reproduced.
 
 Leve deliberately fails closed:
 
-- Model `bash`, project context commands, and interactive `!command` execute in the same
-  mandatory microsandbox microVM.
-- There is no host/local execution fallback, no CLI transport, and no Fiddle path.
-- The sandbox is provided exclusively by the in-repo `ext/leve_sandbox` native extension
-  binding the `microsandbox` Rust crate (pinned `=0.6.8`). There is no Ruby gem dependency
-  for the sandbox.
-- Only `workspace/` is bind-mounted into the VM.
-- Network access is deny-by-default. The policy is built inside the extension from
-  `NetworkPolicy::none()` plus one narrow gateway-DNS rule plus one allow rule per host
-  named by `allow`; nothing on the Ruby side can widen it. Secrets are substituted only for
-  explicitly scoped hosts, and the guest sees only the placeholder.
+- Every command a tool issues — `ctx.sh` — and every `leve exec` runs in the same mandatory
+  microsandbox microVM. There is no host-shell, local, CLI, or FFI fallback.
+- The sandbox is provided exclusively by the `microsandbox` Rust crate, pinned `=0.6.8` in
+  `Cargo.toml`. It is Leve's only sandbox dependency, linked and called directly — no FFI
+  shim, no daemon, no CLI transport.
+- Only `workspace/` is bind-mounted into the VM, at `/workspace`, and set as the working
+  directory. The agent's own definition files stay outside the mount.
+- Network access is deny-by-default. The policy is built in Rust from
+  `NetworkPolicy::none()` — deny both directions — plus one narrow gateway-DNS rule plus
+  one allow rule per host named by `sandbox.lua`. Nothing in the crate can widen it to
+  "the internet". GitHub hosts are reachable by default; `allow` is additive on top.
+- Secrets are scoped per host. The guest sees only the placeholder; the real value is
+  injected into requests to the named hosts at the network boundary. An unscoped secret
+  (no `hosts`) is refused at load time. Secrets are hashed into the VM fingerprint, never
+  stored in cleartext.
 - Durable intent records are written before effects so recovery does not guess whether an
   effectful operation should be replayed.
 
-The host Ruby process, files under `tools/*.rb` and `channels/*.rb`, configured model
-providers, the `ext/leve_sandbox` native extension, and the upstream microsandbox runtime
-remain trusted components. Channel adapters intentionally perform host-side transport I/O;
-install them only as trusted code. They do not authorize model-authored host commands.
+The host Rust process, the Lua launch code (`agent.lua`, `sandbox.lua`, `tools/*.lua`), the
+configured model providers, and the upstream microsandbox runtime remain trusted
+components. Lua launch code runs on the host and is not model output; install an agent's
+tools only as trusted code. They do not authorize model-authored host commands — there is
+no host command path exposed to Lua.
