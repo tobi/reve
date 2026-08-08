@@ -58,6 +58,10 @@ module Reve
 
     COMMANDS = %w[help exit quit abort resume compact new verbose goal skill model models think
                   tools state cache sandbox output agents lanes lane tree back log steer next].freeze
+    # What `#command` dispatches before it ever reaches a channel, aliases
+    # included. A channel command named in here would be completed and listed
+    # by /help and then silently never run, so registration rejects it.
+    RESERVED = (COMMANDS + %w[q ?]).freeze
     THINK_LEVELS = %w[off low medium high].freeze
 
     def initialize(harness, suspended, lane: "main")

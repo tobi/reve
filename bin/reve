@@ -151,7 +151,9 @@ build_harness = lambda do |session_path, sandbox = nil|
     build_harness.call(fresh_path, current.sandbox)
   end
   h.start_heartbeat if options[:conversation] == "main" && options[:print].nil? && prompt_arg.nil?
-  h.channel_runtime = Reve::Channels::Runtime.new(h, PROJECT).start
+  h.channel_runtime = Reve::Channels::Runtime.new(
+    h, PROJECT, reserved: Reve::InteractiveAgentTUI::RESERVED
+  ).start
   [h, suspended_ops]
 end
 

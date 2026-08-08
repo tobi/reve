@@ -12,6 +12,12 @@ All notable changes to Reve are documented here. The project follows
 - A stdlib-only Telegram rich-message channel example based on `tobi/pi-telegram`, with
   pairing, polling, durable connection state, and a monotonic streaming state machine.
 
+### Fixed
+
+- A channel command that shadowed a built-in slash command (including the undocumented
+  `/q` and `/?` dispatch aliases) was completed and listed by `/help` but never ran.
+  Registration now rejects reserved names at startup.
+
 ## [0.8.0] - 2026-08-08
 
 ### Added

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "helper"
+require_relative "../lib/reve/tui"
 include TestKit
 
 load File.expand_path("../examples/telegram.rb", __dir__)
@@ -116,6 +117,39 @@ group "channel commands parse JSON objects" do
   context = Reve::Channels::Context.new(runtime, Reve::Channels.registrations.first)
   context.prompt("hello")
   eq "channel prompts carry transport metadata", "[channel=telegram] hello", lane.prompts.last
+ensure
+  runtime&.close
+  FileUtils.rm_rf(project&.root)
+end
+
+group "channel commands cannot shadow a harness command" do
+  project = Struct.new(:root).new(Dir.mktmpdir)
+  harness = Struct.new(:main, :channel_runtime).new(nil, nil)
+  reserved = Reve::InteractiveAgentTUI::RESERVED
+  runtime = Reve::Channels::Runtime.new(harness, project, reserved: reserved)
+
+  eq "the alias /q is reserved even though /help never lists it", true, reserved.include?("q")
+
+  shadow = begin
+    runtime.register_command("state", description: "shadow") { {} }
+    nil
+  rescue ArgumentError => e
+    e.message
+  end
+  eq "a built-in name is refused at registration", "channel command /state is reserved by the harness",
+     shadow
+
+  aliased = begin
+    runtime.register_command("q", description: "shadow") { {} }
+    nil
+  rescue ArgumentError => e
+    e.message
+  end
+  eq "so is an undocumented dispatch alias", "channel command /q is reserved by the harness", aliased
+
+  runtime.register_command("state-of-mind", description: "fine") { { "ok" => true } }
+  eq "a name that merely starts with one is fine", true, runtime.command?("state-of-mind")
+  eq "and it dispatches", true, runtime.invoke("/state-of-mind")["ok"]
 ensure
   runtime&.close
   FileUtils.rm_rf(project&.root)

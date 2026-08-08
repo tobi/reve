@@ -275,7 +275,9 @@ trivial to add. Every `channels/*.rb` file loads before Ractors spawn. A channel
 
 - Subscribe to atomic snapshots plus ordered live events.
 - Submit or steer durable lane work.
-- Register new `/commands` with JSON-object arguments.
+- Register new `/commands` with JSON-object arguments. Built-in names such as `/state` or
+  the `/quit` alias `/q` are reserved: registering one raises at startup instead of
+  producing a command that `/help` advertises and never dispatches.
 - Persist host-side credentials and cursors in a namespaced `.reve/channels.json` KV store.
 - Append stable channel-style guidance to the system message.
 

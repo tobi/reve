@@ -120,9 +120,13 @@ module Reve
     class Runtime
       attr_reader :harness, :project
 
-      def initialize(harness, project)
+      def initialize(harness, project, reserved: [])
         @harness = harness
         @project = project
+        # The front-end that dispatches slash commands owns the names it takes
+        # first; it hands them over so a shadowed channel command fails loudly
+        # at boot instead of quietly never running.
+        @reserved = reserved.map(&:to_s).freeze
         @commands = {}
         @instances = []
         Channels.registrations.each do |registration|
@@ -144,6 +148,7 @@ module Reve
         key = name.to_s.delete_prefix("/")
         raise ArgumentError, "invalid channel command #{key.inspect}" unless key.match?(/\A[a-z][a-z0-9_-]*\z/)
         raise ArgumentError, "channel command /#{key} is already registered" if @commands.key?(key)
+        raise ArgumentError, "channel command /#{key} is reserved by the harness" if @reserved.include?(key)
 
         @commands[key] = Command.new(name: key, description: description.to_s,
                                      schema: schema, handler: handler)

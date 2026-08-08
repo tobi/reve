@@ -312,7 +312,7 @@ module Reve
     class Runtime
       attr_reader harness: Harness
       attr_reader project: Project
-      def initialize: (Harness, Project) -> void
+      def initialize: (Harness, Project, ?reserved: Array[String]) -> void
       def start: () -> Runtime
       def close: () -> untyped
       def register_command: (String | Symbol, description: String, ?schema: Hash[untyped, untyped]) { (Hash[String, untyped]) -> untyped } -> Command
