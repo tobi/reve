@@ -15,10 +15,12 @@ jobs:
   test:
     name: Ruby 4.0
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # microsandbox-rb compiles its Rust extension when no prebuilt platform gem
+    # is available. A cold runner can spend more than ten minutes in bundle install.
+    timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
