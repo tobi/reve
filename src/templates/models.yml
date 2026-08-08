@@ -2,6 +2,11 @@
 # there is no home-directory or global fallback.
 #
 # Every apiKey must be a $ENV_VAR reference; secrets do not belong in this file.
+# A `$ENV_VAR` baseUrl is resolved the same way, which is how you point at a
+# local endpoint without hardcoding a port.
+#
+# `compat` holds the differences between endpoints that all claim to speak the
+# same protocol, so the adapters stay free of per-provider conditionals.
 providers:
   openai:
     baseUrl: https://api.openai.com/v1
@@ -12,3 +17,47 @@ providers:
         reasoning: true
         contextWindow: 200000
         maxTokens: 8192
+    compat:
+      supportsStore: true
+      supportsDeveloperRole: false
+      supportsReasoningEffort: true
+      maxTokensField: max_output_tokens
+
+  anthropic:
+    baseUrl: https://api.anthropic.com
+    api: anthropic-messages
+    apiKey: $ANTHROPIC_API_KEY
+    models:
+      - id: claude-opus-5
+        reasoning: true
+        contextWindow: 200000
+        maxTokens: 8192
+    compat:
+      supportsStore: false
+      supportsDeveloperRole: false
+      supportsReasoningEffort: true
+      maxTokensField: max_tokens
+
+  # A local llama.cpp server. Uncomment, point $LLAMA_CPP_BASE at it, and set
+  # the model id to whatever it is serving.
+  #
+  # llama.cpp speaks the OpenAI protocol but not all of it, which is what the
+  # compat block below is for: no `store`, no `developer` role, no reasoning
+  # effort, and the token cap is spelled `max_tokens`.
+  #
+  # `models:` must list the ids explicitly — asking the endpoint what it serves
+  # is not implemented yet, so an empty list would leave nothing to select.
+  #
+  # llamacpp:
+  #   baseUrl: $LLAMA_CPP_BASE
+  #   api: openai-responses
+  #   apiKey: $LLAMA_API_KEY
+  #   models:
+  #     - id: local-model
+  #       contextWindow: 32768
+  #       maxTokens: 4096
+  #   compat:
+  #     supportsStore: false
+  #     supportsDeveloperRole: false
+  #     supportsReasoningEffort: false
+  #     maxTokensField: max_tokens

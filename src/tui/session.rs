@@ -74,6 +74,9 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
         let updates = updates.clone();
         let project = Arc::new(project);
         tokio::spawn(async move {
+            // The first request of a session has a cold prefix by definition,
+            // so warning about it would be noise every single launch.
+            let mut turns = 0usize;
             // Held so an Interrupt can reach the command that is running.
             let mut cancel: Option<CancelTx> = None;
             while let Some(action) = actions_rx.recv().await {
@@ -97,7 +100,10 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
                             Some(run_tool(&project, &sandbox, name).await)
                         } else {
                             match &model {
-                                Ok(model) => ask(model.as_ref(), &project, &text, &updates).await,
+                                Ok(model) => {
+                                    turns += 1;
+                                    ask(model.as_ref(), &project, &text, &updates, turns > 1).await
+                                }
                                 Err(why) => Some(Item::Notice(format!("no model: {why}"))),
                             }
                         };
@@ -178,6 +184,7 @@ async fn ask(
     project: &Project,
     prompt: &str,
     updates: &mpsc::Sender<Update>,
+    warn_on_cache_miss: bool,
 ) -> Option<Item> {
     let context = vec![crate::records::Entry::message(
         crate::records::MAIN_LANE,
@@ -212,7 +219,10 @@ async fn ask(
                      wired up yet",
                     names.join(", ")
                 )))
-            } else if turn.usage.uncached_fraction() > 0.3 && turn.usage.input > 0 {
+            } else if warn_on_cache_miss
+                && turn.usage.input > 0
+                && turn.usage.uncached_fraction() > 0.3
+            {
                 Some(Item::Notice(format!(
                     "prompt cache miss: {:.0}% of {} input tokens were uncached",
                     turn.usage.uncached_fraction() * 100.0,

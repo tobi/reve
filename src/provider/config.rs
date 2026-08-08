@@ -364,11 +364,56 @@ providers:
         assert!(!claude.model.reasoning);
     }
 
+    const TEMPLATE: &str = include_str!("../templates/models.yml");
+
     #[test]
     fn the_scaffolded_models_file_is_valid() {
         // The template `leve init` writes must itself load.
-        let template = include_str!("../templates/models.yml");
-        let models = Models::parse(template, "models.yml").expect("the scaffold parses");
-        assert!(!models.catalog().is_empty());
+        let models = Models::parse(TEMPLATE, "models.yml").expect("the scaffold parses");
+        let catalog = models.catalog();
+        assert!(
+            catalog.iter().any(|m| m.starts_with("openai/")),
+            "{catalog:?}"
+        );
+        assert!(
+            catalog.iter().any(|m| m.starts_with("anthropic/")),
+            "{catalog:?}"
+        );
+    }
+
+    /// A commented-out example that does not work when uncommented is a trap.
+    #[test]
+    fn the_commented_local_provider_works_when_uncommented() {
+        let start = TEMPLATE
+            .find("  # llamacpp:")
+            .expect("the example is present");
+        // Uncomment the way a person does: delete the `# `, keep the indent.
+        let uncommented: String = TEMPLATE[start..]
+            .lines()
+            .map(|line| line.replacen("# ", "", 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let yaml = format!("providers:\n{uncommented}");
+
+        let models = Models::parse(&yaml, "models.yml").expect("it parses");
+        let resolved = models
+            .resolve_with(
+                "llamacpp",
+                &env(&[
+                    ("LLAMA_CPP_BASE", "http://127.0.0.1:8080/v1"),
+                    ("LLAMA_API_KEY", "x"),
+                ]),
+            )
+            .expect("and resolves");
+        assert_eq!(
+            resolved.base_url, "http://127.0.0.1:8080/v1",
+            "the $ENV baseUrl resolves"
+        );
+        assert_eq!(resolved.api, Api::OpenaiResponses);
+        // The quirks that make llama.cpp different from OpenAI proper.
+        assert!(!resolved.compat.supports_store);
+        assert!(!resolved.compat.supports_developer_role);
+        assert!(!resolved.compat.supports_reasoning_effort);
+        assert_eq!(resolved.compat.max_tokens_field, "max_tokens");
     }
 }
