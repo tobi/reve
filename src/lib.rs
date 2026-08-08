@@ -13,3 +13,4 @@ pub mod project;
 pub mod records;
 pub mod sandbox;
 pub mod storage;
+pub mod tui;
