@@ -1,0 +1,40 @@
+name: Bug report
+description: Report a reproducible Reve problem
+title: ""
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Security issues must be reported privately as described in SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: Reve version
+      placeholder: reve 0.8.0
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Ruby, OS, and architecture
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Remove credentials, transcripts, and private workspace data.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true

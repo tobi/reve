@@ -362,7 +362,7 @@ group "sandbox: egress is deny-by-default, github only" do
 end
 
 group "sandbox: the host's github auth is lent, not copied" do
-  entry = { "env_var" => "GITHUB_TOKEN", "value" => "ghp_secret", "allow_hosts" => %w[github.com] }
+  entry = { "env_var" => "GITHUB_TOKEN", "value" => "github-token-value", "allow_hosts" => %w[github.com] }
   cfg = Reve::Sandbox.config("githubAuth" => false, "secrets" => [entry])
   secrets = Reve::Sandbox.secret_entries(cfg)
   eq "declared secrets pass through", ["GITHUB_TOKEN"], secrets.map { _1["env_var"] }

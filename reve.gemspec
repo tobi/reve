@@ -3,14 +3,16 @@
 require_relative "lib/reve/version"
 
 Gem::Specification.new do |spec|
-  spec.name = "reve"
+  # `reve` on RubyGems is an unrelated Eve Online library. Keep Reve as the
+  # project, namespace, and executable while publishing under an unambiguous name.
+  spec.name = "reve-agent"
   spec.version = Reve::VERSION
-  spec.summary = "A durable coding agent in pure Ruby, on Ractors"
+  spec.summary = "A durable, microVM-sandboxed coding agent in Ruby"
   spec.description = <<~TEXT.strip
-    reve is a coding agent built on a durable harness: every message, tool call and
-    tool result is recorded before it happens, so an interrupted session resumes exactly
-    where it stopped. An agent is a directory — instructions.md, tools/*.rb, skills/,
-    sandbox/ — and model-authored commands run in mandatory microsandbox microVMs.
+    Reve is a coding agent built on a durable harness: every message, tool call, and
+    tool result is recorded so interrupted sessions can recover. An agent is a portable
+    directory containing its instructions, models, tools, workspace skills, sandbox
+    policy, and history. Model-authored commands run only in microsandbox microVMs.
   TEXT
   spec.authors = ["Tobi Lutke"]
   spec.license = "MIT"
@@ -29,6 +31,10 @@ Gem::Specification.new do |spec|
     "README.md",
     "PLAN.md",
     "AGENTS.md",
+    "CHANGELOG.md",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
     "LICENSE"
   ]
   spec.bindir = "bin"
@@ -39,6 +45,9 @@ Gem::Specification.new do |spec|
 
   spec.metadata = {
     "source_code_uri" => spec.homepage,
-    "rubygems_mfa_required" => "false"
+    "bug_tracker_uri" => "#{spec.homepage}/issues",
+    "changelog_uri" => "#{spec.homepage}/blob/master/CHANGELOG.md",
+    "documentation_uri" => "#{spec.homepage}#readme",
+    "rubygems_mfa_required" => "true"
   }
 end

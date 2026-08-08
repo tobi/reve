@@ -5,7 +5,8 @@
 require "rake/clean"
 require_relative "lib/reve/version"
 
-GEM_NAME = "reve"
+GEM_NAME = "reve-agent"
+GEMSPEC = "reve.gemspec"
 GEM_FILE = "#{GEM_NAME}-#{Reve::VERSION}.gem"
 CLOBBER.include(GEM_FILE, "pkg")
 
@@ -44,7 +45,7 @@ end
 
 desc "build #{GEM_FILE}"
 task :build do
-  sh "gem", "build", "#{GEM_NAME}.gemspec"
+  sh "gem", "build", GEMSPEC
 end
 
 desc "build and install the gem locally"

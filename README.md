@@ -1,17 +1,68 @@
 # Reve
 
-Reve is a durable coding agent in Ruby on Ractors. Model-authored commands always run in
-a microsandbox microVM through the mandatory `microsandbox-rb` gem. The defining rule is
-simple:
+[![CI](https://github.com/tobi/reve/actions/workflows/ci.yml/badge.svg)](https://github.com/tobi/reve/actions/workflows/ci.yml)
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **The folder is the agent.**
+Reve is a Ruby environment for building durable coding agents. Its central idea is:
 
-There is no machine-wide Reve profile, no home-directory prompt, no global model file, and
-no session store outside the agent folder. Copy the folder and you copy the agent: its
-identity, instructions, model configuration, skills, tools, workspace, channel example,
-and durable history.
+> **The directory is the agent.**
 
-## Start with an agent folder
+An agent is not a profile hidden in a home directory or state scattered across services.
+It is one portable directory containing identity, model configuration, tools, mutable
+memory, skills, sandbox policy, and durable history. Copy the directory and you copy the
+agent.
+
+## Philosophy
+
+Reve combines three ideas:
+
+1. **Ruby is the agent language.** An agent's configuration and project tools are ordinary,
+   readable Ruby. Ractors isolate concurrent lanes, while a small channel boundary keeps
+   the durable core independent from the terminal UI.
+2. **The environment is a real sandbox.** Every model-authored command, context command,
+   and interactive `!command` runs in a full microVM—never in a host-shell fallback. Reve
+   uses the community Ruby port [`microsandbox-rb`](https://github.com/ya-luotao/microsandbox-rb),
+   built on [microsandbox](https://github.com/superradcompany/microsandbox). The host only
+   orchestrates; the agent works inside its mounted `workspace/` with deny-by-default
+   networking and explicitly scoped secrets.
+3. **State is durable data, not process memory.** Reve's append-only conversation tree and
+   intent-before-effect records are based on the durable harness work in
+   [Pi](https://github.com/badlogic/pi-mono). A crash can leave an incomplete operation,
+   but not an ambiguous one: recovery has the identifiers and intent needed to reconcile
+   it safely.
+
+The result is an agent you can inspect with normal filesystem and Ruby tools, constrain as
+an operating environment, stop at any moment, and resume without pretending the
+interruption never happened.
+
+There is no machine-wide Reve profile, home-directory prompt, global model file, or session
+store outside the agent directory.
+
+## Install and create an agent
+
+Requirements:
+
+- Ruby 4.0 or newer.
+- Linux with KVM, or macOS on Apple Silicon, as required by `microsandbox-rb`.
+- Network access on first use to install the embedded microsandbox runtime and pull the VM
+  image. A source-gem install may additionally require Rust 1.91 or newer when no
+  precompiled native gem exists for the platform.
+
+```bash
+gem install reve-agent  # installs the `reve` executable
+mkdir my-agent && cd my-agent
+reve init
+export OPENAI_API_KEY=...
+./agent.rb
+```
+
+The RubyGems package is named `reve-agent` because the `reve` package name belongs to an
+unrelated project. It installs the `reve` executable and `Reve` Ruby namespace.
+
+The first launch builds and provisions the microVM and shows live startup progress. Later
+launches restart its persisted root disk.
+
+## Agent directory
 
 ```text
 reve/                         the agent root
@@ -37,13 +88,15 @@ reve/                         the agent root
     └── logs/                  oversized tool output
 ```
 
-Create the complete structure in the directory you are in:
+Create the complete structure in the current directory and launch it:
 
 ```bash
-bin/reve init .
-bundle install
-bundle exec bin/reve
+reve init .
+./agent.rb
 ```
+
+When working from a source checkout instead, use `bundle install` and
+`bundle exec bin/reve`.
 
 `reve init` is idempotent. It never writes to `$HOME`, a global cache, or another
 project. `models.yml` is copied into the new root and becomes the only model configuration
@@ -57,6 +110,101 @@ Launching `reve` reopens the named `main` conversation by default (adopting the 
 legacy session on first use). `reve -c research` opens another persistent named
 conversation. Use `/new` to rotate the selected conversation to a fresh durable session
 without rebooting the microVM.
+
+## Examples
+
+### Define an agent in Ruby
+
+`agent.rb` selects the model and thinking level; `instructions.md` holds the prose identity:
+
+```ruby
+#!/usr/bin/env reve
+
+agent do
+  model "openai/gpt-5.6-luna"
+  thinking :low
+end
+```
+
+The launcher is executable, so the directory itself feels like an application:
+
+```bash
+./agent.rb -c refactor
+```
+
+### Give the VM narrowly scoped GitHub access
+
+`sandbox.rb` is ordinary Ruby. This policy allows GitHub egress and lends a token only to
+those hosts. The VM sees `reve-github-token`; microsandbox substitutes the real value at
+the network boundary:
+
+```ruby
+sandbox do
+  image "debian:trixie-slim"
+  cpus 2
+  memory 2048
+
+  allow "github.com", "api.github.com" do
+    secret "GITHUB_TOKEN",
+           value: ENV.fetch("GITHUB_TOKEN"),
+           placeholder: "reve-github-token"
+  end
+end
+```
+
+There is no `host-exec`, and omitting the token does not create an invisible host fallback.
+
+### Stop and resume durable work
+
+```text
+$ ./agent.rb -c migration
+› update the storage format and run the recovery suite
+^C
+  aborting — ctrl-c again to quit
+
+$ ./agent.rb -c migration
+  conversation migration · recovered interrupted operation
+› /resume
+```
+
+Tool intent, result IDs, queue state, and the conversation branch are persisted under
+`.reve/sessions/`; recovery does not depend on the original Ruby process surviving.
+
+### Schedule background maintenance
+
+`workspace/HEARTBEAT.yml` creates durable background lanes while the main conversation is
+open:
+
+```yaml
+tasks:
+  - name: maintain
+    every: 30m
+    lane: maintenance
+    continue: true
+    model: openai/gpt-5.6-luna
+    vm-exec: git status --short
+    prompt: Review the workspace and perform one safe maintenance improvement.
+    delivery: main
+```
+
+A heartbeat returns `SILENCE`, `Message: ...`, or `Steer: ...`; its intent, completion,
+delivery, skips, and errors are recorded like foreground work.
+
+### Add a reloadable skill
+
+Create `workspace/skills/review/SKILL.md`:
+
+```markdown
+---
+name: review
+description: Review a change for correctness, durability, and sandbox escapes.
+---
+
+Read the diff, run focused tests, and report findings before proposing edits.
+```
+
+Reve fingerprints the complete skill directory and exposes changes at the next turn
+boundary without rewriting the stable system prompt.
 
 ## The one channel: inline TUI
 
