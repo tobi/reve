@@ -118,8 +118,9 @@ When working from a source checkout instead, use `bundle install` and
 
 `reve init` is idempotent. It never writes to `$HOME`, a global cache, or another
 project. `models.yml` is copied into the new root and becomes the only model configuration
-that this agent reads. The generated `channels/tui.rb` is intentionally small enough to
-serve as a channel implementation example.
+that this agent reads. The generated `channels/tui.rb` is the default terminal adapter;
+see [`examples/telegram.rb`](examples/telegram.rb) for a complete file-drop channel with
+commands, KV state, system-message guidance, polling, pairing, and rich streaming.
 
 The launcher refuses to run in a directory that is not an agent. This prevents an agent
 from silently attaching itself to an arbitrary checkout. The only durable paths are under
