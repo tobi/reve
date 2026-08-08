@@ -377,7 +377,13 @@ module Reve
           case value
           when Hash
             value.keys.sort.each_with_object({}) do |key, out|
-              out[key] = key.to_s == "value" ? "[secret]" : scrub.call(value[key])
+              # Never persist credential material, but do make rotation change
+              # the VM fingerprint so the proxy cannot retain a stale secret.
+              out[key] = if key.to_s == "value"
+                           "[secret-sha256:#{Digest::SHA256.hexdigest(value[key].to_s)}]"
+                         else
+                           scrub.call(value[key])
+                         end
             end
           when Array then value.map { scrub.call(_1) }
           else value
@@ -464,6 +470,8 @@ module Reve
         extras << "provisioned" if @config["provision"]
         extras << "mise #{(@config["mise"] || []).join(",")}" unless (@config["mise"] || []).empty?
         extras << (@config["allowAll"] ? "network open" : "net #{(@config["allowHosts"] || []).size} hosts")
+        secret_names = Sandbox.secret_entries(@config).map { _1["env_var"] }.uniq
+        extras << "secrets #{secret_names.join(",")}" unless secret_names.empty?
         "microsandbox-rb #{@config["image"]} (#{@config["cpus"]} cpu, #{@config["memory"]}MB" \
           "#{extras.empty? ? "" : ", #{extras.join(", ")}"}) #{mount_description}"
       end

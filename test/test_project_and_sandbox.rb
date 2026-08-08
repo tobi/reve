@@ -411,6 +411,25 @@ group "sandbox client contract" do
   end
 end
 
+group "rotating a scoped secret invalidates the persisted VM" do
+  Dir.mktmpdir do |root|
+    workspace = File.join(root, "workspace")
+    FileUtils.mkdir_p(workspace)
+    base = { "hostWorkspace" => workspace, "provision" => false, "githubAuth" => false,
+             "secrets" => [{ "env_var" => "GITHUB_TOKEN", "value" => "token-one",
+                              "allow_hosts" => ["github.com"],
+                              "placeholder" => "reve-github-token" }] }
+    first = Reve::Sandbox::Client.new(Object.new, Reve::Sandbox.config(base))
+    rotated = Marshal.load(Marshal.dump(base))
+    rotated["secrets"].first["value"] = "token-two"
+    second = Reve::Sandbox::Client.new(Object.new, Reve::Sandbox.config(rotated))
+    eq "secret values are hashed into the fingerprint", true,
+       first.send(:fingerprint) != second.send(:fingerprint)
+    eq "the raw token is never persisted in the fingerprint", false,
+       first.send(:fingerprint).include?("token-one")
+  end
+end
+
 group "sandbox startup progress is visible before the TUI exists" do
   output = Class.new(StringIO) { def tty? = true }.new
   progress = Reve::Sandbox::Progress.new(output)

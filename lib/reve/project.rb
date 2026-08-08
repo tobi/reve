@@ -461,10 +461,13 @@ module Reve
 
           # Host-scoped substitution: the VM sees only this fake placeholder;
           # microsandbox substitutes the real value on requests to these hosts.
+          # `gh` keyring login is not an environment variable; export it first:
+          #   export GITHUB_TOKEN="$(gh auth token --hostname github.com)"
+          github_token = ENV["GITHUB_TOKEN"] || ENV["GH_TOKEN"]
           allow "github.com", "api.github.com", "raw.githubusercontent.com",
                 "objects.githubusercontent.com", "codeload.github.com" do
-            if ENV.key?("GITHUB_TOKEN")
-              secret "GITHUB_TOKEN", value: ENV.fetch("GITHUB_TOKEN"),
+            if github_token && !github_token.empty?
+              secret "GITHUB_TOKEN", value: github_token,
                      placeholder: "reve-github-token"
             end
           end

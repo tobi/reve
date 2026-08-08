@@ -153,6 +153,15 @@ end
 ```
 
 There is no `host-exec`, and omitting the token does not create an invisible host fallback.
+`gh auth login` may keep its token only in the operating-system keyring; export it before
+launching Reve when needed:
+
+```bash
+export GITHUB_TOKEN="$(gh auth token --hostname github.com)"
+./agent.rb
+```
+
+Reve itself never executes that host command.
 
 ### Stop and resume durable work
 
