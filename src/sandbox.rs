@@ -667,6 +667,12 @@ pub mod tokio_util_lite {
     }
 
     impl CancelRx {
+        /// A non-blocking peek, for a loop that wants to check between steps
+        /// rather than race a future.
+        pub fn is_cancelled(&self) -> bool {
+            *self.0.borrow()
+        }
+
         /// Resolves once cancellation is requested, and stays resolved.
         pub async fn cancelled(&mut self) {
             if *self.0.borrow() {

@@ -29,6 +29,32 @@ pub const FORMAT_VERSION: u32 = 4;
 /// The default lane. Every session has one; others are created on demand.
 pub const MAIN_LANE: &str = "main";
 
+/// Envelope field names.
+///
+/// Payloads are flattened into the line, so a payload key with one of these
+/// names would be emitted twice and the line would no longer parse. Rather
+/// than trust every caller to remember that, payloads are sanitised on the way
+/// in: a reserved key is moved aside under a `payload` prefix.
+pub const RESERVED_KEYS: &[&str] = &[
+    "kind",
+    "id",
+    "parentId",
+    "lane",
+    "seq",
+    "type",
+    "customType",
+    "timestamp",
+];
+
+fn sanitize(mut payload: Map<String, Value>) -> Map<String, Value> {
+    for key in RESERVED_KEYS {
+        if let Some(value) = payload.remove(*key) {
+            payload.insert(format!("payload_{key}"), value);
+        }
+    }
+    payload
+}
+
 /// A single line of a session file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -86,6 +112,7 @@ impl Entry {
     pub fn message(lane: impl Into<String>, message: Value) -> Self {
         let mut payload = Map::new();
         payload.insert("message".into(), message);
+        let payload = sanitize(payload);
         Self {
             id: EntryId::new(),
             parent_id: None,
@@ -101,6 +128,7 @@ impl Entry {
     pub fn custom(lane: impl Into<String>, custom_type: impl Into<String>, data: Value) -> Self {
         let mut payload = Map::new();
         payload.insert("data".into(), data);
+        let payload = sanitize(payload);
         Self {
             id: EntryId::new(),
             parent_id: None,
@@ -142,7 +170,7 @@ impl Record {
             seq: 0,
             record_type: record_type.into(),
             timestamp: Some(crate::ids::now_ms()),
-            payload: match payload {
+            payload: sanitize(match payload {
                 Value::Object(map) => map,
                 Value::Null => Map::new(),
                 other => {
@@ -150,7 +178,7 @@ impl Record {
                     map.insert("value".into(), other);
                     map
                 }
-            },
+            }),
         }
     }
 
@@ -253,6 +281,32 @@ mod tests {
         assert_eq!(Replay::parse("never"), Replay::Never);
         assert_eq!(Replay::parse("mostly"), Replay::Never);
         assert_eq!(Replay::parse(""), Replay::Never);
+    }
+
+    #[test]
+    fn a_payload_cannot_collide_with_the_envelope() {
+        // Regression: `operation_started` carried a payload key named `kind`,
+        // which is the envelope's own tag. The line was written with `kind`
+        // twice and refused to parse on reopen — a session that could be
+        // written but never read back.
+        let record = Record::new(
+            "main",
+            "operation_started",
+            json!({"kind": "run", "type": "x", "seq": 9, "runId": "run_1"}),
+        );
+        let text = serde_json::to_string(&Line::Record(record)).unwrap();
+        let parsed: Line = serde_json::from_str(&text).expect("the line must round-trip");
+        let Line::Record(back) = parsed else {
+            panic!("expected a record")
+        };
+        assert_eq!(back.record_type, "operation_started", "the envelope wins");
+        assert_eq!(back.str("runId"), Some("run_1"));
+        assert_eq!(
+            back.get("payload_kind").unwrap(),
+            "run",
+            "the payload is kept, moved aside"
+        );
+        assert_eq!(back.get("payload_type").unwrap(), "x");
     }
 
     #[test]

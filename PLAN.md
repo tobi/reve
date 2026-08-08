@@ -100,25 +100,38 @@ tests/
 9. **Opt-in microVM tests.** `tests/microvm.rs`: a Lua tool's `ctx.sh` in the guest with
    the workspace mount read/write; `github.com` reachable, unlisted host blocked;
    cancellation kills the guest command, VM still usable. `#[ignore]` by default.
+10. **The model seam.** `Model` trait plus `ScriptedModel`, whose cursor lives in a file so
+    a killed-and-restarted process resumes at the turn it had reached (`src/model.rs`).
+11. **The run procedure.** Intent before effect, end to end: `operation_started` →
+    `task_attempt` → assistant entry → `tool_started` (which provisions the result id and
+    records the replay declaration) → result entry under exactly that id →
+    `operation_finished`. Retry cap, tool failures returned to the model as results rather
+    than faulting the lane (`src/lane.rs`).
+12. **Abort + reconciliation.** A cancelled run still writes the promised result entry — a
+    synthetic interrupted one — and still closes its operation. An abort before any work
+    promises nothing and closes cleanly (`src/lane.rs`).
+13. **Recovery.** The reduction from two bounded reads: which operations were opened and
+    never finished, and which of their declared results never landed. Every missing result
+    is produced — replayed only when the recorded *and* current declarations both say
+    `safe`, otherwise synthesised. Closing every operation it touches makes re-running a
+    no-op (`recover` in `src/lane.rs`).
+14. **Crash-site test.** `tests/crash.rs` spawns `src/bin/crash_child.rs`, waits until it is
+    inside the tool, SIGKILLs it, and reduces what the dead process left on disk. Nothing
+    is simulated.
 
 ### Pending
 
-10. **The agent loop** — streaming assistant turns, tool-call prepare/execute/finalize
-    batches.
-11. **Providers** — `openai-responses`, `anthropic-messages`, and a `fake` for tests.
-    `models.yml` is scaffolded and parsed; no requests are made yet.
-12. **Lane execution** — beyond `main` in storage, no concurrent lane runs, queues,
-    steering, retry caps.
-13. **Recovery / resume** — the invariants are in the format and storage layer; no
-    procedure walks them yet.
-14. **Abort + reconciliation** — synthetic results, closing message, queue payload return.
-15. **Observer hub + snapshots + events.**
-16. **Compaction** — branch summarisation, `set_leaf` exists but no summariser.
-17. **Hooks** — interception points.
-18. **Heartbeats** — `HEARTBEAT.yml` is scaffolded; no scheduler reloads it.
-19. **Skills** — `workspace/skills/` exists; no discovery, catalog, or frontmatter parsing.
-20. **Channels** — `channels/` is an empty directory; no adapters.
-21. **The TUI** — no terminal renderer.
+15. **Providers** — `openai-responses`, `anthropic-messages`, and a `fake` over the `Model`
+    trait. `models.yml` is scaffolded and parsed; no requests are made yet.
+16. **Lane execution as a task** — the run procedure exists but runs inline against a
+    borrowed `Storage`; no owning task, no concurrent lanes, no queues or steering.
+17. **Observer hub + snapshots + events.**
+18. **Compaction** — branch summarisation; `set_leaf` exists but no summariser.
+19. **Hooks** — interception points.
+20. **Heartbeats** — `HEARTBEAT.yml` is scaffolded; no scheduler reloads it.
+21. **Skills** — `workspace/skills/` exists; no discovery, catalog, or frontmatter parsing.
+22. **Channels** — `channels/` is an empty directory; no adapters.
+23. **The TUI** — no terminal renderer.
 
 ## 4. Scope cuts (explicit)
 
@@ -130,12 +143,26 @@ tests/
 - The microVM tests are opt-in (`#[ignore]`); the unit suite must not provision a VM or
   make model requests.
 
-## 5. Invariants we test
+## 5. Invariants, and where each is actually tested
 
-- One writer: any append from outside the owning task is impossible by construction.
-- Intent before effect: for every `tool_started` there is either a result entry with the
-  provisioned id, or recovery produces one (recovery itself is pending; the format upholds
-  it).
-- Append-only context: mid-step writes never land before the in-flight assistant entry.
-- Deleting every record leaves a valid conversation tree.
-- Re-running recovery is idempotent (the `append_entry_if_missing` path).
+Every row names a test. A claim without one is marked as such rather than listed as if it
+were covered.
+
+| Invariant | Test |
+|---|---|
+| Deleting every record leaves a valid conversation tree | `storage::tests::deleting_every_record_leaves_a_valid_tree` |
+| A provisioned id may be appended twice without duplicating | `storage::tests::provisioned_ids_can_be_appended_twice_without_duplicating` |
+| `seq` is shared and monotonic across entries and records | `storage::tests::seq_is_shared_and_monotonic_across_entries_and_records` |
+| A torn tail truncates; a malformed line elsewhere is corruption | `storage::jsonl::tests::{a_torn_tail_is_truncated_and_the_prefix_survives, a_malformed_line_in_the_middle_is_corruption}` |
+| A payload can never collide with the envelope | `records::tests::a_payload_cannot_collide_with_the_envelope` |
+| Intent before effect: `tool_started` names the id the result uses | `lane::tests::a_run_writes_intent_before_effect` |
+| Append-only context: a result never precedes the turn that asked for it | `lane::tests::the_assistant_turn_lands_before_its_tool_result` |
+| An aborted tool still gets its promised result | `lane::tests::aborting_mid_run_still_produces_the_promised_result_entry` |
+| An effectful tool is never replayed by recovery | `lane::tests::recovery_replays_a_tool_only_when_both_declarations_say_safe` |
+| Recovery is idempotent | `lane::tests::recovery_closes_the_operation_and_is_idempotent` |
+| A really-killed process leaves a recoverable session | `tests/crash.rs` (spawns and SIGKILLs a real child) |
+| Deny-by-default egress | `tests/microvm.rs` (opt-in, real VM) |
+
+**Not yet enforced.** "Single writer" is currently true only because nothing shares a
+`Storage` — there is no owning task yet, so any holder of `&mut Storage` can append. It
+becomes structural when item 16 lands; until then it is a convention, not a guarantee.

@@ -2260,6 +2260,7 @@ dependencies = [
  "microsandbox",
  "microsandbox-network",
  "mlua",
+ "parking_lot",
  "rand 0.10.2",
  "regex",
  "reqwest",

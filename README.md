@@ -367,21 +367,53 @@ reopen, leve truncates back to the last complete line and resumes appending. A m
 line anywhere *else* is not something a crash can do, so it is corruption and leve refuses
 to open the file.
 
+## The durable harness
+
+Every mutation follows one sequence: **record the intent, perform the effect, append the
+result under the id the intent named.** One run writes:
+
+```text
+record operation_started  { runId, intent: { kind: "run" } }
+entry  user
+record task_attempt       { runId, attempt }
+entry  assistant
+record tool_started       { runId, toolName, resultEntryId, replay }   <- intent
+entry  toolResult                                                      <- effect, that id
+record operation_finished { runId, outcome }
+```
+
+A crash therefore leaves either a completed operation or an incomplete one that says
+exactly what it was about to do — never an ambiguous one.
+
+**Recovery** is a reduction over two bounded reads: which operations were opened and never
+finished, and which of their declared results never landed. Every missing result is
+produced. A tool is re-run only when the recorded declaration *and* the current one both
+say `safe` — a tool that has since become effectful is never replayed on the strength of an
+old record; it gets a synthetic interrupted result instead. Recovery closes every operation
+it touches, so running it twice is a no-op.
+
+**Abort** is reconciliation, not abandonment. A cancelled run still writes the result entry
+it promised and still closes its operation, and in the VM the guest command is actually
+killed through the agent's control channel.
+
+This is tested against a really-killed process: `tests/crash.rs` spawns a child, waits
+until it is inside a tool, `SIGKILL`s it, and then reduces whatever the dead process left
+on disk. Nothing about it is simulated.
+
 ## Not yet built
 
-The durable format and the sandbox it will sit on are in place; the engine is not. The
-following are planned but **not yet implemented**:
+The durable core is in place; the surface around it is not. Planned but **not yet
+implemented**:
 
-- **The agent loop** — no streaming assistant turns, no tool-call batches.
-- **Providers** — `openai-responses`, `anthropic-messages`, and a `fake` provider for
-  tests are not yet wired. `models.yml` is scaffolded and parsed but no model requests are
-  made.
-- **Lanes** — beyond the `main` lane in storage, no concurrent lane execution.
+- **Providers** — `openai-responses`, `anthropic-messages`, and a `fake` over the `Model`
+  trait. `models.yml` is scaffolded and parsed, but no model requests are made; today the
+  only implementation is a scripted model used by the tests.
+- **Lane execution as a task** — the run procedure exists but runs inline against a
+  borrowed `Storage`. No owning task, no concurrent lanes, no queues or steering. Until
+  that lands, "single writer" is a convention rather than a structural guarantee.
 - **The observer hub** — no event snapshots or subscriptions.
 - **Hooks** — no interception points.
 - **Compaction** — no branch summarisation.
-- **Recovery / resume** — the durability invariants are encoded in the format and storage
-  layer, but no recovery procedure walks them yet.
 - **Heartbeats** — `workspace/HEARTBEAT.yml` is scaffolded but no scheduler reloads it.
 - **Skills** — `workspace/skills/` exists as a directory but no discovery or catalog.
 - **Channels** — no file-drop adapters; `channels/` is an empty directory.
@@ -389,8 +421,9 @@ following are planned but **not yet implemented**:
 
 What works today: `leve init` scaffolds an agent; `leve info` loads and describes it;
 `leve exec` runs a command in the microVM; `leve tool` runs a Lua tool whose `ctx.sh`
-executes in that microVM; and the durable JSONL format reads, writes, and reopens
-correctly.
+executes in that microVM; the durable JSONL format reads, writes, and reopens correctly;
+and the run procedure, abort reconciliation, and crash recovery work end to end against a
+scripted model.
 
 ## Development
 

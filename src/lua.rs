@@ -15,6 +15,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use mlua::{Lua, LuaSerdeExt, Table, Value as LuaValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -165,16 +167,16 @@ impl Runtime {
 
     /// Load `agent.lua`, if the agent has one.
     pub fn load_agent(&mut self, path: &Path) -> Result<()> {
-        let captured: Arc<std::sync::Mutex<Option<AgentConfig>>> = Arc::default();
+        let captured: Arc<Mutex<Option<AgentConfig>>> = Arc::default();
         let sink = captured.clone();
         let agent_fn = self.lua.create_function(move |lua, table: Table| {
             let config: AgentConfig = lua.from_value(LuaValue::Table(table))?;
-            *sink.lock().expect("agent config lock") = Some(config);
+            *sink.lock() = Some(config);
             Ok(())
         })?;
         self.lua.globals().set("agent", agent_fn)?;
         self.exec_file(path)?;
-        if let Some(config) = captured.lock().expect("agent config lock").take() {
+        if let Some(config) = captured.lock().take() {
             self.agent = config;
         }
         Ok(())
@@ -183,15 +185,15 @@ impl Runtime {
     /// Load `sandbox.lua`, if the agent has one. Absent means the default
     /// policy, which is already deny-by-default.
     pub fn load_sandbox(&mut self, path: &Path) -> Result<()> {
-        let captured: Arc<std::sync::Mutex<Option<Table>>> = Arc::default();
+        let captured: Arc<Mutex<Option<Table>>> = Arc::default();
         let sink = captured.clone();
         let sandbox_fn = self.lua.create_function(move |_, table: Table| {
-            *sink.lock().expect("sandbox lock") = Some(table);
+            *sink.lock() = Some(table);
             Ok(())
         })?;
         self.lua.globals().set("sandbox", sandbox_fn)?;
         self.exec_file(path)?;
-        let table = captured.lock().expect("sandbox lock").take();
+        let table = captured.lock().take();
         if let Some(table) = table {
             self.policy = policy_from_table(&table)?;
         }
@@ -203,12 +205,12 @@ impl Runtime {
         if !dir.is_dir() {
             return Ok(());
         }
-        let collected: Arc<std::sync::Mutex<Vec<(String, Table)>>> = Arc::default();
+        let collected: Arc<Mutex<Vec<(String, Table)>>> = Arc::default();
         let sink = collected.clone();
         let tool_fn = self
             .lua
             .create_function(move |_, (name, spec): (String, Table)| {
-                sink.lock().expect("tool lock").push((name, spec));
+                sink.lock().push((name, spec));
                 Ok(())
             })?;
         self.lua.globals().set("tool", tool_fn)?;
@@ -226,7 +228,7 @@ impl Runtime {
             self.exec_file(path)?;
         }
 
-        let declared = std::mem::take(&mut *collected.lock().expect("tool lock"));
+        let declared = std::mem::take(&mut *collected.lock());
         for (name, spec) in declared {
             self.tools.push(self.tool_from_table(name, spec)?);
         }
