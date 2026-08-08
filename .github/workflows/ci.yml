@@ -28,8 +28,10 @@ jobs:
         with:
           ruby-version: "4.0"
           bundler-cache: true
+      # rake and rbs ship with Ruby 4. Running outside Bundler keeps these
+      # development-only default gems out of Reve's runtime dependency set.
       - name: Test, lint, and validate signatures
-        run: bundle exec rake
+        run: rake
       - name: Validate gem package
         run: |
           gem build reve.gemspec
