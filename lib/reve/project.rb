@@ -456,7 +456,8 @@ module Reve
           provision true
           packages "ca-certificates", "curl", "git", "gh", "build-essential", "jq",
                    "unzip", "ripgrep", "fd-find", "file", "less"
-          mise "node@lts", "ast-grep@latest"
+          mise "node@lts"
+          npm "@ast-grep/cli" # avoids mise's unauthenticated GitHub API lookup
 
           # Host-scoped substitution: the VM sees only this fake placeholder;
           # microsandbox substitutes the real value on requests to these hosts.

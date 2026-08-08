@@ -187,9 +187,11 @@ secret ...; end` explicitly scopes placeholder substitution to named hosts.
 
 The first launch creates and provisions a VM. Clean shutdown stops it but preserves its
 root disk and definition; later launches restart that named VM instead of reinstalling
-APT and mise-managed tools. Node and ast-grep are both installed through mise; the
-default scaffold does not use npm provisioning. A sandbox policy or toolchain change
-intentionally replaces and reprovisions it. Reve also avoids model-endpoint discovery during startup.
+APT and language tools. Node is installed through mise; ast-grep uses npm because mise's
+aqua backend still queries GitHub's unauthenticated, rate-limited releases API. A sandbox policy or toolchain change
+intentionally replaces and reprovisions it. Before the TUI appears, a live startup spinner
+names image/VM creation, APT/mise provisioning, and each bootstrap stage, then reports
+elapsed time. Reve also avoids model-endpoint discovery during startup.
 
 At every run boundary Reve rereads full `workspace/AGENTS.md`, full
 `workspace/SOUL.md`, and the first 100 lines of `workspace/KNOWLEDGE.md`. They enter the

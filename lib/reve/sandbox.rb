@@ -21,10 +21,11 @@ module Reve
     # activated in /etc/profile.d, so `sh -lc` picks it up like a login shell).
     APT_PACKAGES = %w[ca-certificates curl git gh build-essential jq unzip
                       ripgrep fd-find file less].freeze
-    # gh comes from Debian; mise installs Node and ast-grep directly (the
-    # registry resolves ast-grep through aqua), so npm is not a provisioner.
-    MISE_TOOLS = %w[node@lts ast-grep@latest].freeze
-    NPM_TOOLS = [].freeze
+    # gh comes from Debian and Node from mise. ast-grep stays on npm because
+    # mise's aqua backend queries GitHub's rate-limited releases API even for
+    # pinned versions; npm needs no implicit GitHub credential.
+    MISE_TOOLS = %w[node@lts].freeze
+    NPM_TOOLS = %w[@ast-grep/cli].freeze
 
     DEFAULTS = Ractor.make_shareable({
       "backend" => "microsandbox",
@@ -48,7 +49,7 @@ module Reve
       # provisioning is enabled; turn it off (or bake an image) and the policy
       # is github-only.
       "provisionHosts" => %w[deb.debian.org security.debian.org ftp.debian.org
-                             mise.run mise.jdx.dev nodejs.org
+                             mise.run mise.jdx.dev registry.npmjs.org nodejs.org
                              github.com objects.githubusercontent.com],
       "githubAuth" => false,
       "secrets" => [],
@@ -243,16 +244,66 @@ module Reve
       d.to_config
     end
 
+    # Startup happens before the TUI exists, so long image pulls and first-time
+    # provisioning need their own small renderer instead of looking hung.
+    class Progress
+      FRAMES = %w[⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏].freeze
+
+      def initialize(io)
+        @io = io
+        @mutex = Mutex.new
+      end
+
+      def stage(label)
+        return unless @io&.tty?
+
+        @mutex.synchronize do
+          @label = label
+          @started ||= Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          next if @thread&.alive?
+
+          @stop = false
+          @thread = Thread.new do
+            index = 0
+            until @stop
+              current = @mutex.synchronize { @label }
+              @io.print("\r\e[2K#{FRAMES[index % FRAMES.size]} #{current}")
+              @io.flush
+              index += 1
+              sleep 0.08
+            end
+          end
+        end
+      end
+
+      def finish(label = "sandbox ready") = settle("\e[32m✓\e[0m", label)
+      def fail(label) = settle("\e[31m✗\e[0m", label)
+
+      def settle(mark, label)
+        return unless @io&.tty?
+
+        @stop = true
+        @thread&.join(0.3)
+        elapsed = @started && Process.clock_gettime(Process::CLOCK_MONOTONIC) - @started
+        suffix = elapsed ? " (#{elapsed.round(1)}s)" : ""
+        @io.puts("\r\e[2K#{mark} #{label}#{suffix}")
+        @io.flush
+        @thread = nil
+        @started = nil
+      end
+    end
+
     # One interface, whichever backend is underneath.
     class Client
       attr_reader :config, :backend_name
 
-      def initialize(vm, config)
+      def initialize(vm, config, progress: nil)
         raise ArgumentError, "a microsandbox runtime is required" unless vm
 
         @vm = vm
         @config = config
         @backend_name = "microsandbox-rb"
+        @progress = progress
         @provisioned = false
         @started = false
         @mutex = Mutex.new
@@ -283,8 +334,10 @@ module Reve
           ensure_workspace!
           if reusable?
             begin
+              @progress&.stage("restarting microVM #{sandbox_name}")
               @vm.connect(sandbox_name)
               @started = true
+              @progress&.finish
               return self
             rescue StandardError => e
               # A running sandbox belongs to another live Reve. Replacing it
@@ -293,14 +346,26 @@ module Reve
             end
           end
 
+          @progress&.stage("building microVM #{sandbox_name} from #{@config["image"]}")
           opts = Sandbox.create_options(@config, host_workspace, workdir).merge("replace" => true)
           @vm.create(sandbox_name, opts)
           @started = true
+          if @config["provision"]
+            tools = ((@config["mise"] || []) + (@config["npm"] || [])).join(", ")
+            @progress&.stage("provisioning APT packages#{tools.empty? ? "" : " and #{tools}"}")
+          end
           provision_ok = !@config["provision"] || provision!
-          bootstrap_ok = (@config["bootstrap"] || []).all? { |cmd| exec(cmd)["exitCode"].to_i.zero? }
+          bootstrap_ok = (@config["bootstrap"] || []).each_with_index.all? do |cmd, index|
+            @progress&.stage("running bootstrap #{index + 1}/#{@config["bootstrap"].size}: #{cmd.to_s.lines.first.strip}")
+            exec(cmd)["exitCode"].to_i.zero?
+          end
           save_fingerprint if provision_ok && bootstrap_ok
+          @progress&.finish(provision_ok && bootstrap_ok ? "sandbox ready" : "sandbox ready with provisioning errors")
         end
         self
+      rescue StandardError => e
+        @progress&.fail("sandbox startup failed: #{e.message}")
+        raise
       end
 
       def fingerprint_path
@@ -413,7 +478,8 @@ module Reve
         raise Unavailable, "unsupported sandbox backend #{backend.inspect}; microsandbox is mandatory"
       end
 
-      Client.new(Microsandbox.new, cfg.merge("backend" => "microsandbox")).tap(&:start)
+      progress = Progress.new(warn_io)
+      Client.new(Microsandbox.new, cfg.merge("backend" => "microsandbox"), progress: progress).tap(&:start)
     rescue Microsandbox::Error => e
       warn_io&.puts("\e[31m sandbox: #{e.message}\e[0m")
       raise Unavailable, e.message

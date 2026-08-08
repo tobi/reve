@@ -50,8 +50,8 @@ group "reve init scaffolds an agent directory" do
        File.read(sandbox_path).include?("Microsandbox is mandatory")
     sandbox_template = File.read(sandbox_path)
     eq "GitHub auth is not enabled implicitly", false, sandbox_template.include?("github_auth true")
-    eq "ast-grep is installed by mise without npm", true,
-       sandbox_template.include?('mise "node@lts", "ast-grep@latest"') && !sandbox_template.include?("npm ")
+    eq "ast-grep avoids mise's GitHub API lookup", true,
+       sandbox_template.include?('mise "node@lts"') && sandbox_template.include?('npm "@ast-grep/cli"')
   end
 end
 
@@ -324,8 +324,8 @@ group "sandbox: default image comes with the tools an agent reaches for" do
   eq "ripgrep and fd are in the package list", true,
      (cfg["packages"] & %w[ripgrep fd-find]).size == 2
   eq "gh comes from Debian, avoiding GitHub API discovery", true, cfg["packages"].include?("gh")
-  eq "mise supplies Node and ast-grep", %w[node@lts ast-grep@latest], cfg["mise"]
-  eq "npm provisioning is empty", [], cfg["npm"]
+  eq "mise supplies Node", %w[node@lts], cfg["mise"]
+  eq "ast-grep comes from npm without GitHub API discovery", ["@ast-grep/cli"], cfg["npm"]
   script = Reve::Sandbox.provision_script(cfg)
   eq "mise is installed", true, script.include?("https://mise.run")
   eq "and activated for every shell", true, script.include?("/etc/profile.d/10-mise.sh")
@@ -334,9 +334,8 @@ group "sandbox: default image comes with the tools an agent reaches for" do
   eq "shims go on PATH, because /bin/sh is dash", true, script.include?("mise/shims")
   eq "fd gets its familiar name", true, script.include?("ln -sf /usr/bin/fdfind")
   eq "provisioning is idempotent", true, script.include?("[ -f /var/lib/reve/provisioned ]")
-  eq "mise tools installed globally", true,
-     script.include?("mise use -g node@lts ast-grep@latest")
-  eq "no npm global install", false, script.include?("npm install -g")
+  eq "mise tools installed globally", true, script.include?("mise use -g node@lts")
+  eq "npm installs ast-grep globally", true, script.include?("npm install -g @ast-grep/cli")
 end
 
 group "sandbox: egress is deny-by-default, github only" do
@@ -412,6 +411,20 @@ group "sandbox client contract" do
   end
 end
 
+group "sandbox startup progress is visible before the TUI exists" do
+  output = Class.new(StringIO) { def tty? = true }.new
+  progress = Reve::Sandbox::Progress.new(output)
+  progress.stage("building microVM")
+  sleep 0.12
+  progress.stage("provisioning APT packages")
+  sleep 0.1
+  progress.finish("sandbox ready")
+  eq "the spinner names build stages", true,
+     output.string.include?("building microVM") && output.string.include?("provisioning APT packages")
+  eq "completion includes elapsed time", true,
+     output.string.include?("sandbox ready") && output.string.match?(/\([0-9.]+s\)/)
+end
+
 group "an unchanged provisioned VM is restarted instead of replaced" do
   Dir.mktmpdir do |root|
     workspace = File.join(root, "workspace")
@@ -467,7 +480,7 @@ group "sandbox DSL" do
     eq "the VM receives a fake placeholder", "fake-token", secret["placeholder"]
     eq "the real value remains in the proxy config", "real-token", secret["value"]
     eq "GitHub auth is not implicit", false, cfg["githubAuth"]
-    eq "ast-grep comes from mise, not npm", [%w[node@lts ast-grep@latest], []],
+    eq "default tools avoid unauthenticated GitHub release lookup", [%w[node@lts], ["@ast-grep/cli"]],
        [cfg["mise"], cfg["npm"]]
     eq "defaults filled in", "/workspace", cfg["workdir"]
   end
