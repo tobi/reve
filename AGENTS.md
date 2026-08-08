@@ -1,4 +1,4 @@
-# reve
+# leve
 
 A durable coding agent in Ruby on Ractors. The design is
 Pi's durable harness (see PLAN.md); PLAN.md maps it onto Ractors and records what is in and
@@ -6,11 +6,13 @@ out of scope.
 
 ## Rules
 
-- **Sandbox or no Reve.** Microsandbox is provided exclusively by the mandatory
-  `microsandbox-rb` gem. Reve must refuse to start if the VM cannot boot. Every shell
-  command — model `bash`, project `ctx.sh`, and user `!command` — executes inside that VM.
-  Never retain, add, or silently select a host/local shell fallback, even for tests,
-  diagnostics, degraded operation, or convenience.
+- **Sandbox or no Leve.** Microsandbox is provided exclusively by the in-repo
+  `ext/leve_sandbox` native extension, which binds the official `microsandbox` Rust crate
+  (pinned `=0.6.8`) directly. There is no Ruby gem dependency for the sandbox and exactly
+  one transport. Leve must refuse to start if the extension or the microVM cannot boot.
+  Every shell command — model `bash`, project `ctx.sh`, and user `!command` — executes
+  inside that VM. Never retain, add, or silently select a host/local shell fallback, even
+  for tests, diagnostics, degraded operation, or convenience.
 - Everything loads before any Ractor spawns: a non-main Ractor cannot `require`.
 - Constants reachable from a Ractor must be shareable (`Ractor.make_shareable`, or a
   frozen literal). `<<~TXT.strip` is *not* frozen — add `.freeze`.
@@ -21,14 +23,15 @@ out of scope.
 - Every new behaviour gets a test in `test/`, and recovery behaviour gets a crash-site
   test that kills a real child process.
 - Project code (`tools/*.rb`, hooks, the sandbox connection) runs in the host Ractor,
-  because blocks and live handles cannot cross a Ractor boundary. “Host Ractor” describes
+  because blocks and live handles cannot cross a Ractor boundary. "Host Ractor" describes
   orchestration only: it does not authorize host effects. Sandboxed built-ins dispatch
   through the VM handle; other built-ins may run in their own Ractor only when they do not
   execute processes.
-- Do not maintain a second microsandbox transport. Use the public `microsandbox-rb` API and
-  test the adapter against Ruby fakes; real-microVM tests are opt-in integration tests.
+- There is exactly one sandbox transport, `ext/leve_sandbox`. Test the Ruby sandbox layer
+  against a Ruby fake via the injectable `native:` seam; real-microVM tests are opt-in.
 
 ## Commands
 
     bin/test          run every suite, each in its own process
-    bin/reve       the agent itself
+    rake compile      build the ext/leve_sandbox native extension
+    bin/leve       the agent itself

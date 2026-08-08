@@ -4,17 +4,17 @@ require_relative "helper"
 require "open3"
 include TestKit
 
-group "reve init scaffolds an agent directory" do
+group "leve init scaffolds an agent directory" do
   Dir.mktmpdir do |dir|
-    result = Reve::Project.init(dir, name: "notes-bot")
+    result = Leve::Project.init(dir, name: "notes-bot")
     eq "instructions.md is the centre of it", true, result["created"].include?("instructions.md")
     eq "agent.rb carries the configuration", true, result["created"].include?("agent.rb")
     agent_path = File.join(dir, "agent.rb")
-    eq "agent.rb has the Reve shebang", "#!/usr/bin/env reve", File.open(agent_path, &:gets).strip
+    eq "agent.rb has the Leve shebang", "#!/usr/bin/env leve", File.open(agent_path, &:gets).strip
     eq "agent.rb is executable", true, File.executable?(agent_path)
     env = { "PATH" => "#{File.expand_path("../bin", __dir__)}:#{ENV.fetch("PATH")}" }
     stdout, stderr, status = Open3.capture3(env, agent_path, "--version", chdir: "/tmp")
-    eq "executing agent.rb launches Reve from its own directory", [true, "reve #{Reve::VERSION}", ""],
+    eq "executing agent.rb launches Leve from its own directory", [true, "leve #{Leve::VERSION}", ""],
        [status.success?, stdout.strip, stderr.strip]
     eq "with tools, mutable skills and a sandbox alongside",
        %w[sandbox.rb tools/example.rb workspace/AGENTS.md workspace/skills/heartbeat/SKILL.md],
@@ -25,26 +25,26 @@ group "reve init scaffolds an agent directory" do
        %w[workspace/KNOWLEDGE.md workspace/DREAM.md workspace/HEARTBEAT.yml].all? do |file|
          result["created"].include?(file)
        end
-    eq "the directory is now an agent directory", true, Reve::Project.agent_dir?(dir)
-    eq "sessions live with the agent", true, File.directory?(File.join(dir, ".reve", "sessions"))
+    eq "the directory is now an agent directory", true, Leve::Project.agent_dir?(dir)
+    eq "sessions live with the agent", true, File.directory?(File.join(dir, ".leve", "sessions"))
     eq "workspace/ is where the work goes", true, File.directory?(File.join(dir, "workspace"))
     eq "with a mutable skills directory", true, File.directory?(File.join(dir, "workspace", "skills"))
     eq "with its own AGENTS.md naming the tools", true,
        %w[fd rg ast-grep jq gh mise].all? { File.read(File.join(dir, "workspace", "AGENTS.md")).include?("`#{_1}`") }
-    eq "and are not committed", true, File.read(File.join(dir, ".gitignore")).include?(".reve/")
-    again = Reve::Project.init(dir)
+    eq "and are not committed", true, File.read(File.join(dir, ".gitignore")).include?(".leve/")
+    again = Leve::Project.init(dir)
     eq "running init twice changes nothing", [], again["created"] - [".gitignore"]
     eq "identical files are classified as unchanged", true, again["unchanged"].include?("instructions.md")
     eq "and says what it skipped", true, again["skipped"].include?("instructions.md")
 
     sandbox_path = File.join(dir, "sandbox.rb")
     File.write(sandbox_path, "# an older or user-edited policy\n")
-    offered = Reve::Project.init(dir)
+    offered = Leve::Project.init(dir)
     eq "a changed generated file is offered for update", true,
        offered["updateCandidates"].include?("sandbox.rb")
     eq "it is not overwritten without approval", "# an older or user-edited policy\n",
        File.read(sandbox_path)
-    applied = Reve::Project.init(dir, update: ["sandbox.rb"])
+    applied = Leve::Project.init(dir, update: ["sandbox.rb"])
     eq "an approved candidate is updated", ["sandbox.rb"], applied["updated"]
     eq "the current mandatory sandbox template was installed", true,
        File.read(sandbox_path).include?("Microsandbox is mandatory")
@@ -55,12 +55,12 @@ group "reve init scaffolds an agent directory" do
   end
 end
 
-group "reve init moves the legacy nested sandbox without overwriting it" do
+group "leve init moves the legacy nested sandbox without overwriting it" do
   Dir.mktmpdir do |root|
     legacy = File.join(root, "sandbox", "sandbox.rb")
     FileUtils.mkdir_p(File.dirname(legacy))
     File.write(legacy, "# custom policy\n")
-    result = Reve::Project.init(root)
+    result = Leve::Project.init(root)
     eq "the policy moved to the agent root", "# custom policy\n", File.read(File.join(root, "sandbox.rb"))
     eq "the legacy path is gone", false, File.exist?(legacy)
     eq "the custom policy is still only an update candidate", true,
@@ -69,10 +69,10 @@ group "reve init moves the legacy nested sandbox without overwriting it" do
 end
 
 Dir.mktmpdir do |root|
-  Reve::Project.init(root, name: "notes-bot")
+  Leve::Project.init(root, name: "notes-bot")
 
   group "the directory is the agent" do
-    p = Reve::Project.load(root)
+    p = Leve::Project.load(root)
     eq "it knows it is an agent", true, p.agent?
     eq "name from frontmatter", "notes-bot", p.name
     eq "model comes from agent.rb", "openai/gpt-5.6-luna", p.config["model"]
@@ -80,16 +80,15 @@ Dir.mktmpdir do |root|
     eq "instructions are the body, not the frontmatter", false, p.instructions.include?("name: notes-bot")
     eq "tools/ loaded", %w[sandboxed_uname word_count], p.tools.map(&:name).sort
     eq "workspace skills loaded", %w[heartbeat release-notes], p.skills.map { _1["name"] }.sort
-    eq "sandbox is required", "microsandbox", p.sandbox_config["backend"]
     eq "no diagnostics for the scaffold", [], p.diagnostics
-    eq "sessions dir", File.join(root, ".reve", "sessions"), p.sessions_dir
+    eq "sessions dir", File.join(root, ".leve", "sessions"), p.sessions_dir
     eq "workspace is the working directory", File.join(root, "workspace"), p.workspace_dir
     eq "and it is what the sandbox mounts", File.join(root, "workspace"), p.sandbox_config["hostWorkspace"]
     eq "at /workspace", "/workspace", p.sandbox_config["workdir"]
   end
 
   group "the system prompt carries the instructions as the authority" do
-    p = Reve::Project.load(root)
+    p = Leve::Project.load(root)
     prompt = p.system_prompt(tools: %w[read bash], sandbox: fake_sandbox(p.workspace_dir))
     eq "instructions are tagged", true, prompt.include?("<agent_instructions source=\"instructions.md\">")
     eq "and declared to outrank the defaults", true, prompt.include?("outrank")
@@ -99,7 +98,7 @@ Dir.mktmpdir do |root|
   end
 
   group "tool DSL: schema from typed declarations" do
-    p = Reve::Project.load(root)
+    p = Leve::Project.load(root)
     d = p.tool("word_count").declaration
     eq "name", "word_count", d["name"]
     eq "description", "Count words in a file in the workspace", d["description"]
@@ -113,20 +112,20 @@ Dir.mktmpdir do |root|
   group "a project tool runs, and its return value is normalised" do
     File.write(File.join(root, "workspace", "sample.txt"), "one two three\nfour five\n")
     sandbox = fake_sandbox(File.join(root, "workspace"))
-    ctx = Reve::ToolDSL::Context.new(sandbox: sandbox, cwd: root)
-    p = Reve::Project.load(root)
-    result = Reve::ToolDSL.invoke(p.tool("word_count"), { "path" => "sample.txt" }, ctx)
+    ctx = Leve::ToolDSL::Context.new(sandbox: sandbox, cwd: root)
+    p = Leve::Project.load(root)
+    result = Leve::ToolDSL.invoke(p.tool("word_count"), { "path" => "sample.txt" }, ctx)
     eq "string return becomes text content", "5 words, 2 lines", result.dig("content", 0, "text")
     eq "not an error", false, result["isError"]
 
-    shell = Reve::ToolDSL.invoke(p.tool("sandboxed_uname"), {}, ctx)
+    shell = Leve::ToolDSL.invoke(p.tool("sandboxed_uname"), {}, ctx)
     eq "ctx.sh runs a command", true, shell.dig("content", 0, "text").include?("Linux")
   end
 
   group "a broken tool file is a diagnostic, not a crash" do
     File.write(File.join(root, "tools", "broken.rb"), "tool \"nope\" do\n  description 'x'\n")
     File.write(File.join(root, "tools", "nohandler.rb"), "tool(\"idle\") { description 'no run block' }\n")
-    p = Reve::Project.load(root)
+    p = Leve::Project.load(root)
     eq "the good tools still load", true, p.tools.map(&:name).include?("word_count")
     eq "the syntax error is reported", true,
        p.diagnostics.any? { _1["type"] == "error" && _1["path"].to_s.end_with?("broken.rb") }
@@ -142,7 +141,7 @@ Dir.mktmpdir do |root|
         run { "no" }
       end
     RUBY
-    p = Reve::Project.load(root)
+    p = Leve::Project.load(root)
     eq "collision reported", true, p.diagnostics.any? { _1["type"] == "collision" }
     eq "and the built-in wins", false, p.tools.map(&:name).include?("bash")
     File.delete(File.join(root, "tools", "shadow.rb"))
@@ -154,14 +153,14 @@ Dir.mktmpdir do |root|
     h, = test_harness(storage: "memory", model: model, cwd: root)
     eq "project tools are active", true, h.state["activeTools"].include?("word_count")
     eq "built-ins are still there", true, h.state["activeTools"].include?("bash")
-    eq "sandbox reported", true, h.sandbox.describe.start_with?("microsandbox-rb")
+    eq "sandbox reported", true, h.sandbox.describe.start_with?("microsandbox")
     r = h.prompt("count the words in sample.txt")
     eq "the run completed", true, r["ok"]
     result = entries_of(h.session).find { _1.dig("message", "role") == "toolResult" }
     eq "the project tool ran through the host", "5 words, 2 lines",
        result.dig("message", "content", 0, "text")
     eq "and its declaration reached the provider", true,
-       File.readlines("#{ENV["REVE_FAKE_SCRIPT"]}.requests")
+       File.readlines("#{ENV["LEVE_FAKE_SCRIPT"]}.requests")
            .last.include?("word_count")
     h.close
   end
@@ -169,20 +168,20 @@ end
 
 group "a directory has to look like an agent" do
   Dir.mktmpdir do |dir|
-    eq "an empty directory is not one", false, Reve::Project.agent_dir?(dir)
+    eq "an empty directory is not one", false, Leve::Project.agent_dir?(dir)
     File.write(File.join(dir, "instructions.md"), "Be useful.")
-    eq "instructions.md is enough", true, Reve::Project.agent_dir?(dir)
+    eq "instructions.md is enough", true, Leve::Project.agent_dir?(dir)
     File.delete(File.join(dir, "instructions.md"))
     File.write(File.join(dir, "agent.rb"), "agent { model \"vllm\" }")
-    eq "so is agent.rb", true, Reve::Project.agent_dir?(dir)
+    eq "so is agent.rb", true, Leve::Project.agent_dir?(dir)
   end
 end
 
 group "the prompt is a list of files, so SOUL.md can join it" do
   Dir.mktmpdir do |root|
-    Reve::Project.init(root, name: "soulful")
+    Leve::Project.init(root, name: "soulful")
     File.write(File.join(root, "SOUL.md"), "You are terse and dry.")
-    p = Reve::Project.load(root)
+    p = Leve::Project.load(root)
     eq "the generated workspace soul wins over a duplicate root file",
        ["instructions.md", "workspace/SOUL.md"],
        p.prompt_sources.map { _1["path"].delete_prefix("#{root}/") }
@@ -199,7 +198,7 @@ group "the prompt is a list of files, so SOUL.md can join it" do
         instructions "instructions.md", "SOUL.md", "docs/style.md"
       end
     RUBY
-    p2 = Reve::Project.load(root)
+    p2 = Leve::Project.load(root)
     eq "agent.rb names the list", %w[instructions.md SOUL.md style.md],
        p2.prompt_sources.map { File.basename(_1["path"]) }
     eq "nested paths keep their path in the tag", true,
@@ -211,7 +210,7 @@ group "the prompt is a list of files, so SOUL.md can join it" do
         instructions "instructions.md", "nope.md"
       end
     RUBY
-    p3 = Reve::Project.load(root)
+    p3 = Leve::Project.load(root)
     eq "a missing prompt file is a diagnostic", true,
        p3.diagnostics.any? { _1["message"] == "prompt file not found" }
     eq "and the rest still load", %w[instructions.md SOUL.md],
@@ -229,7 +228,7 @@ group "inline instructions in agent.rb work too" do
         TXT
       end
     RUBY
-    p = Reve::Project.load(root)
+    p = Leve::Project.load(root)
     eq "it counts as an agent", true, p.agent?
     eq "the prose is a source", "agent.rb", p.prompt_sources.first["path"]
     eq "and reaches the prompt", true,
@@ -239,7 +238,7 @@ end
 
 group "workspace AGENTS, SOUL and bounded KNOWLEDGE are reread for every run" do
   Dir.mktmpdir do |root|
-    Reve::Project.init(root, name: "memory-agent")
+    Leve::Project.init(root, name: "memory-agent")
     workspace = File.join(root, "workspace")
     File.write(File.join(workspace, "AGENTS.md"), "AGENT RULE V1\n")
     File.write(File.join(workspace, "SOUL.md"), "SOUL V1\n")
@@ -250,7 +249,7 @@ group "workspace AGENTS, SOUL and bounded KNOWLEDGE are reread for every run" do
     eq "editable memory stays out of the stable prefix", false, stable.include?("AGENT RULE V1")
 
     h.prompt("first")
-    requests = File.readlines("#{ENV["REVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
+    requests = File.readlines("#{ENV["LEVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
     first = requests.first["messages"].flat_map { _1["content"] }.filter_map { _1["text"] }.join("\n")
     eq "AGENTS is included", true, first.include?("AGENT RULE V1")
     eq "SOUL is included", true, first.include?("SOUL V1")
@@ -260,7 +259,7 @@ group "workspace AGENTS, SOUL and bounded KNOWLEDGE are reread for every run" do
     File.write(File.join(workspace, "AGENTS.md"), "AGENT RULE V2\n")
     File.write(File.join(workspace, "SOUL.md"), "SOUL V2\n")
     h.prompt("second")
-    requests = File.readlines("#{ENV["REVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
+    requests = File.readlines("#{ENV["LEVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
     second = requests.last["messages"].flat_map { _1["content"] }.filter_map { _1["text"] }.join("\n")
     eq "edits are visible on the next run", true,
        second.include?("AGENT RULE V2") && second.include?("SOUL V2")
@@ -272,7 +271,7 @@ end
 group "the workspace directory is created for the bind mount" do
   Dir.mktmpdir do |root|
     File.write(File.join(root, "instructions.md"), "Be useful.")
-    p = Reve::Project.load(root)
+    p = Leve::Project.load(root)
     eq "loading a project creates nothing", false, File.directory?(File.join(root, "workspace"))
     eq "but the workspace never falls back to the agent directory",
        File.join(root, "workspace"), p.workspace_dir
@@ -293,19 +292,17 @@ end
 
 group "the workspace is mapped, and the agent's own files are not" do
   Dir.mktmpdir do |root|
-    Reve::Project.init(root, name: "mapped")
+    Leve::Project.init(root, name: "mapped")
     model = fake_model(root, [assistant_tool("bash", { "command" => "pwd" }), assistant_text("done")])
     h, = test_harness(storage: "memory", model: model, cwd: root)
     eq "tools run in workspace/", File.join(root, "workspace"), h.config["cwd"]
     eq "the agent directory is remembered separately", root, h.config["agentRoot"]
-    volume = Reve::Sandbox.create_options(h.sandbox.config, h.sandbox.host_workspace,
-                                             h.sandbox.workdir).dig("volumes", "/workspace")
+    spec = Leve::Sandbox.create_spec(h.sandbox.config, h.sandbox.sandbox_name,
+                                     h.sandbox.host_workspace, h.sandbox.workdir)
     eq "workspace/ is bind-mounted at /workspace, read-write",
-       { "bind" => File.join(root, "workspace"), "readonly" => false, "nosuid" => true, "nodev" => true },
-       volume
-    eq "and it is the only mount", ["/workspace"],
-       Reve::Sandbox.create_options(h.sandbox.config, h.sandbox.host_workspace,
-                                       h.sandbox.workdir)["volumes"].keys
+       { "guest" => "/workspace", "host" => File.join(root, "workspace"), "readonly" => false },
+       spec["mounts"].first
+    eq "and it is the only mount", ["/workspace"], spec["mounts"].map { _1["guest"] }
     eq "the mount is what the client reports",
        "bind #{File.join(root, "workspace")} → /workspace (rw)", h.sandbox.mount_description
     eq "only the VM-editable workspace AGENTS.md is in scope",
@@ -319,14 +316,14 @@ group "the workspace is mapped, and the agent's own files are not" do
 end
 
 group "sandbox: default image comes with the tools an agent reaches for" do
-  cfg = Reve::Sandbox.config({})
+  cfg = Leve::Sandbox.config({})
   eq "debian", "debian:trixie-slim", cfg["image"]
   eq "ripgrep and fd are in the package list", true,
      (cfg["packages"] & %w[ripgrep fd-find]).size == 2
   eq "gh comes from Debian, avoiding GitHub API discovery", true, cfg["packages"].include?("gh")
   eq "mise supplies Node", %w[node@lts], cfg["mise"]
   eq "ast-grep comes from npm without GitHub API discovery", ["@ast-grep/cli"], cfg["npm"]
-  script = Reve::Sandbox.provision_script(cfg)
+  script = Leve::Sandbox.provision_script(cfg)
   eq "mise is installed", true, script.include?("https://mise.run")
   eq "fresh-VM network operations retry while DNS settles", true,
      script.include?("Acquire::Retries=5") && script.include?("retry mise use") &&
@@ -336,69 +333,62 @@ group "sandbox: default image comes with the tools an agent reaches for" do
      script.include?('eval "$(mise activate bash)" || true')
   eq "shims go on PATH, because /bin/sh is dash", true, script.include?("mise/shims")
   eq "fd gets its familiar name", true, script.include?("ln -sf /usr/bin/fdfind")
-  eq "provisioning is idempotent", true, script.include?("[ -f /var/lib/reve/provisioned ]")
+  eq "provisioning is idempotent", true, script.include?("[ -f /var/lib/leve/provisioned ]")
   eq "mise tools installed globally", true, script.include?("mise use -g node@lts")
   eq "npm installs ast-grep globally", true, script.include?("npm install -g @ast-grep/cli")
 end
 
 group "sandbox: egress is deny-by-default, github only" do
-  cfg = Reve::Sandbox.config("provision" => false)
-  net = Reve::Sandbox.network_options(cfg)
-  rules = net.dig("custom_policy", "rules")
-  allowed = rules.select { _1["destination_kind"] == "domain" }.map { _1["destination"] }.uniq
-  eq "only github hosts are allowed", %w[api.github.com codeload.github.com github.com
-                                         objects.githubusercontent.com raw.githubusercontent.com],
-     allowed.sort
-  dns = rules.find { _1["destination_kind"] == "group" && _1["destination"] == "host" }
-  eq "dns uses the microsandbox-rb gateway rule", [%w[udp tcp], ["53"]],
-     [dns["protocols"], dns["ports"]]
-  eq "every rule is an allow, so the policy denies by default", ["allow"], rules.map { _1["action"] }.uniq
-  eq "egress only", ["egress"], rules.map { _1["direction"] }.uniq
+  cfg = Leve::Sandbox.config("provision" => false)
+  net = Leve::Sandbox.network_spec(cfg)
+  eq "network is always enabled", true, net["enabled"]
+  eq "only github hosts are allowed", Leve::Sandbox::HostAuth::GITHUB_HOSTS.sort, net["allow"].sort
+  eq "the allowlist is the whole policy; there is no rules array", %w[allow enabled], net.keys.sort
 
-  provisioning = Reve::Sandbox.network_options(Reve::Sandbox.config({}))
-  hosts = provisioning.dig("custom_policy", "rules").map { _1["destination"] }
-  eq "package mirrors are allowed only while provisioning", true, hosts.include?("deb.debian.org")
-  eq "and mise's installer with them", true, hosts.include?("mise.run")
-
-  open_cfg = Reve::Sandbox.config("allowAll" => true)
-  eq "allow_all opts out of the policy entirely", {}, Reve::Sandbox.network_options(open_cfg)
+  provisioning = Leve::Sandbox.network_spec(Leve::Sandbox.config({}))
+  eq "package mirrors are allowed only while provisioning", true,
+     provisioning["allow"].include?("deb.debian.org")
+  eq "and mise's installer with them", true, provisioning["allow"].include?("mise.run")
+  eq "github remains reachable while provisioning", true, provisioning["allow"].include?("github.com")
 end
 
 group "sandbox: the host's github auth is lent, not copied" do
-  entry = { "env_var" => "GITHUB_TOKEN", "value" => "github-token-value", "allow_hosts" => %w[github.com] }
-  cfg = Reve::Sandbox.config("githubAuth" => false, "secrets" => [entry])
-  secrets = Reve::Sandbox.secret_entries(cfg)
-  eq "declared secrets pass through", ["GITHUB_TOKEN"], secrets.map { _1["env_var"] }
-  eq "scoped to their hosts", %w[github.com], secrets.first["allow_hosts"]
+  entry = { "env" => "GITHUB_TOKEN", "value" => "github-token-value", "hosts" => %w[github.com] }
+  cfg = Leve::Sandbox.config("githubAuth" => false, "secrets" => [entry])
+  secrets = Leve::Sandbox.secret_entries(cfg)
+  eq "declared secrets pass through", ["GITHUB_TOKEN"], secrets.map { _1["env"] }
+  eq "scoped to their hosts", %w[github.com], secrets.first["hosts"]
   eq "a secret with no value is dropped", [],
-     Reve::Sandbox.secret_entries(Reve::Sandbox.config("githubAuth" => false,
-                                                             "secrets" => [{ "env_var" => "X", "value" => "" }]))
+     Leve::Sandbox.secret_entries(Leve::Sandbox.config("githubAuth" => false,
+                                                             "secrets" => [{ "env" => "X", "value" => "",
+                                                                             "hosts" => ["github.com"] }]))
 
-  with_token = Reve::Sandbox.config("githubAuth" => true, "secrets" => [])
-  found = Reve::Sandbox::HostAuth.github_secret
+  with_token = Leve::Sandbox.config("githubAuth" => true, "secrets" => [])
+  found = Leve::Sandbox::HostAuth.github_secret
   if found
-    entries = Reve::Sandbox.secret_entries(with_token)
-    eq "the host token is offered to the sandbox", "GITHUB_TOKEN", entries.first["env_var"]
-    eq "scoped to github only", true, entries.first["allow_hosts"].all? { _1.include?("github") }
-    eq "with a placeholder, so the VM never sees the value", "reve-github-token",
+    entries = Leve::Sandbox.secret_entries(with_token)
+    eq "the host token is offered to the sandbox", "GITHUB_TOKEN", entries.first["env"]
+    eq "scoped to github only", true, entries.first["hosts"].all? { _1.include?("github") }
+    eq "with a placeholder, so the VM never sees the value", "leve-github-token",
        entries.first["placeholder"]
-    eq "and we know where it came from", true, %w[$GITHUB_TOKEN $GH_TOKEN].include?(found["source"]) ||
-                                               found["source"].include?("git") || found["source"].include?("gh ")
+    eq "and we know where it came from", true,
+       Leve::Sandbox::HostAuth::ENV_VARS.map { "$#{_1}" }.include?(found["source"])
   else
-    eq "no host credential, no secret", [], Reve::Sandbox.secret_entries(with_token)
+    eq "no host credential, no secret", [], Leve::Sandbox.secret_entries(with_token)
   end
 end
 
-group "sandbox: create options speak microsandbox's wire shape" do
-  cfg = Reve::Sandbox.config("provision" => false, "githubAuth" => false)
-  opts = Reve::Sandbox.create_options(cfg, "/host/ws", "/workspace")
-  eq "memory is memory_mib", 2048, opts["memory_mib"]
-  eq "the workspace is a bind volume, rw and hardened",
-     { "bind" => "/host/ws", "readonly" => false, "nosuid" => true, "nodev" => true },
-     opts.dig("volumes", "/workspace")
-  eq "env travels", "noninteractive", opts.dig("env", "DEBIAN_FRONTEND")
-  eq "network policy attached", true, opts.key?("network")
-  eq "no empty secrets key", false, opts.key?("secrets")
+group "sandbox: the create spec speaks the binding's wire shape" do
+  cfg = Leve::Sandbox.config("provision" => false, "githubAuth" => false)
+  spec = Leve::Sandbox.create_spec(cfg, "leve-test", "/host/ws", "/workspace")
+  eq "memory is a plain integer", 2048, spec["memory"]
+  eq "the workspace is a bind mount, read-write",
+     { "guest" => "/workspace", "host" => "/host/ws", "readonly" => false },
+     spec["mounts"].first
+  eq "env travels", "noninteractive", spec.dig("env", "DEBIAN_FRONTEND")
+  eq "network policy attached", true, spec.key?("network")
+  eq "no empty secrets key", false, spec.key?("secrets")
+  eq "replace is set so the stable named sandbox is rebuilt", true, spec["replace"]
 end
 
 group "sandbox client contract" do
@@ -419,13 +409,12 @@ group "rotating a scoped secret invalidates the persisted VM" do
     workspace = File.join(root, "workspace")
     FileUtils.mkdir_p(workspace)
     base = { "hostWorkspace" => workspace, "provision" => false, "githubAuth" => false,
-             "secrets" => [{ "env_var" => "GITHUB_TOKEN", "value" => "token-one",
-                              "allow_hosts" => ["github.com"],
-                              "placeholder" => "reve-github-token" }] }
-    first = Reve::Sandbox::Client.new(Object.new, Reve::Sandbox.config(base))
+             "secrets" => [{ "env" => "GITHUB_TOKEN", "value" => "token-one",
+                             "hosts" => ["github.com"], "placeholder" => "leve-github-token" }] }
+    first = Leve::Sandbox::Client.new(Leve::Sandbox.config(base), native: fake_native(workspace))
     rotated = Marshal.load(Marshal.dump(base))
     rotated["secrets"].first["value"] = "token-two"
-    second = Reve::Sandbox::Client.new(Object.new, Reve::Sandbox.config(rotated))
+    second = Leve::Sandbox::Client.new(Leve::Sandbox.config(rotated), native: fake_native(workspace))
     eq "secret values are hashed into the fingerprint", true,
        first.send(:fingerprint) != second.send(:fingerprint)
     eq "the raw token is never persisted in the fingerprint", false,
@@ -435,7 +424,7 @@ end
 
 group "sandbox startup progress is visible before the TUI exists" do
   output = Class.new(StringIO) { def tty? = true }.new
-  progress = Reve::Sandbox::Progress.new(output)
+  progress = Leve::Sandbox::Progress.new(output)
   progress.stage("building microVM")
   sleep 0.12
   progress.stage("provisioning APT packages")
@@ -451,27 +440,21 @@ group "an unchanged provisioned VM is restarted instead of replaced" do
   Dir.mktmpdir do |root|
     workspace = File.join(root, "workspace")
     FileUtils.mkdir_p(workspace)
-    runtime = Class.new do
-      attr_reader :creates, :connects, :stops
-      def initialize = (@creates = @connects = @stops = 0)
-      def create(_name, _options) = (@creates += 1; { "handle" => 1 })
-      def connect(_name) = (@connects += 1; { "handle" => 1 })
-      def stop = (@stops += 1)
-    end.new
-    config = Reve::Sandbox.config("hostWorkspace" => workspace, "provision" => false,
+    native = fake_native(workspace)
+    config = Leve::Sandbox.config("hostWorkspace" => workspace, "provision" => false,
                                   "githubAuth" => false, "bootstrap" => [])
-    first = Reve::Sandbox::Client.new(runtime, config)
+    first = Leve::Sandbox::Client.new(config, native: native)
     first.start
     first.stop
-    second = Reve::Sandbox::Client.new(runtime, config)
+    second = Leve::Sandbox::Client.new(config, native: native)
     second.start
-    eq "only the first launch creates", 1, runtime.creates
-    eq "the next launch reconnects", 1, runtime.connects
+    eq "only the first launch creates", 1, native.created.size
+    eq "the next launch restarts the persisted VM", 1, native.started.size
     second.stop
 
-    changed = Reve::Sandbox::Client.new(runtime, config.merge("memory" => 4096))
+    changed = Leve::Sandbox::Client.new(config.merge("memory" => 4096), native: native)
     changed.start
-    eq "policy changes replace the VM", 2, runtime.creates
+    eq "policy changes replace the VM", 2, native.created.size
     changed.stop
   end
 end
@@ -491,14 +474,13 @@ group "sandbox DSL" do
         bootstrap "pip install -r requirements.txt", "pytest --version"
       end
     RUBY
-    cfg = Reve::Sandbox.config(Reve::Sandbox.load_definition(path))
-    eq "backend", "microsandbox", cfg["backend"]
+    cfg = Leve::Sandbox.config(Leve::Sandbox.load_definition(path))
     eq "image", "python:3.12", cfg["image"]
     eq "resources", [4, 2048], [cfg["cpus"], cfg["memory"]]
     eq "env", { "TZ" => "UTC" }, cfg["env"]
     eq "bootstrap commands in order", ["pip install -r requirements.txt", "pytest --version"], cfg["bootstrap"]
     secret = cfg["secrets"].first
-    eq "allow block scopes its secret", %w[github.com api.github.com], secret["allow_hosts"]
+    eq "allow block scopes its secret", %w[github.com api.github.com], secret["hosts"]
     eq "the VM receives a fake placeholder", "fake-token", secret["placeholder"]
     eq "the real value remains in the proxy config", "real-token", secret["value"]
     eq "GitHub auth is not implicit", false, cfg["githubAuth"]
@@ -510,8 +492,8 @@ end
 
 group "durable conversations are named and main adopts existing history" do
   Dir.mktmpdir do |root|
-    Reve::Project.init(root)
-    project = Reve::Project.load(root)
+    Leve::Project.init(root)
+    project = Leve::Project.load(root)
     older = File.join(project.sessions_dir, "older.jsonl")
     newer = File.join(project.sessions_dir, "newer.jsonl")
     File.write(older, "")

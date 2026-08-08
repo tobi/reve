@@ -18,9 +18,9 @@ end
 
 group "storage parity: memory vs jsonl" do
   Dir.mktmpdir do |dir|
-    mem = Reve::Storage::Memory.new
+    mem = Leve::Storage::Memory.new
     path = File.join(dir, "s.jsonl")
-    jsonl = Reve::Storage::Jsonl.open(path)
+    jsonl = Leve::Storage::Jsonl.open(path)
     a_m, b_m, c_m = exercise(mem)
     a_j, b_j, c_j = exercise(jsonl)
 
@@ -38,7 +38,7 @@ group "storage parity: memory vs jsonl" do
     eq "custom entry chains to a (branch point)", a_j["id"], c_j["parentId"]
 
     jsonl.close
-    re = Reve::Storage::Jsonl.open(path)
+    re = Leve::Storage::Jsonl.open(path)
     eq "reopen: entries", jsonl.stats["entries"], re.stats["entries"]
     eq "reopen: seq", jsonl.stats["seq"], re.stats["seq"]
     eq "reopen: t1 leaf", c_j["id"], re.lanes.find { _1["lane"] == "t1" }["leafId"]
@@ -52,11 +52,11 @@ end
 group "torn tail is truncated, valid prefix survives" do
   Dir.mktmpdir do |dir|
     path = File.join(dir, "torn.jsonl")
-    s = Reve::Storage::Jsonl.open(path)
+    s = Leve::Storage::Jsonl.open(path)
     e = s.append_entry({ "type" => "message", "message" => { "role" => "user", "content" => [] } }, "main")
     s.close
     File.open(path, "a") { _1.write('{"kind":"entry","id":"broken') } # died mid-write
-    re = Reve::Storage::Jsonl.open(path)
+    re = Leve::Storage::Jsonl.open(path)
     eq "torn line dropped", 1, re.stats["entries"]
     eq "leaf intact", e["id"], re.lanes.find { _1["lane"] == "main" }["leafId"]
     n = re.append_entry({ "type" => "message", "message" => { "role" => "user", "content" => [] } }, "main")
@@ -70,15 +70,15 @@ end
 group "malformed line in the middle is corruption" do
   Dir.mktmpdir do |dir|
     path = File.join(dir, "bad.jsonl")
-    s = Reve::Storage::Jsonl.open(path)
+    s = Leve::Storage::Jsonl.open(path)
     s.append_entry({ "type" => "message", "message" => { "role" => "user", "content" => [] } }, "main")
     s.close
     body = File.read(path)
     File.write(path, body.lines.insert(1, "not json\n").join)
     raised = begin
-      Reve::Storage::Jsonl.open(path)
+      Leve::Storage::Jsonl.open(path)
       false
-    rescue Reve::Storage::Corrupt
+    rescue Leve::Storage::Corrupt
       true
     end
     eq "open rejects", true, raised
@@ -86,7 +86,7 @@ group "malformed line in the middle is corruption" do
 end
 
 group "records never affect the tree" do
-  mem = Reve::Storage::Memory.new
+  mem = Leve::Storage::Memory.new
   exercise(mem)
   tree = mem.find_entries("order" => "oldestFirst")
   eq "every entry has a parent chain to root", true,
@@ -95,12 +95,12 @@ group "records never affect the tree" do
 end
 
 group "single writer: the store Ractor is the only mutator" do
-  st = Reve::Store.spawn(kind: "memory")
-  session = Reve::Session.new(st)
+  st = Leve::Store.spawn(kind: "memory")
+  session = Leve::Session.new(st)
   session.append_message({ "role" => "user", "content" => [{ "type" => "text", "text" => "hi" }] })
   eq "append via ractor", 1, session.stats["entries"]
   from_other_ractor = Ractor.new(st) do |s|
-    sess = Reve::Session.new(s)
+    sess = Leve::Session.new(s)
     sess.append_message({ "role" => "user", "content" => [] })
     sess.stats["entries"]
   end.value

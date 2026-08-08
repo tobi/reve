@@ -11,7 +11,7 @@ participation when conduct is harmful to the community. Enforcement decisions sh
 proportionate, private where possible, and focused on restoring a safe environment.
 
 Report conduct concerns privately to the project owner through
-<https://github.com/tobi/reve/security/advisories/new>. Do not include sensitive personal
+<https://github.com/tobi/leve/security/advisories/new>. Do not include sensitive personal
 information in a public issue.
 
 This policy applies in the repository and in public spaces where someone is representing

@@ -1,0 +1,28 @@
+[package]
+name = "leve_sandbox"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Leve's direct binding to the microsandbox Rust crate"
+license = "MIT"
+
+[lib]
+name = "leve_sandbox"
+crate-type = ["cdylib"]
+
+[dependencies]
+magnus = "0.8"
+rb-sys = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.52", features = ["rt-multi-thread"] }
+
+# Pinned to the exact version the binding was written against. The network
+# crate is a direct dependency because `Rule` (needed to admit gateway DNS
+# under a deny-by-default policy) is not re-exported by `microsandbox`.
+# Cargo unifies both on the same `=0.6.8`, so the types are identical.
+microsandbox = "=0.6.8"
+microsandbox-network = "=0.6.8"
+
+[profile.release]
+opt-level = 2

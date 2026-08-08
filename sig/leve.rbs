@@ -1,0 +1,424 @@
+# Signatures for leve's public surface.
+#
+# Everything that crosses a Ractor boundary is JSON, so most types here are
+# `Hash[String, untyped]` on purpose: that *is* the type. The value of writing
+# them down is the shape of the API — what returns a result hash, what returns
+# an entry, what can be nil — and `rake rbs` keeps them honest.
+
+module Leve
+  VERSION: String
+
+  class RemoteError < StandardError
+  end
+
+  # ── ipc ────────────────────────────────────────────────────────────────
+  module IPC
+    DEFER: Symbol
+
+    def self.encode: (untyped) -> String
+    def self.decode: (String?) -> untyped
+    def self.reply_port: () -> Ractor::Port
+    def self.post: (Ractor | Ractor::Port, untyped) -> nil
+    def self.cast: (Ractor | Ractor::Port, String | Symbol, ?untyped) -> nil
+    def self.call: (Ractor | Ractor::Port, String | Symbol, ?untyped, ?port: Ractor::Port) -> untyped
+    def self.reply: (Ractor::Port?, untyped) -> nil
+    def self.serve: (untyped) { (String, untyped, Ractor::Port?) -> untyped } -> void
+  end
+
+  module Ids
+    def self.entry: () -> String
+    def self.record: () -> String
+    def self.session: () -> String
+    def self.step: () -> String
+    def self.now_ms: () -> Integer
+  end
+
+  # ── storage and session ────────────────────────────────────────────────
+  module Storage
+    class Corrupt < StandardError
+    end
+
+    class Base
+      FORMAT_VERSION: Integer
+
+      attr_reader metadata: Hash[String, untyped]
+
+      def initialize: (?metadata: Hash[String, untyped]) -> void
+      def append_entry: (Hash[String, untyped], String) -> Hash[String, untyped]
+      def append_record: (Hash[String, untyped], ?move_lane: Hash[String, untyped]?) -> Hash[String, untyped]
+      def create_entry_id: () -> String
+      def lanes: () -> Array[Hash[String, untyped]]
+      def create_lane: (String, String?) -> nil
+      def delete_lane: (String) -> nil
+      def move_lane: (String, String?) -> nil
+      def set_name: (String) -> nil
+      def name: () -> String?
+      def set_label: (String, String?) -> nil
+      def label: (String) -> String?
+      def entry: (String) -> Hash[String, untyped]?
+      def find_entries: (?Hash[untyped, untyped]) -> Array[Hash[String, untyped]]
+      def find_entries_on_branch: (?Hash[untyped, untyped]) -> Array[Hash[String, untyped]]
+      def find_records: (?Hash[untyped, untyped]) -> Array[Hash[String, untyped]]
+      def log: (?after_seq: Integer?, ?limit: Integer?) -> Array[Hash[String, untyped]]
+      def stats: () -> Hash[String, untyped]
+    end
+
+    class Memory < Base
+      def self.open: (?String?, ?metadata: Hash[String, untyped]) -> Memory
+    end
+
+    class Jsonl < Base
+      attr_reader path: String
+
+      def self.open: (String, ?metadata: Hash[String, untyped]) -> Jsonl
+      def close: () -> void
+    end
+  end
+
+  module Store
+    def self.spawn: (?kind: String, ?path: String?, ?metadata: Hash[String, untyped]) -> Ractor
+  end
+
+  class Session
+    attr_reader lane: String
+    attr_reader store: Ractor
+
+    def initialize: (Ractor, ?lane: String) -> void
+    def view: (String) -> Session
+    def leaf_id: () -> String?
+    def entry: (String) -> Hash[String, untyped]?
+    def find_entries: (?Hash[untyped, untyped]) -> Array[Hash[String, untyped]]
+    def find_entry: (?Hash[untyped, untyped]) -> Hash[String, untyped]?
+    def find_entries_on_branch: (?Hash[untyped, untyped]) -> Array[Hash[String, untyped]]
+    def find_entry_on_branch: (?Hash[untyped, untyped]) -> Hash[String, untyped]?
+    def path_entries: (?start: String?) -> Array[Hash[String, untyped]]
+    def context_entries: (?start: String?) -> Array[Hash[String, untyped]]
+    def append_entry: (Hash[String, untyped]) -> Hash[String, untyped]
+    def append_message: (Hash[String, untyped]) -> Hash[String, untyped]
+    def append_custom_entry: (String, ?untyped) -> Hash[String, untyped]
+    def append_if_missing: (Hash[String, untyped]) -> Hash[String, untyped]
+    def create_entry_id: () -> String
+    def lanes: () -> Array[Hash[String, untyped]]
+    def append_record: (Hash[String, untyped], ?move_lane: Hash[String, untyped]?) -> Hash[String, untyped]
+    def find_records: (?Hash[untyped, untyped]) -> Array[Hash[String, untyped]]
+    def close: () -> untyped
+  end
+
+  # ── tools ──────────────────────────────────────────────────────────────
+  module Tools
+    MAX_OUTPUT: Integer
+    MAX_OUTPUT_LINES: Integer
+    LOG_DIR: String
+
+    def self.names: () -> Array[String]
+    def self.spec: (String) -> Hash[String, untyped]?
+    def self.replay_of: (String) -> String
+    def self.declarations: (?Array[String]?) -> Array[Hash[String, untyped]]
+    def self.spawn: (String, Hash[String, untyped], String) -> Ractor
+    def self.cancel: (Ractor) -> void
+    def self.invoke: (String, Hash[String, untyped], String, ?(^() -> bool)?) -> Hash[String, untyped]
+    def self.validate: (String, Hash[String, untyped]) -> String?
+    def self.ok: (untyped, ?details: Hash[String, untyped]?) -> Hash[String, untyped]
+    def self.error: (untyped, ?details: Hash[String, untyped]?) -> Hash[String, untyped]
+    def self.overspill: (String, String) -> [String, Hash[String, untyped]?]
+    def self.clip: (String) -> String
+    def self.exec_stream: (String, String, ?timeout: Float, ?cancel: (^() -> bool)?) ?{ (String) -> void } -> Hash[String, untyped]
+  end
+
+
+  module ToolDSL
+    class Definition
+      attr_reader name: String
+      attr_reader handler: Proc?
+
+      def initialize: (String | Symbol) -> void
+      def description: (?String?) -> String
+      def replay: (String | Symbol) -> String
+      def sandbox: (?bool) -> bool
+      def sandboxed?: () -> bool
+      def run: () { (*untyped) -> untyped } -> Proc
+      def keywords?: () -> bool
+      def declaration: () -> Hash[String, untyped]
+    end
+
+    class Context
+      attr_reader sandbox: Sandbox::Client?
+      attr_reader cwd: String
+      attr_reader lane: String
+
+      def sh: (String, ?timeout: Integer) -> String
+      def read: (String) -> String
+      def write: (String, String) -> untyped
+    end
+
+    def self.load_dir: (String) -> Hash[String, untyped]
+    def self.invoke: (Definition, Hash[String, untyped], Context) -> Hash[String, untyped]
+  end
+
+  # ── project ────────────────────────────────────────────────────────────
+  class Project
+    attr_reader root: String
+    attr_reader instructions: String?
+    attr_reader config: Hash[String, untyped]
+    attr_reader tools: Array[ToolDSL::Definition]
+    attr_reader skills: Array[Hash[String, untyped]]
+    attr_reader diagnostics: Array[Hash[String, untyped]]
+    attr_reader sandbox_config: Hash[String, untyped]
+    attr_reader prompt_sources: Array[Hash[String, untyped]]
+
+    def self.load: (?String, ?user_skills: bool) -> Project
+    def self.agent_dir?: (?String) -> bool
+    def self.init: (?String, ?name: String?, ?force: bool, ?update: bool | Array[String]) -> Hash[String, untyped]
+    def initialize: (?String, ?user_skills: bool) -> void
+    def agent?: () -> bool
+    def name: () -> String
+    def sessions_dir: () -> String
+    def latest_session_path: () -> String?
+    def conversation_path: (?String, ?fresh: bool) -> String
+    def tool: (String) -> ToolDSL::Definition?
+    def tool_declarations: () -> Array[Hash[String, untyped]]
+    def system_prompt: (?tools: Array[String]?, ?sandbox: Sandbox::Client?, ?skills: Array[Hash[String, untyped]]) -> String
+  end
+
+  # ── sandbox ────────────────────────────────────────────────────────────
+  module Sandbox
+    DEFAULTS: Hash[String, untyped]
+    APT_PACKAGES: Array[String]
+    MISE_TOOLS: Array[String]
+
+    def self.config: (?Hash[untyped, untyped]?) -> Hash[String, untyped]
+    def self.resolve: (Hash[untyped, untyped], ?warn_io: IO?, ?native: untyped?) -> Client
+    def self.available?: () -> bool
+    def self.load_definition: (String) -> Hash[String, untyped]
+    def self.create_spec: (Hash[String, untyped], String, String, String) -> Hash[String, untyped]
+    def self.network_spec: (Hash[String, untyped]) -> Hash[String, untyped]
+    def self.secret_entries: (Hash[String, untyped]) -> Array[Hash[String, untyped]]
+    def self.provision_script: (Hash[String, untyped]) -> String
+
+    class Client
+      def initialize: (Hash[String, untyped], ?native: untyped?, ?progress: untyped?) -> void
+      def sandbox_name: () -> String
+      def fingerprint: () -> String
+      def reusable?: () -> bool
+      attr_reader config: Hash[String, untyped]
+      attr_reader backend_name: String
+
+      def isolated?: () -> bool
+      def start: () -> Client
+      def exec: (String, ?timeout: Integer, ?cancel: (^() -> bool)?) -> Hash[String, untyped]
+      def read_file: (String) -> String
+      def write_file: (String, String) -> untyped
+      def stop: () -> void
+      def describe: () -> String
+    end
+
+    module HostAuth
+      GITHUB_HOSTS: Array[String]
+
+      def self.github_token: () -> Hash[String, String]?
+      def self.github_secret: (?placeholder: String) -> Hash[String, untyped]?
+    end
+
+    # Defined by the `leve_sandbox` native extension.
+    module Native
+      MICROSANDBOX_VERSION: String
+
+      class Error < StandardError
+      end
+
+      class Unavailable < Error
+      end
+
+      class Failed < Error
+      end
+
+      class BadSpec < Error
+      end
+
+      def self.installed?: () -> bool
+      def self.install: () -> void
+      def self.create: (String) -> Vm
+      def self.start: (String) -> Vm
+      def self.exists?: (String) -> bool
+      def self.running?: (String) -> bool
+      def self.remove: (String) -> void
+      def self.microsandbox_version: () -> String
+
+      class Vm
+        def name: () -> String
+        def exec: (String, String) -> String
+        def shell: (String, String) -> String
+        def exec_session: (String, String) -> Exec
+        def read_file: (String) -> String
+        def write_file: (String, String) -> void
+        def alive?: () -> bool
+        def stop: () -> void
+      end
+
+      class Exec
+        def collect: () -> String
+        def kill: () -> void
+      end
+    end
+
+    module NativeLoader
+      CANDIDATES: Array[String]
+
+      def self.load!: () -> bool
+    end
+
+    class Unavailable < StandardError
+    end
+  end
+
+  module Heartbeat
+    RESPONSE_RULE: String
+    def self.load: (String) -> Array[Hash[String, untyped]]
+    def self.parse_duration: (String) -> Integer
+
+    class Runner
+      def initialize: (Harness, workspace: String, config_path: String,
+                       tasks: Array[Hash[String, untyped]], state_path: String) -> void
+      def start: () -> Runner
+      def stop: () -> untyped
+      def reload_config: () -> untyped
+      def run_due: (?Time) -> untyped
+      def run_task: (Hash[String, untyped]) -> untyped
+      def background_lane?: (String) -> bool
+    end
+  end
+
+  module Channels
+    class Registration
+      attr_reader name: String
+      attr_reader adapter: untyped
+      attr_reader system_prompt: String
+    end
+
+    class Command
+      attr_reader name: String
+      attr_reader description: String
+      attr_reader schema: Hash[untyped, untyped]
+      attr_reader handler: Proc
+    end
+
+    def self.register: (String | Symbol, untyped, ?system_prompt: String?) -> Registration
+    def self.registrations: () -> Array[Registration]
+    def self.system_prompts: () -> Array[String]
+    def self.load_directory: (String) -> Array[untyped]
+
+    class KV
+      def initialize: (String, String | Symbol) -> void
+      def get: (String | Symbol, ?untyped) -> untyped
+      def set: (String | Symbol, untyped) -> untyped
+      def delete: (String | Symbol) -> untyped
+      def to_h: () -> Hash[String, untyped]
+    end
+
+    class Context
+      attr_reader harness: Harness
+      attr_reader project: Project
+      attr_reader name: String
+      attr_reader kv: KV
+      def command: (String | Symbol, description: String, ?schema: Hash[untyped, untyped]) { (Hash[String, untyped]) -> untyped } -> Command
+      def prompt: (String, ?lane: String) -> Hash[String, untyped]
+      def watch: (?String?) -> Watch
+    end
+
+    class Runtime
+      attr_reader harness: Harness
+      attr_reader project: Project
+      def initialize: (Harness, Project, ?reserved: Array[String]) -> void
+      def start: () -> Runtime
+      def close: () -> untyped
+      def register_command: (String | Symbol, description: String, ?schema: Hash[untyped, untyped]) { (Hash[String, untyped]) -> untyped } -> Command
+      def command_names: () -> Array[String]
+      def command_help: () -> Array[Command]
+      def command?: (String | Symbol) -> bool
+      def invoke: (String | Symbol, ?String?) -> untyped
+    end
+  end
+
+  # ── harness ────────────────────────────────────────────────────────────
+  class Harness
+    HOOKS: Array[String]
+
+    attr_reader store: Ractor
+    attr_reader hub: Ractor
+    attr_reader session: Session
+    attr_reader session_path: String?
+    attr_reader conversation_name: String
+    attr_reader config: Hash[String, untyped]
+    attr_reader suspended: Array[Hash[String, untyped]]
+    attr_accessor channel_runtime: Channels::Runtime?
+
+    def self.create: (**untyped) -> [Harness, Array[Hash[String, untyped]]]
+    def lane: (String) -> LaneHandle?
+    def main: () -> LaneHandle
+    def lanes: () -> Array[Hash[String, untyped]]
+    def create_lane: (String, String?) -> Hash[String, untyped]
+    def delete_lane: (String) -> Hash[String, untyped]
+    def prompt: (?String?, ?message: Hash[String, untyped]?, ?content: Array[untyped]?) -> Hash[String, untyped]
+    def steer: (String) -> Hash[String, untyped]
+    def follow_up: (String) -> Hash[String, untyped]
+    def next_run: (String) -> Hash[String, untyped]
+    def abort!: (?String) -> Hash[String, untyped]
+    def resume: () -> Hash[String, untyped]
+    def compact: (?custom_instructions: String?) -> Hash[String, untyped]
+    def state: () -> Hash[String, untyped]
+    def run_skill: (String, ?String?) -> Hash[String, untyped]
+    def on_hook: (String | Symbol) { (Hash[String, untyped]) -> untyped } -> ^() -> untyped
+    def on_event: () { (Hash[String, untyped]) -> void } -> ^() -> untyped
+    def watch: (?String?) -> Watch
+    def watch_session: () -> Watch
+    def model: () -> Hash[String, untyped]
+    def set_model: (String | Hash[String, untyped]) -> Hash[String, untyped]
+    def available_models: (?probe: bool) -> Array[Hash[String, untyped]]
+    def model_completions: (?probe: bool) -> Array[String]
+    def model_catalog_diagnostics: () -> Array[Hash[String, untyped]]
+    def resolve_model: (String) -> Hash[String, untyped]?
+    def start_heartbeat: () -> untyped
+    def background_lane?: (String) -> bool
+    def emit_event: (String, ?Hash[String, untyped]) -> untyped
+    def new_session: () -> [Harness, Array[Hash[String, untyped]]]
+    def agents_md: () -> Array[Hash[String, untyped]]
+    def skills: () -> Array[Hash[String, untyped]]
+    def skill_diagnostics: () -> Array[Hash[String, untyped]]
+    def project: () -> Project?
+    def sandbox: () -> Sandbox::Client?
+    def project_tools: () -> Array[ToolDSL::Definition]
+    def system_prompt: () -> String
+    def close: (?close_sandbox: bool) -> void
+
+    class LaneHandle
+      attr_reader name: String
+
+      def state: () -> Hash[String, untyped]
+      def leaf_id: () -> String?
+      def prompt: (?String?, ?message: Hash[String, untyped]?, ?content: Array[untyped]?) -> Hash[String, untyped]
+      def skill: (String, ?String?) -> Hash[String, untyped]
+      def append_bash: (String, String, Integer) -> Hash[String, untyped]
+      def steer: (String) -> Hash[String, untyped]
+      def follow_up: (String) -> Hash[String, untyped]
+      def next_run: (String) -> Hash[String, untyped]
+      def abort!: (?String) -> Hash[String, untyped]
+      def resume: () -> Hash[String, untyped]
+      def compact: (?custom_instructions: String?) -> Hash[String, untyped]
+      def set_persisted: (String, untyped) -> Hash[String, untyped]
+      def update_runtime: (Hash[String, untyped]) -> Hash[String, untyped]
+      def wait_idle: () -> Hash[String, untyped]
+      def session: () -> Session
+      def close: () -> untyped
+    end
+  end
+
+  class Watch
+    attr_reader snapshot: Hash[String, untyped]
+    attr_reader port: Ractor::Port
+
+    def initialize: (Ractor, ?lane: String?) -> void
+    def each_event: () { (Hash[String, untyped]) -> void } -> void
+    def next_event: () -> Hash[String, untyped]?
+    def close: () -> nil
+  end
+end

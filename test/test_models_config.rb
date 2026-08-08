@@ -3,14 +3,14 @@
 require_relative "helper"
 include TestKit
 
-M = Reve::Provider::Models
+M = Leve::Provider::Models
 
 group "models.yml belongs to the agent directory" do
   Dir.mktmpdir do |root|
     eq "config paths stay inside the agent", [File.join(root, "models.yml")], M.config_paths(root)
     eq "missing models are empty", { "providers" => {} }, M.load(root: root)
 
-    result = Reve::Project.init(root, name: "portable")
+    result = Leve::Project.init(root, name: "portable")
     eq "init writes models.yml", true, result["created"].include?("models.yml")
     eq "models.yml is inside the agent", true, File.file?(File.join(root, "models.yml"))
     config = M.load(root: root)
@@ -47,7 +47,7 @@ end
 group "/model catalog discovery queries every provider" do
   calls = []
   original = M.method(:live_ids)
-  no_probe = ENV.delete("REVE_NO_PROBE")
+  no_probe = ENV.delete("LEVE_NO_PROBE")
   M.define_singleton_method(:live_ids) do |provider, **_options|
     calls << provider["baseUrl"]
     ["live-model"]
@@ -63,7 +63,7 @@ group "/model catalog discovery queries every provider" do
   eq "models JSON accepts id, model, name and strings", %w[a b c d],
      M.model_ids({ "models" => [{ "id" => "a" }, { "model" => "b" }, { "name" => "c" }, "d"] })
 ensure
-  ENV["REVE_NO_PROBE"] = no_probe if no_probe
+  ENV["LEVE_NO_PROBE"] = no_probe if no_probe
   M.define_singleton_method(:live_ids, original)
 end
 
@@ -75,14 +75,14 @@ group "missing and unknown choices fail locally" do
 end
 
 group "provider URLs, API keys and headers resolve only through model construction" do
-  ENV["REVE_TEST_BASE"] = "http://resolved.invalid/v1"
-  ENV["REVE_TEST_KEY"] = "resolved-key"
-  ENV["REVE_TEST_HEADER"] = "resolved-header"
+  ENV["LEVE_TEST_BASE"] = "http://resolved.invalid/v1"
+  ENV["LEVE_TEST_KEY"] = "resolved-key"
+  ENV["LEVE_TEST_HEADER"] = "resolved-header"
   config = { "providers" => { "test" => {
     "api" => "openai-responses",
-    "baseUrl" => "$REVE_TEST_BASE",
-    "apiKey" => "$REVE_TEST_KEY",
-    "headers" => { "X-Resolved" => "$REVE_TEST_HEADER", "X-Literal" => "literal" },
+    "baseUrl" => "$LEVE_TEST_BASE",
+    "apiKey" => "$LEVE_TEST_KEY",
+    "headers" => { "X-Resolved" => "$LEVE_TEST_HEADER", "X-Literal" => "literal" },
     "models" => [{ "id" => "tiny" }]
   } } }
   model = M.resolve(config, "test/tiny", probe: false)
@@ -91,7 +91,7 @@ group "provider URLs, API keys and headers resolve only through model constructi
   eq "env header resolves", "resolved-header", model.dig("headers", "X-Resolved")
   eq "literal header remains literal", "literal", model.dig("headers", "X-Literal")
   eq "missing env name becomes empty", "", M.resolve({ "providers" => { "x" => {
-    "apiKey" => "$REVE_MISSING_KEY", "models" => [{ "id" => "m" }]
+    "apiKey" => "$LEVE_MISSING_KEY", "models" => [{ "id" => "m" }]
   } } }, "x/m", probe: false)["apiKey"]
   eq "literal key remains literal for programmatic configuration", "sk-literal", M.resolve({ "providers" => { "x" => {
     "apiKey" => "sk-literal", "models" => [{ "id" => "m" }]

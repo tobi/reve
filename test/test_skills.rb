@@ -25,7 +25,7 @@ Dir.mktmpdir do |root|
              "Use bin/rails db:migrate.\n")
 
   group "frontmatter parsing" do
-    fm, body = Reve::Frontmatter.parse(<<~MD)
+    fm, body = Leve::Frontmatter.parse(<<~MD)
       ---
       name: thing
       description: >
@@ -43,27 +43,27 @@ Dir.mktmpdir do |root|
     eq "boolean", true, fm["disable-model-invocation"]
     eq "list", %w[a b], fm["tags"]
     eq "body separated", "Body here.\n", body
-    eq "no frontmatter is left alone", [{}, "just text"], Reve::Frontmatter.parse("just text")
+    eq "no frontmatter is left alone", [{}, "just text"], Leve::Frontmatter.parse("just text")
   end
 
   group "discovery is only the VM-editable workspace skills directory" do
-    loaded = Reve::Skills.load(cwd: project)
+    loaded = Leve::Skills.load(cwd: project)
     names = loaded["skills"].map { _1["name"] }.sort
     eq "the local skills are found", %w[db-migrate release-notes], names
     eq "no diagnostics for well-formed skills", [], loaded["diagnostics"]
-    eq "body captured", true, Reve::Skills.find(loaded["skills"], "db-migrate")["body"].include?("db:migrate")
+    eq "body captured", true, Leve::Skills.find(loaded["skills"], "db-migrate")["body"].include?("db:migrate")
     eq "baseDir is the skill directory", true,
-       Reve::Skills.find(loaded["skills"], "db-migrate")["baseDir"].end_with?("db-migrate")
+       Leve::Skills.find(loaded["skills"], "db-migrate")["baseDir"].end_with?("db-migrate")
     eq "the only root is workspace skills",
-       ["workspace/skills"], Reve::Skills::PROJECT_DIRS
+       ["workspace/skills"], Leve::Skills::PROJECT_DIRS
     eq "nothing outside the workspace is searched",
-       [File.join(project, "workspace", "skills")], Reve::Skills.roots(project)
+       [File.join(project, "workspace", "skills")], Leve::Skills.roots(project)
 
     # A skill sitting where another tool would keep it is simply not found.
     FileUtils.mkdir_p(File.join(project, ".pi/skills"))
     skill_file(File.join(project, ".pi/skills"), "outsider", "Should not be discovered.")
     eq "no .pi, no .agents, no $HOME", false,
-       Reve::Skills.load(cwd: project)["skills"].map { _1["name"] }.include?("outsider")
+       Leve::Skills.load(cwd: project)["skills"].map { _1["name"] }.include?("outsider")
   end
 
   group "validation warns, but still loads what it can" do
@@ -72,7 +72,7 @@ Dir.mktmpdir do |root|
     skill_file(bad, "Way-Too-Long-#{"x" * 70}", "fine description")
     skill_file(bad, "verbose", "y" * 1500)
     skill_file(bad, "nodesc", "")
-    loaded = Reve::Skills.load(cwd: root, extra_dirs: [bad])
+    loaded = Leve::Skills.load(cwd: root, extra_dirs: [bad])
     msgs = loaded["diagnostics"].map { _1["message"] }
     eq "name length warned", true, msgs.any? { _1.include?("name exceeds 64") }
     eq "name charset warned", true, msgs.any? { _1.include?("lowercase") }
@@ -86,22 +86,22 @@ Dir.mktmpdir do |root|
     other = File.join(project, "other", "skills")
     FileUtils.mkdir_p(other)
     skill_file(other, "release-notes", "A different release-notes skill.")
-    loaded = Reve::Skills.load(cwd: project, extra_dirs: [other])
-    winner = Reve::Skills.find(loaded["skills"], "release-notes")
+    loaded = Leve::Skills.load(cwd: project, extra_dirs: [other])
+    winner = Leve::Skills.find(loaded["skills"], "release-notes")
     eq "workspace skill wins", true, winner["path"].include?("/proj/workspace/skills/")
     eq "collision reported", true,
        loaded["diagnostics"].any? { _1["type"] == "collision" && _1["path"].include?("/other/") }
   end
 
   group "prompt section is the Agent Skills XML shape" do
-    loaded = Reve::Skills.load(cwd: project)
-    text = Reve::Skills.format_for_prompt(loaded["skills"])
+    loaded = Leve::Skills.load(cwd: project)
+    text = Leve::Skills.format_for_prompt(loaded["skills"])
     eq "opens the block", true, text.include?("<available_skills>")
     eq "names each skill", true, text.include?("<name>db-migrate</name>")
     eq "points at the file", true, text.include?("<location>")
     eq "tells the model how to load it", true, text.include?("read tool")
     hidden = [{ "name" => "x", "description" => "d", "path" => "/p", "disableModelInvocation" => true }]
-    eq "hidden skills are excluded", "", Reve::Skills.format_for_prompt(hidden)
+    eq "hidden skills are excluded", "", Leve::Skills.format_for_prompt(hidden)
   end
 
   group "the harness loads editable skills at the conversation tail" do
@@ -112,7 +112,7 @@ Dir.mktmpdir do |root|
        h.system_prompt.include?("<name>release-notes</name>")
     eq "diagnostics exposed", [], h.skill_diagnostics
     h.prompt("hi")
-    sent = File.readlines("#{ENV["REVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
+    sent = File.readlines("#{ENV["LEVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
     message_text = sent.first["messages"].flat_map { _1["content"] }.filter_map { _1["text"] }.join("\n")
     eq "the provider saw the skills update", true, message_text.include?("<available_skills_update>")
     h.close
@@ -129,7 +129,7 @@ Dir.mktmpdir do |root|
        stable_prompt.include?("new-helper")
 
     h.prompt("first turn")
-    requests = File.readlines("#{ENV["REVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
+    requests = File.readlines("#{ENV["LEVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
     first_text = requests.first["messages"].flat_map { _1["content"] }.map { _1["text"] }.join("\n")
     eq "the current workspace catalog is exposed to the model", true,
        first_text.include?("<name>new-helper</name>")
@@ -137,19 +137,19 @@ Dir.mktmpdir do |root|
 
     skill_file(dynamic_root, "new-helper", "Handle the revised workflow.", "Version two.\n")
     h.prompt("second turn")
-    requests = File.readlines("#{ENV["REVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
+    requests = File.readlines("#{ENV["LEVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
     second_text = requests.last["messages"].flat_map { _1["content"] }.map { _1["text"] }.join("\n")
     eq "a changed file reloads the catalog", true, second_text.include?("revised workflow")
     eq "the cached system prompt remains byte-identical", stable_prompt, requests.last["system"]
 
     h.prompt("third turn")
-    requests = File.readlines("#{ENV["REVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
+    requests = File.readlines("#{ENV["LEVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
     newest = requests.last["messages"].last["content"].map { _1["text"] }.join("\n")
     eq "an unchanged catalog is not injected again", false, newest.include?("available_skills_update")
 
     File.write(File.join(dynamic_root, "new-helper", "template.txt"), "changed support file")
     h.prompt("fourth turn")
-    requests = File.readlines("#{ENV["REVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
+    requests = File.readlines("#{ENV["LEVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
     newest = requests.last["messages"].last["content"].map { _1["text"] }.join("\n")
     eq "a non-SKILL file change also reloads and announces the catalog", true,
        newest.include?("available_skills_update")
@@ -170,7 +170,7 @@ Dir.mktmpdir do |root|
     ])
     h, = test_harness(storage: "memory", model: model, cwd: project)
     h.prompt("learn a skill")
-    requests = File.readlines("#{ENV["REVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
+    requests = File.readlines("#{ENV["LEVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
     second_text = requests.last["messages"].flat_map { _1["content"] }.map { _1["text"] }.join("\n")
     eq "the next model request sees the new skill", true, second_text.include?("<name>live-skill</name>")
     eq "the harness reloaded it in the same turn", true, !h.skill("live-skill").nil?

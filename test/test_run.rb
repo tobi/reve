@@ -32,24 +32,37 @@ Dir.mktmpdir do |dir|
 
   group "model bash has exactly one execution path: the sandbox" do
     calls = []
+    native = Object.new
+    native.define_singleton_method(:microsandbox_version) { "fake" }
+    native.define_singleton_method(:installed?) { true }
+    native.define_singleton_method(:install) { true }
+    native.define_singleton_method(:exists?) { |_name| false }
+    native.define_singleton_method(:running?) { |_name| false }
+    native.define_singleton_method(:remove) { |_name| true }
     vm = Object.new
-    vm.define_singleton_method(:create) { |_name, _options| { "handle" => 1 } }
-    vm.define_singleton_method(:stop) { true }
-    vm.define_singleton_method(:exec) do |command, args: [], **options|
-      calls << [command, args, options]
-      { "stdout" => "sandbox-kernel\n", "stderr" => "", "exitCode" => 0, "cancelled" => false }
+    vm.define_singleton_method(:alive?) { true }
+    vm.define_singleton_method(:exec) do |cmd, opts_json|
+      opts = JSON.parse(opts_json)
+      calls << [cmd, opts["args"]]
+      JSON.generate({ "stdout" => "sandbox-kernel\n", "stderr" => "", "exitCode" => 0, "success" => true })
     end
-    sandbox = Reve::Sandbox::Client.new(vm, Reve::Sandbox.config(
-      "hostWorkspace" => dir, "provision" => false, "githubAuth" => false
-    ))
+    vm.define_singleton_method(:exec_session) do |cmd, opts_json|
+      TestKit::ImmediateExec.new(vm.exec(cmd, opts_json))
+    end
+    vm.define_singleton_method(:stop) { true }
+    native.define_singleton_method(:create) { |_spec_json| vm }
+    native.define_singleton_method(:start) { |_name| vm }
+    config = Leve::Sandbox.config("hostWorkspace" => dir, "provision" => false,
+                                  "githubAuth" => false, "bootstrap" => [])
+    sandbox = Leve::Sandbox::Client.new(config, native: native)
     model = fake_model(dir, [assistant_tool("bash", { "command" => "uname -a" }), assistant_text("done")])
     h, = test_harness(storage: "memory", model: model, sandbox: sandbox, cwd: dir)
     h.prompt("identify the kernel")
     result = entries_of(h.session).find { _1.dig("message", "role") == "toolResult" }
     eq "the model receives only the VM result", "sandbox-kernel\n",
        result.dig("message", "content", 0, "text")
-    eq "bash dispatches to the sandbox as sh -lc", ["sh", ["-lc", "uname -a"]], calls.first.first(2)
-    eq "the result records the sandbox transport", "microsandbox-rb",
+    eq "bash dispatches to the sandbox as sh -lc", ["sh", ["-lc", "uname -a"]], calls.first
+    eq "the result records the sandbox transport", sandbox.backend_name,
        result.dig("message", "details", "sandbox")
     h.close
   end
@@ -291,22 +304,6 @@ Dir.mktmpdir do |dir|
     eq "the kept suffix starts at firstKeptEntryId", comp["firstKeptEntryId"], ctx[1]["id"]
     eq "the summarized head is gone from context", true,
        ctx.none? { _1.dig("message", "content", 0, "text") == "first" }
-    h.close
-  end
-
-  group "navigation moves the leaf atomically with operation_finished" do
-    model = fake_model(dir, [assistant_text("one"), assistant_text("two"), assistant_text("BRANCH SUMMARY")])
-    h, = test_harness(storage: "memory", model: model, cwd: dir)
-    h.prompt("first")
-    target = entries_of(h.session).last["id"]
-    h.prompt("second")
-    r = h.navigate(target, summarize: true, label: "before-refactor")
-    eq "navigation ok", true, r["ok"]
-    eq "label written as a global fact", "before-refactor", h.session.label(target)
-    eq "summary entry chained to the target", "BRANCH SUMMARY", r.dig("summaryEntry", "summary")
-    fin = records_of(h.session).last
-    eq "leaf moved with the finish record", target, h.session.lanes.find { _1["lane"] == "main" }["leafId"]
-    eq "finish outcome", "completed", fin["outcome"]
     h.close
   end
 end

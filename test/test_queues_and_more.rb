@@ -74,7 +74,7 @@ Dir.mktmpdir do |dir|
     h, = test_harness(storage: "memory", model: model, cwd: dir)
     h.prompt("list the dir")
     forked = File.join(dir, "forked.jsonl")
-    Reve::Fork.to_file(h.session, forked)
+    Leve::Fork.to_file(h.session, forked)
     lines = File.readlines(forked).map { JSON.parse(_1) }
     eq "no records were copied", 0, lines.count { _1["kind"] == "record" }
     eq "entries were copied", 4, lines.count { _1["kind"] == "entry" }
@@ -113,12 +113,12 @@ Dir.mktmpdir do |dir|
   end
 
   group "tool declarations and replay safety are declared, not guessed" do
-    eq "read is replay-safe", "safe", Reve::Tools.replay_of("read")
-    eq "bash is never replayed", "never", Reve::Tools.replay_of("bash")
+    eq "read is replay-safe", "safe", Leve::Tools.replay_of("read")
+    eq "bash is never replayed", "never", Leve::Tools.replay_of("bash")
     eq "every tool has a schema", true,
-       Reve::Tools.declarations.all? { _1["parameters"]["type"] == "object" }
+       Leve::Tools.declarations.all? { _1["parameters"]["type"] == "object" }
     eq "the registry is shareable across Ractors", true,
-       Ractor.new { Reve::Tools.names.size }.value == Reve::Tools.names.size
+       Ractor.new { Leve::Tools.names.size }.value == Leve::Tools.names.size
   end
 end
 

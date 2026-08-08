@@ -1,9 +1,9 @@
-# Reve
+# Leve
 
-[![CI](https://github.com/tobi/reve/actions/workflows/ci.yml/badge.svg)](https://github.com/tobi/reve/actions/workflows/ci.yml)
+[![CI](https://github.com/tobi/leve/actions/workflows/ci.yml/badge.svg)](https://github.com/tobi/leve/actions/workflows/ci.yml)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Reve is a Ruby environment for building durable coding agents. Its central idea is:
+Leve is a Ruby environment for building durable coding agents. Its central idea is:
 
 > **The directory is the agent.**
 
@@ -14,18 +14,19 @@ agent.
 
 ## Philosophy
 
-Reve combines three ideas:
+Leve combines three ideas:
 
 1. **Ruby is the agent language.** An agent's configuration and project tools are ordinary,
    readable Ruby. Ractors isolate concurrent lanes, while a small channel boundary keeps
    the durable core independent from the terminal UI.
 2. **The environment is a real sandbox.** Every model-authored command, context command,
-   and interactive `!command` runs in a full microVM—never in a host-shell fallback. Reve
-   uses the community Ruby port [`microsandbox-rb`](https://github.com/ya-luotao/microsandbox-rb),
-   built on [microsandbox](https://github.com/superradcompany/microsandbox). The host only
-   orchestrates; the agent works inside its mounted `workspace/` with deny-by-default
-   networking and explicitly scoped secrets.
-3. **State is durable data, not process memory.** Reve's append-only conversation tree and
+   and interactive `!command` runs in a full microVM—never in a host-shell fallback. Leve
+   ships its own native extension, `ext/leve_sandbox`, which binds the official
+   [`microsandbox`](https://github.com/superradcompany/microsandbox) Rust crate (pinned
+   `=0.6.8`) directly. There is no Ruby gem dependency for the sandbox at all: the crate is
+   compiled into the gem's extension. The host only orchestrates; the agent works inside its
+   mounted `workspace/` with deny-by-default networking and explicitly scoped secrets.
+3. **State is durable data, not process memory.** Leve's append-only conversation tree and
    intent-before-effect records are based on the durable harness work in
    [Pi](https://github.com/badlogic/pi-mono). A crash can leave an incomplete operation,
    but not an ambiguous one: recovery has the identifiers and intent needed to reconcile
@@ -35,14 +36,14 @@ The result is an agent you can inspect with normal filesystem and Ruby tools, co
 an operating environment, stop at any moment, and resume without pretending the
 interruption never happened.
 
-There is no machine-wide Reve profile, home-directory prompt, global model file, or session
+There is no machine-wide Leve profile, home-directory prompt, global model file, or session
 store outside the agent directory.
 
 ## Ractors are the runtime architecture
 
 Ractors are not a decorative implementation detail. The main Ractor owns trusted Ruby
 configuration, channel adapters, hooks, project-tool blocks, and the live microVM handle.
-Around it Reve creates:
+Around it Leve creates:
 
 - **One store Ractor**, the only object allowed to mutate a session.
 - **One observer Ractor**, which atomically snapshots and subscribes channels to ordered
@@ -61,32 +62,40 @@ isolate ownership and concurrent work.
 Requirements:
 
 - Ruby 4.0 or newer.
-- Linux with KVM, or macOS on Apple Silicon, as required by `microsandbox-rb`.
-- Network access on first use to install the embedded microsandbox runtime and pull the VM
-  image. A source-gem install may additionally require Rust 1.91 or newer when no
-  precompiled native gem exists for the platform.
+- Linux with KVM, or macOS on Apple Silicon, as required by the embedded microsandbox
+  runtime.
+- Network access on first use to fetch the microsandbox runtime and firmware once into
+  `~/.microsandbox` and pull the VM image.
+- A Rust toolchain (>= 1.91) to build the `ext/leve_sandbox` native extension when
+  installing from source (a precompiled platform gem needs none).
 
 ```bash
-gem install reve-agent  # installs the `reve` executable
+gem install leve            # installs the `leve` executable
 mkdir my-agent && cd my-agent
-reve init
+leve init
 export OPENAI_API_KEY=...
 ./agent.rb
 ```
 
-The RubyGems package is named `reve-agent` because the `reve` package name belongs to an
-unrelated project. It installs the `reve` executable and `Reve` Ruby namespace.
-
 The first launch builds and provisions the microVM and shows live startup progress. Later
 launches restart its persisted root disk.
+
+When working from a source checkout instead, build the extension first and run through the
+in-repo launcher:
+
+```bash
+bundle install
+rake compile               # builds ext/leve_sandbox against the pinned microsandbox crate
+bundle exec bin/leve
+```
 
 ## Agent directory
 
 ```text
-reve/                         the agent root
+leve/                         the agent root
 ├── instructions.md            identity, purpose, and standing instructions
 ├── models.yml                 provider and model configuration owned by this agent
-├── agent.rb                   executable configuration DSL (`./agent.rb` launches Reve)
+├── agent.rb                   executable configuration DSL (`./agent.rb` launches Leve)
 ├── channels/
 │   └── tui.rb                 default inline terminal adapter; add more files here
 ├── tools/
@@ -101,7 +110,7 @@ reve/                         the agent root
 │   ├── knowledge/             mutable durable facts
 │   ├── notes/                 append-only daily narrative
 │   └── skills/                all skills, including heartbeat authoring guidance
-└── .reve/
+└── .leve/
     ├── sessions/              JSONL durable session logs
     └── logs/                  oversized tool output
 ```
@@ -109,14 +118,11 @@ reve/                         the agent root
 Create the complete structure in the current directory and launch it:
 
 ```bash
-reve init .
+leve init .
 ./agent.rb
 ```
 
-When working from a source checkout instead, use `bundle install` and
-`bundle exec bin/reve`.
-
-`reve init` is idempotent. It never writes to `$HOME`, a global cache, or another
+`leve init` is idempotent. It never writes to `$HOME`, a global cache, or another
 project. `models.yml` is copied into the new root and becomes the only model configuration
 that this agent reads. The generated `channels/tui.rb` is the default terminal adapter;
 see [`examples/telegram.rb`](examples/telegram.rb) for a complete file-drop channel with
@@ -124,9 +130,9 @@ commands, KV state, system-message guidance, polling, pairing, and rich streamin
 
 The launcher refuses to run in a directory that is not an agent. This prevents an agent
 from silently attaching itself to an arbitrary checkout. The only durable paths are under
-the agent root, and `--session` is rejected when it points outside `.reve/sessions`.
-Launching `reve` reopens the named `main` conversation by default (adopting the newest
-legacy session on first use). `reve -c research` opens another persistent named
+the agent root, and `--session` is rejected when it points outside `.leve/sessions`.
+Launching `leve` reopens the named `main` conversation by default (adopting the newest
+legacy session on first use). `leve -c research` opens another persistent named
 conversation. Use `/new` to rotate the selected conversation to a fresh durable session
 without rebooting the microVM.
 
@@ -137,7 +143,7 @@ without rebooting the microVM.
 `agent.rb` selects the model and thinking level; `instructions.md` holds the prose identity:
 
 ```ruby
-#!/usr/bin/env reve
+#!/usr/bin/env leve
 
 agent do
   model "openai/gpt-5.6-luna"
@@ -180,7 +186,7 @@ tool "release_report" do
 end
 ```
 
-Restart Reve and the model immediately sees the generated JSON schema for
+Restart Leve and the model immediately sees the generated JSON schema for
 `release_report`. The Ruby block remains in the trusted host Ractor, while every `ctx.sh`
 command still runs in the mandatory microVM. A file can define multiple tools and use any
 Ruby standard-library logic needed to implement a complex integration.
@@ -188,8 +194,8 @@ Ruby standard-library logic needed to implement a complex integration.
 ### Give the VM narrowly scoped GitHub access
 
 `sandbox.rb` is ordinary Ruby. This policy allows GitHub egress and lends a token only to
-those hosts. The VM sees `reve-github-token`; microsandbox substitutes the real value at
-the network boundary:
+those hosts. The VM sees `leve-github-token`; the microsandbox runtime substitutes the real
+value at the network boundary:
 
 ```ruby
 sandbox do
@@ -200,21 +206,21 @@ sandbox do
   allow "github.com", "api.github.com" do
     secret "GITHUB_TOKEN",
            value: ENV.fetch("GITHUB_TOKEN"),
-           placeholder: "reve-github-token"
+           placeholder: "leve-github-token"
   end
 end
 ```
 
 There is no `host-exec`, and omitting the token does not create an invisible host fallback.
 `gh auth login` may keep its token only in the operating-system keyring; export it before
-launching Reve when needed:
+launching Leve when needed:
 
 ```bash
 export GITHUB_TOKEN="$(gh auth token --hostname github.com)"
 ./agent.rb
 ```
 
-Reve itself never executes that host command.
+Leve itself never executes that host command.
 
 ### Stop and resume durable work
 
@@ -230,7 +236,7 @@ $ ./agent.rb -c migration
 ```
 
 Tool intent, result IDs, queue state, and the conversation branch are persisted under
-`.reve/sessions/`; recovery does not depend on the original Ruby process surviving.
+`.leve/sessions/`; recovery does not depend on the original Ruby process surviving.
 
 ### Schedule background maintenance
 
@@ -265,12 +271,12 @@ description: Review a change for correctness, durability, and sandbox escapes.
 Read the diff, run focused tests, and report findings before proposing edits.
 ```
 
-Reve fingerprints the complete skill directory and exposes changes at the next turn
+Leve fingerprints the complete skill directory and exposes changes at the next turn
 boundary without rewriting the stable system prompt.
 
 ## Channels are file-drop adapters
 
-Reve ships an inline terminal channel, but the observer boundary makes new channels
+Leve ships an inline terminal channel, but the observer boundary makes new channels
 trivial to add. Every `channels/*.rb` file loads before Ractors spawn. A channel may:
 
 - Subscribe to atomic snapshots plus ordered live events.
@@ -278,22 +284,22 @@ trivial to add. Every `channels/*.rb` file loads before Ractors spawn. A channel
 - Register new `/commands` with JSON-object arguments. Built-in names such as `/state` or
   the `/quit` alias `/q` are reserved: registering one raises at startup instead of
   producing a command that `/help` advertises and never dispatches.
-- Persist host-side credentials and cursors in a namespaced `.reve/channels.json` KV store.
+- Persist host-side credentials and cursors in a namespaced `.leve/channels.json` KV store.
 - Append stable channel-style guidance to the system message.
 
 The default TUI does not use an alternate screen buffer. Output stays in normal terminal
 scrollback, while one owned input line is hidden, printed above, and redrawn after every
 event. This keeps command history, copy/paste, and terminal scrollback useful.
 
-The library renderer is `Reve::InteractiveAgentTUI`. The generated `channels/tui.rb` is a
+The library renderer is `Leve::InteractiveAgentTUI`. The generated `channels/tui.rb` is a
 visitor adapter, not a second renderer:
 
 ```ruby
-module Reve
+module Leve
   module Channels
     class TUI
       def initialize(harness, suspended, lane: "main")
-        @renderer = Reve::InteractiveAgentTUI.new(harness, suspended, lane: lane)
+        @renderer = Leve::InteractiveAgentTUI.new(harness, suspended, lane: lane)
       end
 
       def visit(event) = @renderer.render(event)
@@ -322,7 +328,7 @@ cp examples/telegram.rb /path/to/my-agent/channels/telegram.rb
 From the installed gem:
 
 ```bash
-GEM_DIR="$(ruby -e 'print Gem::Specification.find_by_name("reve-agent").gem_dir')"
+GEM_DIR="$(ruby -e 'print Gem::Specification.find_by_name("leve").gem_dir')"
 cp "$GEM_DIR/examples/telegram.rb" /path/to/my-agent/channels/telegram.rb
 cd /path/to/my-agent
 ./agent.rb
@@ -358,7 +364,7 @@ thinking  →  tools  →  answering  →  done
 
 It opens a private `Working…` rich draft, adds live tool summaries, streams answer text,
 and persists the final rich message. Late events cannot move the renderer backward. The
-bot token, pairing ID, and update cursor remain host-side in `.reve/channels.json`; they
+bot token, pairing ID, and update cursor remain host-side in `.leve/channels.json`; they
 never enter `workspace/` or the microVM.
 
 The host Ractor owns the terminal entry box and renderer. Lane Ractors own durable work.
@@ -374,7 +380,7 @@ flowchart LR
   L -->|JSON events| O[observer hub Ractor]
   O --> C
   L --> S[store Ractor]
-  S --> J[(agent/.reve/sessions/*.jsonl)]
+  S --> J[(agent/.leve/sessions/*.jsonl)]
 ```
 
 Useful commands include:
@@ -395,16 +401,16 @@ Useful commands include:
 ## Background heartbeats
 
 `workspace/HEARTBEAT.yml` declares periodic tasks that run in unattached durable lanes
-while the `main` conversation is open. Reve fingerprints and reloads the file every
+while the `main` conversation is open. Leve fingerprints and reloads the file every
 scheduler scan. Each task selects a model and lane, chooses whether to continue that
 lane, and may run a `vm-exec` prerequisite. A nonzero prerequisite skips the model turn
 and is logged. Host execution is deliberately unsupported.
 
 The model must return exactly `SILENCE`, `Message: one paragraph`, or `Steer: command`.
 Messages and steering are durably queued into main; malformed output is reported as a
-heartbeat error. Before each run, Reve refreshes
+heartbeat error. Before each run, Leve refreshes
 `workspace/RECENT_CONVERSATIONS.md` from a bounded tail of main's durable context, so
-`DREAM.md` can consolidate recent work without mounting `.reve/` in the VM. The generated
+`DREAM.md` can consolidate recent work without mounting `.leve/` in the VM. The generated
 `heartbeat` skill documents every option.
 
 ## Durable architecture
@@ -426,7 +432,7 @@ flowchart TB
   end
   Store[one store Ractor]
   Hub[observer hub Ractor]
-  Files[(agent/.reve/sessions)]
+  Files[(agent/.leve/sessions)]
   Tools[tool Ractors]
   Provider[provider stream]
 
@@ -450,34 +456,52 @@ own operation, queue, abort, retry, compaction, and recovery state.
 
 ## Mandatory sandbox and dynamic skills
 
-Reve depends on `microsandbox-rb`. There is no local mode, CLI transport, Fiddle fallback,
-or host shell: if the gem or embedded runtime cannot boot the configured VM, Reve refuses
-to start. Model `bash`, project `ctx.sh`, and user `!command` all execute through the same
-live VM handle. `workspace/` is the only writable bind mount; host-side file helpers are
-strictly confined to that bind source, including symlink resolution. GitHub hosts are
-allowed by default, but credentials are never borrowed implicitly. `allow ... do;
-secret ...; end` explicitly scopes placeholder substitution to named hosts.
+Leve ships `ext/leve_sandbox`, its own native extension (built with magnus and rb-sys)
+that binds the official `microsandbox` Rust crate (pinned `=0.6.8`) directly. The crate is
+compiled into the gem's extension, so there is no Ruby gem dependency for the sandbox at
+all. There is no local mode, no CLI transport, no Fiddle path, and no host-shell fallback:
+if the extension or the microVM cannot start, Leve refuses to run. Model `bash`, project
+`ctx.sh`, and user `!command` all execute through the same live VM handle. `workspace/` is
+the only writable bind mount; host-side file helpers are strictly confined to that bind
+source, including symlink resolution. GitHub hosts are allowed by default, but credentials
+are never borrowed implicitly. `allow ... do; secret ...; end` explicitly scopes placeholder
+substitution to named hosts: the guest sees only the placeholder, and the real value is
+injected into requests to those hosts at the network boundary.
 
-The first launch creates and provisions a VM. Clean shutdown stops it but preserves its
-root disk and definition; later launches restart that named VM instead of reinstalling
-APT and language tools. Node is installed through mise; ast-grep uses npm because mise's
-aqua backend still queries GitHub's unauthenticated, rate-limited releases API. A sandbox policy or toolchain change
+Egress is deny-by-default. The policy is built inside the extension: it starts from
+`NetworkPolicy::none()` (deny in both directions), admits exactly one narrow gateway-DNS
+rule so names can resolve at all, and then adds one allow rule per host named by `allow`.
+Nothing on the Ruby side can widen that to "public". Verified live against a real microVM:
+`github.com` is reachable, and an unlisted host is blocked.
+
+The `sandbox.rb` DSL is unchanged from its predecessor except that `allow_all` and
+`backend` are gone. A sandbox that can reach everything is not a sandbox, and there is
+exactly one backend — the in-repo `ext/leve_sandbox` binding. The remaining vocabulary is
+`image`, `cpus`, `memory`, `name`, `workdir`, `packages`, `mise`, `npm`, `provision`,
+`mount_workspace`, `env`, `bootstrap`, `allow`, `github_auth`, and `secret`.
+
+The microsandbox runtime and firmware are fetched once into `~/.microsandbox` on first use
+(`Leve::Sandbox::Native.install`). The first launch then creates and provisions a VM from
+the configured image. Clean shutdown stops it but preserves its root disk and definition;
+later launches restart that named VM instead of reinstalling APT and language tools. Node
+is installed through mise; ast-grep uses npm because mise's aqua backend still queries
+GitHub's unauthenticated, rate-limited releases API. A sandbox policy or toolchain change
 intentionally replaces and reprovisions it. Before the TUI appears, a live startup spinner
 names image/VM creation, APT/mise provisioning, and each bootstrap stage, then reports
-elapsed time. Reve also avoids model-endpoint discovery during startup.
+elapsed time. Leve also avoids model-endpoint discovery during startup.
 
-At every run boundary Reve rereads full `workspace/AGENTS.md`, full
+At every run boundary Leve rereads full `workspace/AGENTS.md`, full
 `workspace/SOUL.md`, and the first 100 lines of `workspace/KNOWLEDGE.md`. They enter the
 durable turn context rather than the stable system prefix, so edits apply immediately
 without destroying prompt-cache continuity across tool steps.
 
 All skills live in VM-editable `workspace/skills/` and are fingerprinted at each turn
 boundary. When any file there changes,
-Reve reloads the catalog and prepends an `<available_skills_update>` to the new user turn.
+Leve reloads the catalog and prepends an `<available_skills_update>` to the new user turn.
 This exposes newly created skills to modern models without rewriting the system prompt and
 invalidating its cached prefix.
 
-For the same reason, Reve watches provider cache usage. A normal request with more than
+For the same reason, Leve watches provider cache usage. A normal request with more than
 30% uncached input emits a visible cache-miss warning. The first request in a session and
 compaction requests are exempt because their cold prefixes are expected.
 
@@ -493,15 +517,15 @@ hardcoded model ids. Discovery failures are printed with provider, URL, HTTP sta
 the complete response body; static declarations remain available. Provider request
 configuration errors are returned in-band with provider/model and resolved environment
 context rather than faulting a lane. No model file is read from `$HOME` or from a global
-Reve directory.
+Leve directory.
 
-The project uses `openai-responses`, `anthropic-messages`, and a scripted `fake` provider
-for deterministic tests. Provider-specific differences live in each provider's `compat`
-block rather than in scattered conditionals.
+The project uses three providers: `openai-responses`, `anthropic-messages`, and a
+scripted `fake` provider for deterministic tests. Provider-specific differences live in
+each provider's `compat` block rather than in scattered conditionals.
 
 ## Durable records
 
-Sessions are append-only JSONL under `.reve/sessions/`:
+Sessions are append-only JSONL under `.leve/sessions/`:
 
 ```jsonl
 {"kind":"header","version":4,"id":"...","cwd":"workspace"}
@@ -520,12 +544,12 @@ current declarations say `safe`; effectful tools receive a synthetic interrupted
 
 ```bash
 bin/test                 # every test file in its own process
+rake compile             # build the ext/leve_sandbox native extension
 rake lint                # syntax-check the project
 rake test                # run the complete suite
-rake rbs                 # validate signatures when RBS is available
-bin/reve --version
+bin/leve --version
 ```
 
-The repository itself is also an ordinary Reve agent folder for development purposes.
+The repository itself is also an ordinary Leve agent folder for development purposes.
 Tests create isolated temporary agent folders and fake providers; they do not consult a
 user profile or write persistent state outside their fixture folder.

@@ -7,9 +7,9 @@ require_relative "helper"
 require "json"
 include TestKit
 
-script = JSON.parse(File.read(ENV.fetch("REVE_FAKE_SCRIPT")))
-session_path = ENV.fetch("REVE_SESSION")
-prompt = ENV.fetch("REVE_PROMPT")
+script = JSON.parse(File.read(ENV.fetch("LEVE_FAKE_SCRIPT")))
+session_path = ENV.fetch("LEVE_SESSION")
+prompt = ENV.fetch("LEVE_PROMPT")
 
 crash_at =
   if script["crashAfterAccept"] then { "site" => "after_accept" }

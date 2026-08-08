@@ -1,9 +1,11 @@
-# Reve coding agent in pure Ruby, on Ractors
+# Leve coding agent in pure Ruby, on Ractors
 
 Implementation plan. The durable-harness design it follows is documented by Pi at
 [harness-v2.md](https://github.com/earendil-works/pi/blob/main/packages/agent/docs/harness-v2.md);
-this document maps it onto Ruby 4 Ractors and records what we build, in which order, and
-what we deliberately leave out.
+this document maps it onto Ruby 4 Ractors and records what was built and what was
+deliberately left out.
+
+Leve is a rewrite of the earlier reve project as a fresh 0.1.0.
 
 ## 0. Why Ractors
 
@@ -52,13 +54,13 @@ runtime. Records and entries are JSON on the wire and JSON on disk — one repre
 | lane (leaf + op log + queues) | one `lane` Ractor per lane name; leaf persisted in store |
 | lanes run in parallel | real parallelism; they meet only on the store's command port |
 | `prompt/steer/abort/resume` | commands sent to the lane Ractor; results returned on a reply Port |
-| queues + deferred writes | a `Queue` inside the lane Ractor, fed by its control thread, drained at checkpoints — durable first via `queue_enqueued` / `write_deferred` records |
+| queues + writes | a `Queue` inside the lane Ractor, fed by its control thread, drained at checkpoints — durable first via `queue_enqueued` records |
 | abort signal | `AbortFlag` (a mutex-free boolean + generation) inside the lane Ractor |
 | hooks (awaited) | RPC from lane → host Port; host runs handlers in registration order, replies JSON |
 | events (passive) | fire-and-forget JSON to the observer hub |
 | `watch()` snapshot + gapless stream | the hub is single-threaded: it mirrors lane state from the event stream, so "capture snapshot + register port" is one atomic hub operation. The Port itself is the buffer; `start` is the consumer's first `receive` |
 | tools | one Ractor per call: args JSON in, result JSON out, no shared state |
-| telemetry | `reve.*`-shaped span events on a separate hub topic |
+| telemetry | `leve.*`-shaped span events on a separate hub topic |
 
 Things a Ractor forces us to do differently, all improvements:
 
@@ -71,71 +73,101 @@ Things a Ractor forces us to do differently, all improvements:
 
 ## 2. Deliverables
 
+What actually exists in `lib/leve/` today:
+
 ```
-lib/reve/
-  ipc.rb            Port helpers, JSON codec, request/reply, ractor-local reply ports
-  ids.rb            entry/record/run id allocation
-  records.rb        record + entry constructors and the record catalog (§5)
-  storage/base.rb   in-memory core: entries, records, lanes, facts, one seq
-  storage/memory.rb reference backend
-  storage/jsonl.rb  one file per session, one line per mutation, torn-tail truncation
-  store.rb          the store Ractor + client proxy (SessionTree/Session API, §12)
-  observer.rb       event hub, lane mirrors, snapshots (§9, §10)
-  hooks.rb          host-side hook registry + lane-side RPC caller (§11)
-  agent_loop.rb     streamAssistant / prepare|execute|finalize tool call / batch (§14)
-  lane.rb           run, compaction, navigation procedures; checkpoints; recovery (§15, §7)
-  harness.rb        create/restore, lane management, global config (§8)
-  provider/         models.yml loading, anthropic-messages SSE, fake provider (§16)
-  tools/            bash, read, write, edit, ls, grep, glob
-  tui.rb            streaming renderer + slash commands
-bin/reve         CLI entry
-test/               parity + crash-site tests (§20)
+lib/leve/
+  version.rb            Leve::VERSION (0.1.0)
+  ipc.rb                Port helpers, JSON codec, request/reply, ractor-local reply ports
+  ids.rb                entry/record/run id allocation
+  records.rb            record + entry constructors and the record catalog
+  storage/base.rb       in-memory core: entries, records, lanes, facts, one seq
+  storage/memory.rb     reference backend
+  storage/jsonl.rb      one file per session, one line per mutation, torn-tail truncation
+  store.rb              the store Ractor + client proxy (SessionTree/Session API)
+  observer.rb           event hub, lane mirrors, snapshots
+  context.rb            workspace context assembly (AGENTS/SOUL/KNOWLEDGE)
+  agents_md.rb          static AGENTS.md discovery from repo root down, nested on first touch
+  frontmatter.rb        SKILL.md frontmatter parsing + validation
+  skills.rb             skill discovery, catalog, reload, /skill
+  prompt.rb             system prompt + skills XML section assembly
+  compaction.rb         cut point, structured summary, previous-summary updates
+  lane.rb               run, compaction, checkpoints, recovery, steering, follow-ups
+  harness.rb            create/restore, lane management, global config
+  agent_loop.rb         streamAssistant / prepare|execute|finalize tool call / batch
+  tools.rb              tool registry + batch driver
+  tool_dsl.rb           the `tool … do … end` DSL, JSON schema generation
+  project.rb            agent-directory bootstrap, `leve init`, launcher guard
+  heartbeat.rb          durable scheduled lanes, HEARTBEAT.yml reload
+  provider.rb           provider dispatch + compat
+  provider/http.rb      shared HTTP client
+  provider/messages.rb  message-shape normalization
+  provider/usage.rb     token usage / cache accounting
+  provider/thinking.rb  reasoning-effort handling
+  provider/anthropic.rb anthropic-messages provider
+  provider/openai_responses.rb openai-responses provider
+  provider/fake.rb      scripted fake provider for deterministic tests
+  provider/models.rb    models.yml loading, /model, live discovery
+  sandbox.rb            sandbox policy DSL, provisioning, the Client
+  sandbox/native.rb     loads ext/leve_sandbox, fails closed with an instruction
+  sandbox/host_auth.rb  explicit env-var credential reading, host-scoped secret entries
+  channels.rb           channel loading + slash-command registration
+  term.rb               cbreak mode, line editor, screen primitive, right-aligned outcomes
+  tui.rb                streaming renderer + slash commands (Leve::InteractiveAgentTUI)
+ext/leve_sandbox/       the native extension: magnus + rb-sys binding the microsandbox
+                       Rust crate (pinned =0.6.8). Defines Leve::Sandbox::Native and Vm.
+bin/leve               CLI entry (in the cutover tree)
+test/                  parity + crash-site tests
 ```
 
-## 3. Implementation sequence
+## 3. Implementation sequence (what shipped)
 
 1. **IPC + storage + store Ractor.** Entries, records, lanes, facts, one `seq`. JSONL
    round-trip, torn tail. Parity test: memory vs jsonl.
 2. **Records and the durability rule.** Provisioned ids, `append_if_missing`.
-3. **Agent loop blocks + providers.** `stream_assistant`, tool phases, anthropic SSE, fake
-   scripted provider for tests.
+3. **Agent loop blocks + providers.** `stream_assistant`, tool phases, anthropic SSE, the
+   fake scripted provider, and the openai-responses provider with per-provider quirks read
+   from the `compat` block of models.yml.
 4. **Lane Ractor: the run procedure.** operation_started → task_attempt → assistant entry →
    tool_started → result entry → operation_finished. Checkpoints, steering, follow-ups,
-   deferred writes, retry cap.
-5. **Recovery.** The reduction (§7) from two bounded reads; `resume()` re-entering at the
-   right point; crash-site tests driven by killing the process at each trace line.
+   retry cap.
+5. **Recovery.** The reduction from two bounded reads; `resume()` re-entering at the right
+   point; crash-site tests driven by killing the process at each trace line.
 6. **Abort + reconciliation.** Synthetic results, closing message, queue payload return.
 7. **Observer + snapshots + events.** Then the TUI on top of `watch()`.
 8. **Tools.** bash/read/write/edit/ls/grep/glob, replay safety declared per tool
    (`read`/`ls`/`grep` = safe, `bash`/`write`/`edit` = never).
-9. **Compaction** (auto at checkpoint + manual operation) and **navigation** with branch
-   summary and atomic leaf move.
-10. **Deferred requests.** Park/redeem path, exercised by the fake provider.
-11. **Project context.** AGENTS.md (static, from the repo root down; nested, on first
+9. **Compaction** (auto at checkpoint + manual operation) with branch summary.
+10. **Project context.** AGENTS.md (static, from the repo root down; nested, on first
     touch, appended to the tool result that touched it).
-12. **Skills.** SKILL.md discovery in `.agents/skills`, `.agent/skills`, `.reve/skills` and
-    the `~/` equivalents; frontmatter validation with diagnostics (name shape, description
-    length, collisions); the Agent Skills XML section in the system prompt; `/skill` to run
-    one now.
-13. **Real compaction.** Cut point over `keepRecentTokens`, kept suffix named by
+11. **Skills.** SKILL.md discovery in `workspace/skills`; frontmatter validation with
+    diagnostics (name shape, description length, collisions); the Agent Skills XML section
+    in the system prompt; `/skill` to run one now.
+12. **Real compaction.** Cut point over `keepRecentTokens`, kept suffix named by
     `firstKeptEntryId`, structured summary format, previous-summary updates, split turns,
     mechanically extracted file lists.
-14. **Session goal.** A `goal` custom entry on the branch, injected into the system prompt
-    of every request on that lane.
-15. **openai-responses.** A second provider (the local vLLM endpoint is the default), with
-    per-provider quirks read from the `compat` block of models.yml.
-16. **Shell passthrough and completion.** `!command` as a first-class durable fact, and
-    context-aware tab completion driven by the same command table the dispatcher uses.
+13. **Heartbeats.** Durable scheduled lanes with dynamic `workspace/HEARTBEAT.yml` reload,
+    `vm-exec` prerequisites, and `SILENCE`/`Message`/`Steer` contracts.
+14. **The agent directory.** `instructions.md`, `agent.rb`, `tools/*.rb`,
+    `workspace/skills/`, `sandbox.rb`, `workspace/`, and `.leve/sessions/` for the durable
+    logs. `leve init` scaffolds all of it, and leve refuses to launch outside such a
+    directory (`--plain` overrides).
+15. **Typed tools.** A tool's parameters are described by DSL helpers (`string`,
+    `boolean`, …) that generate the JSON schema the model sees. `tools/*.rb` declares tools
+    with the `tool … do … end` DSL; a block may declare `replay :safe`/`:never`.
+16. **The native sandbox extension.** `ext/leve_sandbox` binds the `microsandbox` Rust
+    crate directly (magnus + rb-sys, pinned `=0.6.8`). The Ruby layer is tested against a
+    fake through the injectable `native:` seam; real-microVM tests are opt-in.
 17. **A terminal the renderer can print into.** Own the input line instead of handing it to
     a readline library: cbreak mode, a small line editor, one screen primitive that hides
     the input line, prints, and redraws it. Tool outcomes render right-aligned.
 
-## 3a. The agent directory (eve's model)
+## 3a. The agent directory
 
 An agent is a directory, and the files in it are its definition: `instructions.md` (the
-authority in the system prompt), `agent.rb` (config), `tools/*.rb` (Ruby DSL), `workspace/skills/`,
-`sandbox.rb`, `workspace/` (the work), and `.reve/sessions/` for the durable
-logs. `reve init` scaffolds all of it, and reve refuses to launch outside such a
+authority in the system prompt), `agent.rb` (config), `tools/*.rb` (Ruby DSL),
+`workspace/skills/`, `sandbox.rb`, `workspace/` (the work), and `.leve/sessions/` for the
+durable logs. `leve init` scaffolds all of it, and leve refuses to launch outside such a
 directory (`--plain` overrides).
 
 `workspace/` is the working directory for every tool and is mounted at `/workspace` in the
@@ -151,45 +183,52 @@ Two Ractor consequences shape the implementation:
 * The sandbox holds a live connection (a microVM handle), so it lives in the host Ractor too,
   and sandboxed tools are host-run by construction.
 
-## 3a2. Typed tools
-
-A tool's parameters are a type signature. RBS comments above the `run` block
-(`#: (city: String, ?units: ("metric" | "imperial")) -> String`) are read from the source
-via `Proc#source_location`, parsed by RBS when it is available and by a small fallback
-parser when it is not, and turned into the JSON schema the model sees — literal unions
-become enums, `@param` lines become descriptions, `Proc#parameters` decides requiredness.
-Typed blocks are invoked with keywords; the older `|args, ctx|` form still works.
-
-`sig/reve.rbs` covers the library's public surface and `rake rbs` resolves it.
-
 ## 3b. Sandbox policy
 
-The mandatory sandbox is a provisioned debian microVM, embedded through the
-`microsandbox-rb` Rust extension (git, ripgrep, fd, jq, build-essential, mise with node).
-There is no local, CLI, or Fiddle fallback. Egress is **deny-by-default with github.com the
-only allowed destination**. Package mirrors are allowed only while provisioning is enabled,
-so an agent that bakes its own image gets the github-only policy and nothing more.
+The mandatory sandbox is a provisioned debian microVM, reached through the in-repo
+`ext/leve_sandbox` native extension that binds the `microsandbox` Rust crate (pinned
+`=0.6.8`) directly (git, ripgrep, fd, jq, build-essential, mise with node). There is no
+local, CLI, Fiddle, or host-shell fallback. Egress is **deny-by-default**: the policy is
+built inside the extension from `NetworkPolicy::none()` plus one narrow gateway-DNS rule
+plus one allow rule per host named by `allow`. Package mirrors are allowed only while
+provisioning is enabled, so an agent that bakes its own image gets the github-only policy
+and nothing more. Verified live: `github.com` reachable, an unlisted host blocked.
+
+The `sandbox.rb` DSL is unchanged from its predecessor except that `allow_all` and
+`backend` are gone — a sandbox that can reach everything is not a sandbox, and there is
+exactly one backend. Secrets are scoped with `allow HOSTS do secret "VAR", value: ...,
+placeholder: ... end`; the guest sees only the placeholder, and the real value is injected
+into requests to those hosts at the network boundary.
 
 GitHub access may use an explicitly exported host credential without copying it into the
 VM: microsandbox's secret proxy substitutes the value into requests to allowed hosts, and
-the guest only ever holds a placeholder. Reve reads `$GITHUB_TOKEN` or `$GH_TOKEN`; it does
+the guest only ever holds a placeholder. Leve reads `$GITHUB_TOKEN` or `$GH_TOKEN`; it does
 not execute `gh auth token` or consult host credential helpers.
 
 ## 4. Scope cuts (explicit)
 
 * No v3 JSONL compatibility: this is a new agent, there is nothing to be compatible with.
-  Our own format is the v4 shape from §13.
-* No SQLite backend. Memory + JSONL only; the branch cache design of §13 is not needed
-  until there is a database.
-* Forks/subagents (§17): the storage-level copy primitive is in scope, a subagent tool is not.
-* Deferred requests exist as a code path and are tested against the fake provider; no real
-  batch-API provider.
+  Our own format is the v4 shape.
+* No SQLite backend. Memory + JSONL only; the branch cache design is not needed until there
+  is a database.
+* Forks/subagents: the storage-level copy primitive is in scope, a subagent tool is not.
+* **DROPPED — RBS-typed tool signatures and `rbs_schema.rb`.** Tools declare parameters
+  with DSL helpers that generate the JSON schema directly; there is no RBS signature file.
+* **DROPPED — conversation navigation** (`navigate`, `/tree`, `/back`). Compaction and
+  `/new` remain; branch browsing does not.
+* **DROPPED — session goal** (`/goal`, `set_goal`/`get_goal`). There is no goal custom entry
+  injected into the system prompt.
+* **DROPPED — deferred/parked provider requests.** There is no park/redeem path and no
+  batch-API provider; the queue is a normal in-lane `Queue`.
+* **DROPPED — the `openai-chat` provider.** Only three providers exist: `openai-responses`,
+  `anthropic-messages`, and the scripted `fake`.
 * Telemetry: span events on the hub, no exporters.
 * Subagents remain out of scope. Channels are trusted file-drop adapters with commands,
   namespaced KV state, prompt guidance, and observer subscriptions; schedules are durable
   heartbeat lanes.
-* The normal suite mocks the `microsandbox-rb` public API; real microVM coverage is an
-  opt-in integration concern. There is only one production adapter.
+* The normal suite tests the Ruby sandbox layer against a Ruby fake via the injectable
+  `native:` seam; real microVM coverage is an opt-in integration concern. There is only one
+  transport, `ext/leve_sandbox`.
 
 ## 5. Invariants we test
 

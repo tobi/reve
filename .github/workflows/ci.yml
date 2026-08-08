@@ -15,8 +15,8 @@ jobs:
   test:
     name: Ruby 4.0
     runs-on: ubuntu-latest
-    # microsandbox-rb compiles its Rust extension when no prebuilt platform gem
-    # is available. A cold runner can spend more than ten minutes in bundle install.
+    # leve_sandbox compiles its Rust extension from source. A cold runner can
+    # spend more than ten minutes building the microsandbox crate graph.
     timeout-minutes: 30
 
     steps:
@@ -28,11 +28,13 @@ jobs:
         with:
           ruby-version: "4.0"
           bundler-cache: true
+      - name: Compile native extension
+        run: rake compile
       # rake and rbs ship with Ruby 4. Running outside Bundler keeps these
-      # development-only default gems out of Reve's runtime dependency set.
+      # development-only default gems out of Leve's runtime dependency set.
       - name: Test, lint, and validate signatures
         run: rake
       - name: Validate gem package
         run: |
-          gem build reve.gemspec
-          gem specification ./reve-*.gem name version summary required_ruby_version metadata >/dev/null
+          gem build leve.gemspec
+          gem specification ./leve-*.gem name version summary required_ruby_version metadata >/dev/null

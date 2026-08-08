@@ -10,7 +10,7 @@ body:
     id: version
     attributes:
       label: Reve version
-      placeholder: reve 0.8.0
+      placeholder: leve 0.1.0
     validations:
       required: true
   - type: input

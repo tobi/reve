@@ -1,10 +1,10 @@
 # frozen_string_literal: true
 
-# Drop this one file into <agent>/channels/telegram.rb, restart Reve, then run:
+# Drop this one file into <agent>/channels/telegram.rb, restart Leve, then run:
 #
 #   /telegram-connect {"botToken":"123456:BotFather-token"}
 #
-# The token and pairing state live in .reve/channels.json (mode 0600), never in
+# The token and pairing state live in .leve/channels.json (mode 0600), never in
 # workspace/ and never in the microVM. Subsequent sessions can reconnect with:
 #
 #   /telegram-connect {}
@@ -13,7 +13,7 @@ require "json"
 require "net/http"
 require "uri"
 
-module Reve
+module Leve
   module Channels
     class Telegram
       MAX_RICH = 32_000
@@ -210,7 +210,7 @@ module Reve
           allowed_user = user_id
           allowed_chat = chat_id
           call_api("sendRichMessage", "chat_id" => chat_id,
-                                      "rich_message" => { "markdown" => "Paired with Reve." })
+                                      "rich_message" => { "markdown" => "Paired with Leve." })
           return if message["text"].to_s.start_with?("/start")
         elsif allowed_chat.nil? && allowed_user.to_i == user_id.to_i
           # One-time migration from the earlier user-only pairing format.

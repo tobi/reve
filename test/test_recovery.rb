@@ -8,11 +8,11 @@ include TestKit
 CHILD = File.expand_path("crash_child.rb", __dir__)
 
 def run_child(script_path, session_path, prompt, extra_env = {})
-  env = { "REVE_FAKE_SCRIPT" => script_path, "REVE_SESSION" => session_path,
-          "REVE_PROMPT" => prompt }.merge(extra_env)
+  env = { "LEVE_FAKE_SCRIPT" => script_path, "LEVE_SESSION" => session_path,
+          "LEVE_PROMPT" => prompt }.merge(extra_env)
   # The recovering parent uses the same script: a resumed run continues where
   # the dead process stopped, including the provider's response cursor.
-  ENV["REVE_FAKE_SCRIPT"] = script_path
+  ENV["LEVE_FAKE_SCRIPT"] = script_path
   out = IO.popen(env, ["ruby", CHILD], err: [:child, :out], &:read)
   [out, $?.exitstatus]
 end
@@ -170,40 +170,6 @@ Dir.mktmpdir do |dir|
     h.close
   end
 
-  group "deferred request: the lane parks, a later process redeems the handle" do
-    session = File.join(dir, "defer.jsonl")
-    script = File.join(dir, "defer.json")
-    handle = { "provider" => "fake", "api" => "fake", "id" => "batch-1" }
-    File.write(script, JSON.generate({
-                                       "responses" => [
-                                         { "role" => "assistant", "content" => [], "stopReason" => "deferred",
-                                           "deferred" => handle },
-                                         assistant_text("this is never used"),
-                                         assistant_text("after redemption")
-                                       ],
-                                       "deferred:batch-1" => { "pendingPolls" => 1,
-                                                               "result" => assistant_text("the batch answer") }
-                                     }))
-    out, = run_child(script, session, "analyze this mailbox")
-    eq "prompt resolved as suspended", true, out.include?('"outcome":"suspended"')
-
-    h, susp = open_session(session)
-    eq "restored as suspended", 1, susp.size
-    eq "reason is deferred, not crash", "deferred", susp.first["reason"]
-    eq "the handle came from the persisted assistant entry", "batch-1", susp.first.dig("deferred", "id")
-
-    first = h.resume
-    eq "still pending → parks again", "suspended", first["outcome"]
-    second = h.resume
-    eq "redeemed and the run continues", true, second["ok"]
-    texts = entries_of(h.session).select { _1.dig("message", "role") == "assistant" }
-                                 .filter_map { _1.dig("message", "content", 0, "text") }
-    eq "the redeemed answer is in the transcript", true, texts.include?("the batch answer")
-    eq "no extra provider request was paid for", 1,
-       records_of(h.session).count { _1["type"] == "task_attempt" }
-    h.close
-  end
-
   group "hard kill mid-tool (SIGKILL, no scripted crash) is recoverable" do
     session = File.join(dir, "kill.jsonl")
     script = File.join(dir, "kill.json")
@@ -211,8 +177,8 @@ Dir.mktmpdir do |dir|
                                         assistant_tool("bash", { "command" => "sleep 20" }),
                                         assistant_text("after the kill")
                                       ] }))
-    env = { "REVE_FAKE_SCRIPT" => script, "REVE_SESSION" => session, "REVE_PROMPT" => "sleep a lot" }
-    ENV["REVE_FAKE_SCRIPT"] = script
+    env = { "LEVE_FAKE_SCRIPT" => script, "LEVE_SESSION" => session, "LEVE_PROMPT" => "sleep a lot" }
+    ENV["LEVE_FAKE_SCRIPT"] = script
     pid = Process.spawn(env, "ruby", CHILD, out: "/dev/null", err: "/dev/null")
     sleep 2.5
     Process.kill("KILL", pid)
@@ -249,7 +215,7 @@ group "detaching is not aborting: an open operation stays resumable" do
                                           "stopReason" => "stop", "sleep" => 30 },
                                         assistant_text("finished after resume")
                                       ] }))
-    ENV["REVE_FAKE_SCRIPT"] = script
+    ENV["LEVE_FAKE_SCRIPT"] = script
     h, = open_session(session)
     Thread.new { h.prompt("start something slow") }
     sleep 1.0

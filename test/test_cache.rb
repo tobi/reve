@@ -9,7 +9,7 @@ def cached_reply(text, input: 4000, cache_read: 3800)
 end
 
 group "usage is normalised: input includes what was cached" do
-  acc = Reve::Provider::Anthropic::Accumulator.new({ "provider" => "a", "modelId" => "m" })
+  acc = Leve::Provider::Anthropic::Accumulator.new({ "provider" => "a", "modelId" => "m" })
   acc.handle({ "type" => "message_start",
                "message" => { "usage" => { "input_tokens" => 100, "cache_read_input_tokens" => 900,
                                            "cache_creation_input_tokens" => 50 } } })
@@ -25,8 +25,8 @@ group "anthropic asks for caching explicitly" do
   body = nil
   # Build the request the way the provider does, without sending it.
   msgs = [{ "role" => "user", "content" => [{ "type" => "text", "text" => "hi" }] }]
-  provider_messages = Reve::Provider::Anthropic.to_provider_messages(msgs)
-  Reve::Provider::Anthropic.mark_cache_breakpoint(provider_messages)
+  provider_messages = Leve::Provider::Anthropic.to_provider_messages(msgs)
+  Leve::Provider::Anthropic.mark_cache_breakpoint(provider_messages)
   eq "the newest message carries a breakpoint", { "type" => "ephemeral" },
      provider_messages.last["content"].last["cache_control"]
   body = { "system" => [{ "type" => "text", "text" => "sys", "cache_control" => { "type" => "ephemeral" } }] }
@@ -57,13 +57,16 @@ Dir.mktmpdir do |dir|
     warnings = []
     h.on_event { |e| warnings << e if e["type"] == "cache_invalidated" }
     h.prompt("first")
-    h.set_goal("ship it")
+    # The session goal was the reference's deliberate system-prompt changer;
+    # it is gone, so reach the same "expected" path through a config change
+    # the lane marks deliberate: switching the active tool set.
+    h.main.set_persisted("activeTools", ["read"])
     h.prompt("second")
     sleep 0.2
     eq "one warning", 1, warnings.size
-    eq "it names the system prompt", true, warnings.first["reasons"].include?("system prompt changed")
+    eq "it names the tool set change", true, warnings.first["reasons"].include?("tool set changed")
     eq "and marks it expected", true, warnings.first["expected"]
-    eq "with the cause", "goal changed", warnings.first["cause"]
+    eq "with the cause", "activeTools changed", warnings.first["cause"]
     h.close
   end
 

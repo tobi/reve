@@ -1,14 +1,14 @@
 # frozen_string_literal: true
 
 require_relative "helper"
-require_relative "../lib/reve/tui"
+require_relative "../lib/leve/tui"
 include TestKit
 
 group "there is no host shell fallback" do
-  r = Reve::Tools.invoke("bash", { "command" => "uname -a" }, Dir.pwd)
+  r = Leve::Tools.invoke("bash", { "command" => "uname -a" }, Dir.pwd)
   eq "generic tool invocation fails closed", true, r["isError"]
   eq "the reason is explicit", true, r.dig("content", 0, "text").include?("host execution is forbidden")
-  eq "bash is marked for sandbox dispatch", true, Reve::Tools.sandboxed?("bash")
+  eq "bash is marked for sandbox dispatch", true, Leve::Tools.sandboxed?("bash")
 end
 
 group "file tools are confined to the workspace bind source" do
@@ -16,9 +16,9 @@ group "file tools are confined to the workspace bind source" do
     outside = Dir.mktmpdir
     File.write(File.join(outside, "secret"), "host secret")
     File.symlink(outside, File.join(root, "escape"))
-    absolute = Reve::Tools.invoke("read", { "path" => "/etc/hosts" }, root)
-    traversal = Reve::Tools.invoke("write", { "path" => "../escaped", "content" => "no" }, root)
-    symlink = Reve::Tools.invoke("read", { "path" => "escape/secret" }, root)
+    absolute = Leve::Tools.invoke("read", { "path" => "/etc/hosts" }, root)
+    traversal = Leve::Tools.invoke("write", { "path" => "../escaped", "content" => "no" }, root)
+    symlink = Leve::Tools.invoke("read", { "path" => "escape/secret" }, root)
     eq "absolute host reads fail", true, absolute["isError"]
     eq "parent traversal fails", true, traversal["isError"]
     eq "symlink escapes fail", true, symlink["isError"]
@@ -29,7 +29,7 @@ group "file tools are confined to the workspace bind source" do
 end
 
 group "internal workspace context is model-visible but hidden from user echo" do
-  tui = Reve::InteractiveAgentTUI.allocate
+  tui = Leve::InteractiveAgentTUI.allocate
   message = { "role" => "user", "content" => [
     { "type" => "text", "text" => "<workspace_context>\nsecret context\n</workspace_context>" },
     { "type" => "text", "text" => "what I typed" }
@@ -40,7 +40,7 @@ end
 group "a shell execution projects into context as the user's action" do
   entry = { "type" => "custom", "customType" => "bash_execution",
             "data" => { "command" => "rake test", "output" => "3 failures", "exitCode" => 1 } }
-  msg = Reve::Context.project(entry)
+  msg = Leve::Context.project(entry)
   eq "it is a user message", "user", msg["role"]
   text = msg.dig("content", 0, "text")
   eq "attributed to the user", true, text.start_with?("The user ran a shell command.")
@@ -48,7 +48,7 @@ group "a shell execution projects into context as the user's action" do
   eq "exit code included", true, text.include?("exit=1")
   eq "output included", true, text.include?("3 failures")
   eq "custom entries without a projector stay out of context", nil,
-     Reve::Context.project({ "type" => "custom", "customType" => "something-else" })
+     Leve::Context.project({ "type" => "custom", "customType" => "something-else" })
 end
 
 Dir.mktmpdir do |dir|
@@ -61,7 +61,7 @@ Dir.mktmpdir do |dir|
     eq "stored as a custom entry", "bash_execution", entry["customType"]
     eq "with the exit code", 0, entry.dig("data", "exitCode")
     h.prompt("what happened?")
-    sent = File.readlines("#{ENV["REVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
+    sent = File.readlines("#{ENV["LEVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
     texts = sent.last["messages"].flat_map { |m| (m["content"] || []).map { _1["text"] } }.compact
     eq "the model saw the command and its output", true,
        texts.any? { _1.include?("rake test") && _1.include?("2 runs") }
@@ -97,8 +97,8 @@ Dir.mktmpdir do |dir|
       "llamacpp" => { "models" => [] }
     } }
     h, = test_harness(storage: "memory", model: model, cwd: dir, models_config: models_config)
-    tui = Reve::InteractiveAgentTUI.new(h, [])
-    line = Reve::Term::Line.new
+    tui = Leve::InteractiveAgentTUI.new(h, [])
+    line = Leve::Term::Line.new
     tui.instance_variable_set(:@line, line)
     complete = lambda do |text|
       line.replace_all(text)
@@ -107,7 +107,7 @@ Dir.mktmpdir do |dir|
       [c || [], start]
     end
 
-    eq "command prefix", ["/goal"], complete.call("/go").first
+    eq "command prefix", ["/compact"], complete.call("/co").first
     eq "bare slash lists commands", true, complete.call("/").first.include?("/compact")
     eq "think levels", %w[off low medium high], complete.call("/think ").first
     eq "tool names", %w[read], complete.call("/tools re").first
@@ -133,19 +133,19 @@ Dir.mktmpdir do |dir|
   group "the prompt announces shell mode as you type" do
     model = fake_model(dir, [assistant_text("ok")])
     h, = test_harness(storage: "memory", model: model, cwd: dir)
-    tui = Reve::InteractiveAgentTUI.new(h, [])
+    tui = Leve::InteractiveAgentTUI.new(h, [])
     tui.instance_variable_set(:@busy, false)
-    eq "idle prompt", true, Reve::Term.visible(tui.prompt_for("")).include?("›")
+    eq "idle prompt", true, Leve::Term.visible(tui.prompt_for("")).include?("›")
     tui.instance_variable_set(:@shell_mode, true)
-    eq "shell prompt is the marker itself", "! ", Reve::Term.visible(tui.prompt_for(""))
+    eq "shell prompt is the marker itself", "! ", Leve::Term.visible(tui.prompt_for(""))
     tui.instance_variable_set(:@shell_mode, false)
     tui.instance_variable_set(:@busy, true)
-    eq "steering prompt while busy", true, Reve::Term.visible(tui.prompt_for("")).include?("steer")
+    eq "steering prompt while busy", true, Leve::Term.visible(tui.prompt_for("")).include?("steer")
     h.close
   end
 
   group "the editor splices a completion in at the token" do
-    line = Reve::Term::Line.new
+    line = Leve::Term::Line.new
     "!cat lib/a".each_char { line.feed(_1) }
     token, start = line.token
     eq "token is the last word", ["lib/a", 5], [token, start]
@@ -166,8 +166,8 @@ group "every tool survives being run inside a Ractor" do
              "edit" => { "path" => "a.txt", "oldText" => "hello", "newText" => "bye" },
              "ls" => { "path" => "." }, "glob" => { "pattern" => "*.txt" },
              "grep" => { "pattern" => "bye" } }
-    Reve::Tools.names.each do |name|
-      result = Reve::IPC.decode(Reve::Tools.spawn(name, args.fetch(name), dir).value)
+    Leve::Tools.names.each do |name|
+      result = Leve::IPC.decode(Leve::Tools.spawn(name, args.fetch(name), dir).value)
       text = result["content"].map { _1["text"] }.join
       check("#{name} runs in a Ractor without isolation errors") do
         !text.include?("IsolationError") && !text.include?("ractor failed")
@@ -177,7 +177,7 @@ group "every tool survives being run inside a Ractor" do
 end
 
 group "ctrl-c and ctrl-d escalate the way a terminal user expects" do
-  t = Reve::InteractiveAgentTUI.allocate
+  t = Leve::InteractiveAgentTUI.allocate
   i = ->(**kw) { t.interrupt_decision(**{ shell_running: false, busy: false, aborting: false,
                                           has_text: false, repeat: false }.merge(kw)) }
   eq "^C with text on the line clears it", :clear_line, i.call(has_text: true)
@@ -197,7 +197,7 @@ group "ctrl-c and ctrl-d escalate the way a terminal user expects" do
 end
 
 group "the editor's own ctrl-d" do
-  l = Reve::Term::Line.new
+  l = Leve::Term::Line.new
   eq "empty line reports eof", :eof, l.feed("\u0004")
   "abc".each_char { l.feed(_1) }
   l.feed("\u0001")
@@ -208,14 +208,14 @@ end
 group "big output spills to a file instead of the context window" do
   Dir.mktmpdir do |cwd|
     output = (1..5000).map { "#{_1}\n" }.join
-    text, details = Reve::Tools.overspill(output, "bash", root: cwd)
+    text, details = Leve::Tools.overspill(output, "bash", root: cwd)
     eq "the result is capped", 2001, text.lines.size
     eq "it keeps the tail", true, text.include?("5000")
-    eq "and says where the rest is", true, text.lines.last.include?("/.reve/logs/bash-")
+    eq "and says where the rest is", true, text.lines.last.include?("/.leve/logs/bash-")
     eq "with the counts", true, text.lines.last.include?("3000 earlier lines omitted")
     eq "the file has everything", 5000, File.readlines(details["logPath"]).size
     eq "details carry the totals", [5000, 2000], [details["totalLines"], details["shownLines"]]
-    eq "small output is untouched", "hi\n", Reve::Tools.overspill("hi\n", "bash", root: cwd).first
+    eq "small output is untouched", "hi\n", Leve::Tools.overspill("hi\n", "bash", root: cwd).first
   end
 end
 
@@ -225,7 +225,7 @@ group "/compact runs durable manual compaction" do
     h, = test_harness(cwd: cwd, storage: "memory", model: model,
                       compaction: { "keepRecentTokens" => 8 })
     h.prompt("remember this detailed conversation " * 20)
-    tui = Reve::InteractiveAgentTUI.new(h, [])
+    tui = Leve::InteractiveAgentTUI.new(h, [])
     tui.instance_variable_set(:@out, StringIO.new)
     tui.submit("/compact preserve decisions")
     tui.instance_variable_get(:@run_thread).join
@@ -247,7 +247,7 @@ group "/new replaces the current conversation without replacing the VM" do
       fresh.new_session_factory = first.new_session_factory
       [fresh, suspended]
     end
-    tui = Reve::InteractiveAgentTUI.new(first, [])
+    tui = Leve::InteractiveAgentTUI.new(first, [])
     tui.instance_variable_set(:@out, StringIO.new)
     tui.submit("/new")
     fresh = tui.instance_variable_get(:@h)

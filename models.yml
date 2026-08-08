@@ -1,6 +1,6 @@
-# Reve's self-contained model template.
+# Leve's self-contained model template.
 #
-# This file is copied into each agent root by `reve init`. Runtime reads only
+# This file is copied into each agent root by `leve init`. Runtime reads only
 # <agent>/models.yml; there are no home-directory or global config fallbacks.
 #
 # apiKey values must be `$ENV_VAR` references; secrets never belong in this file.

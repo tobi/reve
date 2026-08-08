@@ -13,21 +13,21 @@ Dir.mktmpdir do |root|
   File.write(File.join(nested, "gen.rb"), "# generated\n")
 
   group "discovery: repo root down to cwd, outermost first" do
-    files = Reve::AgentsMd.discover(repo)
+    files = Leve::AgentsMd.discover(repo)
     eq "found the root file", [File.join(repo, "AGENTS.md")], files.map { _1["path"] }
     eq "content read", true, files.first["content"].include?("always use tabs")
-    deeper = Reve::AgentsMd.discover(File.join(repo, "lib"), root: repo)
+    deeper = Leve::AgentsMd.discover(File.join(repo, "lib"), root: repo)
     eq "from a subdirectory the root file is still found", true,
        deeper.map { _1["path"] }.include?(File.join(repo, "AGENTS.md"))
     eq "and it comes before the closer ones", File.join(repo, "AGENTS.md"), deeper.first["path"]
   end
 
   group "the system prompt carries them" do
-    sp = Reve::Prompt.system_prompt(cwd: repo)
+    sp = Leve::Prompt.system_prompt(cwd: repo)
     eq "instructions embedded", true, sp.include?("always use tabs")
     eq "path is attributed", true, sp.include?("<project_instructions path=")
     eq "no AGENTS.md → plain prompt", false,
-       Reve::Prompt.system_prompt(cwd: root).include?("<project_instructions")
+       Leve::Prompt.system_prompt(cwd: root).include?("<project_instructions")
   end
 
   group "a fresh harness loads them without being asked" do
@@ -35,7 +35,7 @@ Dir.mktmpdir do |root|
     h, = test_harness(storage: "memory", model: model, cwd: repo)
     eq "harness reports the files", [File.join(repo, "AGENTS.md")], h.agents_md.map { _1["path"] }
     h.prompt("hello")
-    requests = File.readlines("#{ENV["REVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
+    requests = File.readlines("#{ENV["LEVE_FAKE_SCRIPT"]}.requests").map { JSON.parse(_1) }
     eq "the provider actually saw them", true, requests.first["system"].include?("always use tabs")
     h.close
   end
@@ -58,9 +58,9 @@ Dir.mktmpdir do |root|
 
   group "nested files outside the workspace are ignored" do
     eq "no injection above cwd", nil,
-       Reve::AgentsMd.nested_for(File.join(root, "elsewhere.rb"), repo, [])
+       Leve::AgentsMd.nested_for(File.join(root, "elsewhere.rb"), repo, [])
     eq "cwd's own file is not 'nested'", nil,
-       Reve::AgentsMd.nested_for(File.join(repo, "x.rb"), repo, [])
+       Leve::AgentsMd.nested_for(File.join(repo, "x.rb"), repo, [])
   end
 end
 

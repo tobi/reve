@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "helper"
-require_relative "../lib/reve/term"
+require_relative "../lib/leve/term"
 include TestKit
 
 VLLM = { "provider" => "vllm", "modelId" => "glm52", "api" => "openai-responses",
@@ -10,7 +10,7 @@ VLLM = { "provider" => "vllm", "modelId" => "glm52", "api" => "openai-responses"
          "compat" => { "supportsStore" => false, "supportsDeveloperRole" => false,
                        "supportsReasoningEffort" => false, "maxTokensField" => "max_tokens" } }.freeze
 
-R = Reve::Provider::OpenAIResponses
+R = Leve::Provider::OpenAIResponses
 
 group "openai-responses: message conversion" do
   input = R.to_input([
@@ -94,7 +94,7 @@ group "provider configuration failures are contextual and in-band" do
   eq "it names provider, model, source and resolved URL", true,
      message["errorMessage"].include?("vllm/glm52") &&
        message["errorMessage"].include?("$LLAMA_CPP_BASE") &&
-       message["errorMessage"].include?("resolved=\"\"")
+       message["errorMessage"].include?('resolved=""')
   eq "it tells the user which environment variable to set", true,
      message["errorMessage"].include?("Set environment variable $LLAMA_CPP_BASE")
 
@@ -106,7 +106,7 @@ group "provider configuration failures are contextual and in-band" do
   transport.define_singleton_method(:request) { |_request, &block| block.call(response) }
   request = Net::HTTP::Post.new(URI("https://models.example/v1/responses"))
   failed = R::Accumulator.new(VLLM)
-  result = Reve::Provider::HTTP.pump(transport, request, failed, nil)
+  result = Leve::Provider::HTTP.pump(transport, request, failed, nil)
   eq "HTTP failures retain the complete response", true,
      result["errorMessage"].include?(body) && result["errorMessage"].include?("URL: https://models.example/v1/responses")
 end
@@ -114,29 +114,29 @@ end
 group "model resolution: provider-only asks the endpoint" do
   cfg = { "providers" => { "vllm" => { "baseUrl" => "http://127.0.0.1:1", "api" => "openai-responses",
                                        "models" => [{ "id" => "glm52", "contextWindow" => 250_000 }] } } }
-  m = Reve::Provider::Models.resolve(cfg, "vllm")
+  m = Leve::Provider::Models.resolve(cfg, "vllm")
   eq "unreachable endpoint falls back to the config", "glm52", m["modelId"]
   eq "compat travels with the model", true, m.key?("compat")
-  eq "provider/model still works", "glm52", Reve::Provider::Models.resolve(cfg, "vllm/glm52")["modelId"]
-  eq "bare id still works", "glm52", Reve::Provider::Models.resolve(cfg, "glm52")["modelId"]
-  eq "unknown provider is nil", nil, Reve::Provider::Models.resolve(cfg, "nope/x")
+  eq "provider/model still works", "glm52", Leve::Provider::Models.resolve(cfg, "vllm/glm52")["modelId"]
+  eq "bare id still works", "glm52", Leve::Provider::Models.resolve(cfg, "glm52")["modelId"]
+  eq "unknown provider is nil", nil, Leve::Provider::Models.resolve(cfg, "nope/x")
 end
 
 group "term: right-aligned columns, like an RPROMPT" do
-  line = Reve::Term.two_column("left", "right", 20)
+  line = Leve::Term.two_column("left", "right", 20)
   eq "padded to the column", 20, line.length
   eq "right edge is the right text", true, line.end_with?("right")
   eq "colour codes do not count toward width", 20,
-     Reve::Term.visible(Reve::Term.two_column("\e[1mleft\e[0m", "\e[2mright\e[0m", 20)).length
-  eq "no room means two lines", true, Reve::Term.two_column("x" * 18, "y" * 10, 20).include?("\n")
-  eq "clip keeps the ellipsis inside the budget", 10, Reve::Term.clip("x" * 40, 10).length
-  eq "wide glyphs count as two cells", 2, Reve::Term.display_width("✓")
+     Leve::Term.visible(Leve::Term.two_column("\e[1mleft\e[0m", "\e[2mright\e[0m", 20)).length
+  eq "no room means two lines", true, Leve::Term.two_column("x" * 18, "y" * 10, 20).include?("\n")
+  eq "clip keeps the ellipsis inside the budget", 10, Leve::Term.clip("x" * 40, 10).length
+  eq "wide glyphs count as two cells", 2, Leve::Term.display_width("✓")
   eq "so a line with them still fits", true,
-     Reve::Term.display_width(Reve::Term.two_column("✓ ok", "✗ no", 20)) <= 20
+     Leve::Term.display_width(Leve::Term.two_column("✓ ok", "✗ no", 20)) <= 20
 end
 
 group "term: the line editor" do
-  l = Reve::Term::Line.new
+  l = Leve::Term::Line.new
   "hello".each_char { l.feed(_1) }
   eq "typing", "hello", l.buffer
   l.feed("\u007F")
@@ -164,12 +164,12 @@ group "term: the line editor" do
 end
 
 group "the tui's own state is initialised, so the first turn cannot crash" do
-  require_relative "../lib/reve/tui"
+  require_relative "../lib/leve/tui"
   Dir.mktmpdir do |dir|
     model = fake_model(dir, [assistant_text("ok")])
     h, = test_harness(storage: "memory", model: model, cwd: dir,
                                  project: false)
-    tui = Reve::InteractiveAgentTUI.new(h, [])
+    tui = Leve::InteractiveAgentTUI.new(h, [])
     # A separator before any turn, an expand with nothing to expand, and a
     # claimed echo that was never echoed: each of these read an ivar that used
     # to be nil on the first keystroke.

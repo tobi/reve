@@ -5,3 +5,8 @@ tmp/
 
 # build artifacts
 *.gem
+
+# compiled native extension
+lib/leve/*.so
+lib/leve/*.bundle
+ext/leve_sandbox/target/
