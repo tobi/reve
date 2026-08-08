@@ -110,8 +110,16 @@ impl Spinner {
     }
 
     /// Settle the current stage onto its own line.
+    ///
+    /// Without a terminal there is no width to align against and no spinner
+    /// line to erase, so a log gets one plain line per stage with its cost.
     fn settle(&self, mark: &str, colour: (u8, u8, u8), label: &str, elapsed: Duration) {
         let mut err = stderr();
+        if !self.animate {
+            let _ = writeln!(err, "  {mark} {label} ({})", human(elapsed));
+            let _ = err.flush();
+            return;
+        }
         let mut state = self.state.lock();
         if state.dirty {
             let _ = write!(err, "\r\x1b[2K");
@@ -141,12 +149,10 @@ impl Progress for Spinner {
                 previous.started.elapsed(),
             );
         }
+        // Only the animated path announces a stage before it finishes; a log
+        // wants the record, one line each, not a start and an end for both.
         if self.animate {
             self.spawn();
-        } else {
-            let mut err = stderr();
-            let _ = writeln!(err, "  · {label}");
-            let _ = err.flush();
         }
     }
 
@@ -159,11 +165,7 @@ impl Progress for Spinner {
         if let Some(last) = last {
             self.settle("✓", theme::RGB_GOOD, &last.label, last.started.elapsed());
         }
-        if self.animate {
-            self.settle("✓", theme::RGB_GOOD, label, self.started.elapsed());
-        } else {
-            let _ = writeln!(stderr(), "  ✓ {label}");
-        }
+        self.settle("✓", theme::RGB_GOOD, label, self.started.elapsed());
     }
 }
 

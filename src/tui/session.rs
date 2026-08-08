@@ -50,14 +50,15 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
         .iter()
         .map(|t| t.name.clone())
         .collect();
-    let banner = if tools.is_empty() {
-        "Type a command to run it in this agent's microVM.".to_string()
+    let mut banner = String::from(
+        "What you type goes to the model. Prefix `!` to run a command in this agent's \
+         microVM instead",
+    );
+    if tools.is_empty() {
+        banner.push('.');
     } else {
-        format!(
-            "Type a command to run it in this agent's microVM, or `/{}` to run a tool.",
-            tools.join("`, `/")
-        )
-    };
+        banner.push_str(&format!(", or `/{}` to run a tool.", tools.join("`, `/")));
+    }
     let _ = updates.send(Update::Item(Item::Assistant(banner))).await;
 
     let worker = {
@@ -79,10 +80,14 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
                         let _ = updates.send(Update::Item(Item::User(text.clone()))).await;
                         let _ = updates.send(Update::Working(Some("Running".into()))).await;
 
-                        let item = if let Some(name) = text.strip_prefix('/') {
+                        // `!` is the shell escape, exactly as it is in the
+                        // durable record; anything else is for the model.
+                        let item = if let Some(command) = text.strip_prefix('!') {
+                            run_command(&sandbox, command.trim(), rx).await
+                        } else if let Some(name) = text.strip_prefix('/') {
                             run_tool(&project, &sandbox, name).await
                         } else {
-                            run_command(&sandbox, &text, rx).await
+                            no_model_yet()
                         };
 
                         let _ = updates.send(Update::Item(item)).await;
@@ -134,6 +139,17 @@ async fn run_command(
         }
         Err(e) => Item::Notice(format!("sandbox error: {e}")),
     }
+}
+
+/// Until a provider is wired, say so plainly rather than doing something else
+/// with the text. Silently running a prompt as a shell command was worse than
+/// refusing it.
+fn no_model_yet() -> Item {
+    Item::Notice(
+        "No provider is wired up yet, so there is nothing to send this to. \
+         Use `!command` to run something in the microVM in the meantime."
+            .into(),
+    )
 }
 
 async fn run_tool(project: &Project, sandbox: &Arc<Sandbox>, name: &str) -> Item {
