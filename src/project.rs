@@ -5,6 +5,7 @@
 //! copy the directory and you copy the agent.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -109,7 +110,9 @@ pub fn init(root: impl AsRef<Path>) -> Result<InitReport> {
 /// A loaded agent directory.
 pub struct Project {
     pub root: PathBuf,
-    pub runtime: Runtime,
+    /// Shared, because tool calls need it alongside the sandbox and a Lua VM
+    /// cannot be cloned.
+    pub runtime: Arc<Runtime>,
 }
 
 impl Project {
@@ -130,7 +133,14 @@ impl Project {
         runtime.load_agent(&root.join("agent.lua"))?;
         runtime.load_sandbox(&root.join("sandbox.lua"))?;
         runtime.load_tools(&root.join("tools"))?;
-        Ok(Self { root, runtime })
+        Ok(Self {
+            root,
+            runtime: Arc::new(runtime),
+        })
+    }
+
+    pub fn runtime_arc(&self) -> Arc<Runtime> {
+        self.runtime.clone()
     }
 
     pub fn workspace(&self) -> PathBuf {

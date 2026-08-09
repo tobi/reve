@@ -1,4 +1,5 @@
 pub mod app;
+pub mod complete;
 pub mod item;
 pub mod markdown;
 pub mod run;

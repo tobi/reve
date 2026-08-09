@@ -20,6 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
+use super::complete::{Command, Completion, accept, complete};
 use super::item::{Inbox, Item, Status, Subagent};
 use super::stream::Stream;
 use super::theme;
@@ -73,6 +74,12 @@ impl Input {
     pub fn take(&mut self) -> String {
         self.cursor = 0;
         std::mem::take(&mut self.text)
+    }
+
+    /// Replace the whole line, cursor to the end.
+    pub fn set(&mut self, text: String) {
+        self.cursor = text.chars().count();
+        self.text = text;
     }
 
     pub fn insert(&mut self, c: char) {
@@ -157,6 +164,11 @@ pub struct App {
     /// one that carries the `◆`.
     stream_opened: bool,
     tail_height: u16,
+    /// Slash commands, including this agent's own Lua tools.
+    commands: Vec<Command>,
+    completion: Completion,
+    /// Which candidate is highlighted. The first, until the user moves.
+    selected: usize,
     scrollback: Vec<Item>,
     interrupt_armed: bool,
     frame: usize,
@@ -179,10 +191,50 @@ impl App {
             stream: Stream::new(),
             stream_opened: false,
             tail_height: 0,
+            commands: Vec::new(),
+            completion: Completion::default(),
+            selected: 0,
             scrollback: Vec::new(),
             interrupt_armed: false,
             frame: 0,
         }
+    }
+
+    /// Install the slash commands. Called once the agent is loaded, because
+    /// the list includes its Lua tools and its configured models.
+    pub fn set_commands(&mut self, commands: Vec<Command>) {
+        self.commands = commands;
+    }
+
+    pub fn commands(&self) -> &[Command] {
+        &self.commands
+    }
+
+    pub fn completion(&self) -> &Completion {
+        &self.completion
+    }
+
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
+    /// Recompute after every edit, so the list tracks what is typed.
+    fn refresh_completion(&mut self) {
+        let previous = self
+            .completion
+            .candidates
+            .get(self.selected)
+            .map(|c| c.value.clone());
+        self.completion = complete(self.input.text(), &self.commands);
+        // Keep the highlight on the same entry when it survives the edit.
+        self.selected = previous
+            .and_then(|value| {
+                self.completion
+                    .candidates
+                    .iter()
+                    .position(|c| c.value == value)
+            })
+            .unwrap_or(0);
     }
 
     pub fn busy(&self) -> bool {
@@ -269,31 +321,66 @@ impl App {
                 return Some(Action::Quit);
             }
             KeyCode::Char('d') if ctrl && self.input.is_empty() => return Some(Action::Quit),
-            KeyCode::Char('w') if ctrl => self.input.delete_word(),
+            KeyCode::Char('w') if ctrl => {
+                self.input.delete_word();
+                self.refresh_completion();
+            }
             KeyCode::Char('u') if ctrl => {
                 self.input.take();
+                self.refresh_completion();
             }
-            KeyCode::Char(c) => self.input.insert(c),
-            KeyCode::Backspace => self.input.backspace(),
+            KeyCode::Char(c) => {
+                self.input.insert(c);
+                self.refresh_completion();
+            }
+            KeyCode::Backspace => {
+                self.input.backspace();
+                self.refresh_completion();
+            }
             KeyCode::Left => self.input.left(),
             KeyCode::Right => self.input.right(),
             KeyCode::Home => self.input.home(),
             KeyCode::End => self.input.end(),
+            KeyCode::Tab => {
+                // Tab accepts; the first candidate is highlighted already, so
+                // the common case is one keystroke.
+                if self.completion.is_open() {
+                    let text = accept(
+                        self.input.text(),
+                        &self.completion,
+                        self.selected,
+                        &self.commands,
+                    );
+                    self.input.set(text);
+                    self.refresh_completion();
+                }
+            }
             KeyCode::Esc => {
-                if self.busy() {
+                // Escape dismisses the list before it interrupts anything —
+                // otherwise closing a menu would abort the run behind it.
+                if self.completion.is_open() {
+                    self.completion = Completion::default();
+                } else if self.busy() {
                     return Some(Action::Interrupt);
                 }
             }
             KeyCode::Down => {
-                if !self.subagents.is_empty() {
+                if self.completion.is_open() {
+                    self.selected = (self.selected + 1) % self.completion.candidates.len();
+                } else if !self.subagents.is_empty() {
                     let agents = self.subagents.clone();
                     self.scrollback.push(Item::SubagentDetail(agents));
                 }
             }
             KeyCode::Up => {
-                // Mark the inbox read: you have seen it.
-                for message in &mut self.inbox {
-                    message.read = true;
+                if self.completion.is_open() {
+                    let len = self.completion.candidates.len();
+                    self.selected = (self.selected + len - 1) % len;
+                } else {
+                    // Mark the inbox read: you have seen it.
+                    for message in &mut self.inbox {
+                        message.read = true;
+                    }
                 }
             }
             KeyCode::Enter => {
@@ -301,6 +388,7 @@ impl App {
                     return None;
                 }
                 let text = self.input.take();
+                self.completion = Completion::default();
                 // The same keystroke means different things depending on
                 // whether the agent is working, which is the distinction the
                 // status line above the input is there to make obvious.
@@ -333,38 +421,68 @@ impl App {
     /// does so as whole blocks settle into scrollback — not per token — and
     /// because the alternative is showing nothing until a reply finishes.
     pub fn live_height(&self) -> u16 {
-        Self::HEIGHT + self.tail_height
+        Self::HEIGHT
+    }
+
+    /// Rows shared by whatever needs them: the candidate list while choosing a
+    /// command, the in-flight reply while one streams, otherwise the subagent
+    /// strip and the working line.
+    ///
+    /// A fixed budget rather than a growing region. Resizing an inline
+    /// viewport blanks the screen, and even when it does not, a region that
+    /// grew would shove the input line under the user's hands.
+    pub const OVERFLOW: u16 = 3;
+    pub const MAX_CANDIDATES: u16 = Self::OVERFLOW;
+
+    pub fn completion_height(&self) -> u16 {
+        (self.completion.candidates.len() as u16).min(Self::MAX_CANDIDATES)
     }
 
     /// The live region: the in-flight text, then six fixed rows of chrome.
     pub fn render_live(&mut self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
         self.frame = self.frame.wrapping_add(1);
         let width = area.width as usize;
-        let tail = self.stream_tail(width);
-        self.tail_height = tail.len() as u16;
-
-        let split = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(self.tail_height), Constraint::Min(6)])
-            .split(area);
-        if !tail.is_empty() {
-            Paragraph::new(tail).render(split[0], buf);
-        }
+        self.tail_height = 0;
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1); 6])
-            .split(split[1]);
+            .split(area);
 
-        if !self.subagents.is_empty() {
-            Paragraph::new(self.subagent_strip(width)).render(chunks[0], buf);
+        // The three shared rows, in priority order: choosing a command beats
+        // watching a reply arrive, which beats idle status.
+        let overflow: Vec<Line<'static>> = if self.completion.is_open() {
+            self.candidate_lines(width)
+        } else {
+            let mut tail = self.stream_tail(width);
+            if tail.len() > Self::OVERFLOW as usize {
+                tail.drain(..tail.len() - Self::OVERFLOW as usize);
+            }
+            if tail.is_empty() {
+                let mut rows = Vec::new();
+                if !self.subagents.is_empty() {
+                    rows.push(self.subagent_strip(width));
+                }
+                if self.busy() {
+                    rows.push(self.working_line());
+                }
+                rows
+            } else {
+                tail
+            }
+        };
+        // Bottom-aligned within the budget, so the newest line sits closest to
+        // the input.
+        let offset = Self::OVERFLOW as usize - overflow.len().min(Self::OVERFLOW as usize);
+        for (index, line) in overflow
+            .into_iter()
+            .take(Self::OVERFLOW as usize)
+            .enumerate()
+        {
+            Paragraph::new(line).render(chunks[offset + index], buf);
         }
-        if self.busy() {
-            Paragraph::new(self.working_line()).render(chunks[1], buf);
-        }
-        Paragraph::new(self.top_rule(width)).render(chunks[2], buf);
-        Paragraph::new(self.input_line()).render(chunks[3], buf);
-        Paragraph::new(Line::from(Span::styled("─".repeat(width), theme::faint())))
-            .render(chunks[4], buf);
+
+        Paragraph::new(self.top_rule(width)).render(chunks[3], buf);
+        Paragraph::new(self.input_line()).render(chunks[4], buf);
         Paragraph::new(self.status_line(width)).render(chunks[5], buf);
     }
 
@@ -429,12 +547,47 @@ impl App {
         Line::from(spans)
     }
 
+    /// The candidate list, with the selection always kept in view.
+    fn candidate_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let max = Self::MAX_CANDIDATES as usize;
+        let start = self.selected.saturating_sub(max - 1);
+        let name_width = self
+            .completion
+            .candidates
+            .iter()
+            .map(|c| c.value.width())
+            .max()
+            .unwrap_or(0)
+            .min(28);
+
+        self.completion
+            .candidates
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(max)
+            .map(|(index, candidate)| {
+                let picked = index == self.selected;
+                let mut spans = vec![
+                    Span::styled(if picked { "▸ " } else { "  " }, theme::accent()),
+                    Span::styled(
+                        format!("{:<name_width$}", candidate.value),
+                        if picked { theme::bold() } else { theme::fg() },
+                    ),
+                ];
+                if !candidate.detail.is_empty() {
+                    let room = width.saturating_sub(4 + name_width);
+                    let detail: String = candidate.detail.chars().take(room).collect();
+                    spans.push(Span::styled(format!("  {detail}"), theme::dim()));
+                }
+                Line::from(spans)
+            })
+            .collect()
+    }
+
     /// Where the cursor should sit, given the live region's origin.
     pub fn cursor(&self, area: Rect) -> (u16, u16) {
-        (
-            area.x + 2 + self.input.column(),
-            area.y + self.tail_height + 3,
-        )
+        (area.x + 2 + self.input.column(), area.y + 4)
     }
 
     /// The shimmer that tells you it is alive without redrawing the world.
@@ -468,7 +621,20 @@ impl App {
 
     /// The rule above the input doubles as the place to say what Enter will do.
     fn top_rule(&self, width: usize) -> Line<'static> {
-        let (label, style) = if self.unread() > 0 {
+        let (label, style) = if self.completion.is_open() {
+            (
+                format!(
+                    "{} match{} · tab to accept · ↑↓ to choose",
+                    self.completion.candidates.len(),
+                    if self.completion.candidates.len() == 1 {
+                        ""
+                    } else {
+                        "es"
+                    }
+                ),
+                theme::dim(),
+            )
+        } else if self.unread() > 0 {
             (
                 format!("✉ {} unread · ↑ to mark read", self.unread()),
                 theme::alert(),
@@ -888,6 +1054,69 @@ mod tests {
             .collect();
         assert!(status.width() <= 24, "{status:?}");
         assert!(status.contains("leve-spark-1.2"), "{status:?}");
+    }
+
+    /// Render into a buffer and read the rows back, so what is asserted is
+    /// what a user would see.
+    fn screen(app: &mut App, width: u16) -> String {
+        let area = Rect::new(0, 0, width, app.live_height());
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        app.render_live(area, &mut buf);
+        (0..area.height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_candidate_list_is_actually_drawn() {
+        let mut a = app();
+        a.set_commands(vec![
+            Command::new("help", "what these commands do"),
+            Command::new("model", "show or switch the model"),
+        ]);
+        typed(&mut a, "/");
+        assert!(a.completion().is_open());
+
+        let text = screen(&mut a, 60);
+        assert!(text.contains("/help"), "candidates are on screen:\n{text}");
+        assert!(text.contains("/model"), "{text}");
+        assert!(text.contains("▸"), "one is highlighted:\n{text}");
+        assert!(
+            text.contains("⟩ /"),
+            "and the input is still there:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_streaming_tail_is_actually_drawn() {
+        let mut a = app();
+        a.apply(Update::Delta("a sentence still arriving".into()));
+        let text = screen(&mut a, 60);
+        assert!(
+            text.contains("still arriving"),
+            "in-flight text is visible:\n{text}"
+        );
+    }
+
+    #[test]
+    fn choosing_a_command_takes_priority_over_watching_a_reply() {
+        let mut a = app();
+        a.set_commands(vec![Command::new("help", "reference")]);
+        a.apply(Update::Delta("streaming text".into()));
+        typed(&mut a, "/");
+        let text = screen(&mut a, 60);
+        assert!(text.contains("/help"), "{text}");
+        assert!(
+            !text.contains("streaming text"),
+            "the menu wins the shared rows:\n{text}"
+        );
     }
 
     #[test]

@@ -16,4 +16,5 @@ pub mod records;
 pub mod sandbox;
 pub mod storage;
 pub mod theme;
+pub mod tools;
 pub mod tui;
