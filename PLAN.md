@@ -139,6 +139,9 @@ tests/{crash,microvm,provider_http}.rs
 23. **The TUI.** Ratatui inline renderer, checkpointed Markdown streaming,
     slash completion, subagent/inbox/steer/follow-up states, and startup spinner.
 
+The session task is the owner boundary: the TUI and integrations receive only
+`SessionHandle` commands and broadcast events, never a mutable `Storage`.
+
 ## 4. Scope cuts (explicit)
 
 - No v3 JSONL compatibility: this is a new agent, there is nothing to be compatible with.
