@@ -28,46 +28,49 @@ What actually exists in `src/` today:
 
 ```
 src/
-  lib.rs              crate root: pub mod ids, lua, project, records, sandbox, storage
-  ids.rs              EntryId / RecordId / RunId — prefixed ids, provisioned before the effect
-  records.rs          the durable wire format: Line = Header | Entry | Record; JSONL v4;
-                      entries are the conversation tree, records are metadata;
-                      Replay::{Safe,Never}, Outcome
-  storage/
-    mod.rs            single-owner session state: entries, records, lanes, facts, one seq
-    jsonl.rs          one file per session, one line per mutation, flush every append,
-                      torn-tail truncation on reopen, middle corruption refused
-  sandbox.rs          the mandatory microVM: links microsandbox crate directly (pinned =0.6.8),
-                      deny-by-default egress, scoped secrets, fingerprint reuse, cancellation
-  lua.rs              the scripting surface: agent { }, sandbox { }, tool("name", { });
-                      ctx.sh → microVM (only command path), ctx.workdir, ctx.shellescape;
-                      params → JSON schema
-  project.rs          the agent directory, leve init scaffolding, agent-dir guard,
-                      durable paths under .leve/
-  main.rs             CLI: leve init / info / exec / tool, --version
-  templates/          the files leve init writes: agent.lua, sandbox.lua, example_tool.lua,
-                      instructions.md, models.yml, workspace/{AGENTS,SOUL,KNOWLEDGE}.md,
-                      HEARTBEAT.yml, gitignore
-tests/
-  microvm.rs          opt-in integration tests against a real microVM (#[ignore])
+  ids.rs              EntryId / RecordId / RunId
+  records.rs          JSONL v4 wire format; entries, records, Replay, Outcome
+  storage/{mod,jsonl}.rs  single-owner state and torn-tail-safe persistence
+  model.rs            Model trait, streaming callback, ScriptedModel, Usage
+  lane.rs             durable run procedure, abort reconciliation, recovery
+  session.rs          SessionTask owner, command channel, snapshots, events
+  observer.rs         broadcast observer hub
+  hooks.rs            awaited before/after tool hooks
+  compaction.rs       summary entry and durable leaf move
+  provider/
+    config.rs         models.yml, $ENV enforcement, compat resolution
+    sse.rs            chunk-safe SSE decoder
+    openai_responses.rs / anthropic.rs  streaming adapters
+    mod.rs            reqwest transport, retry and diagnostics
+  sandbox.rs          mandatory microsandbox VM, deny-by-default egress
+  lua.rs              agent.lua, sandbox.lua, tools/*.lua, JSON schemas
+  tools.rs            bash/read/write/edit/ls/glob/grep, replay declarations
+  skills.rs           recursive SKILL.md catalog and validation
+  heartbeat.rs        schedule reload and response-contract validation
+  channels.rs         inbox broadcast and namespaced durable KV
+  project.rs          agent directory and leve init
+  tui/{app,item,markdown,stream,complete,run,session}.rs
+                       inline ratatui renderer and terminal session
+  main.rs              init / info / exec / tool / bare leve TUI
+tests/{crash,microvm,provider_http}.rs
 ```
 
 ## 2. Mapping harness-v2 concepts to Rust
 
 | harness-v2 | Rust |
 |---|---|
-| Session (tree, lanes, logs, facts) | `Storage` owning entries, records, lanes, facts, `seq` |
-| single writer | structural: only the owning task holds the `Storage` |
+| Session (tree, lanes, logs, facts) | `Storage` owned by `SessionTask` |
+| single writer | structural: only the session task holds `Storage` |
 | shared monotonic `seq` | `Storage`-local counter; every write assigns it |
-| lane (leaf + op log + queues) | a `LaneState { leaf }` in `Storage`; lane execution is pending |
-| lanes run in parallel | tokio tasks, serialized at the owning task — pending |
-| `prompt/steer/abort/resume` | commands to the owning task — pending |
-| abort signal | `tokio_util_lite::CancelRx` — one bit, delivered once; kills the guest command |
-| hooks (awaited) | pending |
-| events (passive) | pending (observer hub) |
-| `watch()` snapshot + gapless stream | pending |
-| tools | Lua `tool("name", {…})`; body on host, `ctx.sh` in the VM; `params` → JSON schema |
-| telemetry | pending |
+| lane (leaf + op log + queues) | `LaneState { leaf }` plus `Lane::run_with` |
+| lanes run in parallel | session tasks can run independently; one owner per session |
+| `prompt/steer/abort/resume` | `SessionHandle` commands; abort carries `CancelRx` |
+| abort signal | `tokio_util_lite::CancelRx`; kills guest commands through `Toolbox` |
+| hooks (awaited) | `Hooks::run_before_tool` / `run_after_tool` |
+| events (passive) | `SessionTask` event broadcast plus `Observer` |
+| `watch()` snapshot + gapless stream | broadcast `Event::Snapshot` after each command |
+| tools | Lua plus seven Rust built-ins; all effects use `Sandbox` |
+| telemetry | provider usage and cache-miss diagnostics; exporters pending |
 
 ## 3. Implementation sequence
 
@@ -119,19 +122,22 @@ tests/
     inside the tool, SIGKILLs it, and reduces what the dead process left on disk. Nothing
     is simulated.
 
-### Pending
+### Done
 
-15. **Providers** — `openai-responses`, `anthropic-messages`, and a `fake` over the `Model`
-    trait. `models.yml` is scaffolded and parsed; no requests are made yet.
-16. **Lane execution as a task** — the run procedure exists but runs inline against a
-    borrowed `Storage`; no owning task, no concurrent lanes, no queues or steering.
-17. **Observer hub + snapshots + events.**
-18. **Compaction** — branch summarisation; `set_leaf` exists but no summariser.
-19. **Hooks** — interception points.
-20. **Heartbeats** — `HEARTBEAT.yml` is scaffolded; no scheduler reloads it.
-21. **Skills** — `workspace/skills/` exists; no discovery, catalog, or frontmatter parsing.
-22. **Channels** — `channels/` is an empty directory; no adapters.
-23. **The TUI** — no terminal renderer.
+15. **Providers.** OpenAI Responses and Anthropic Messages thin `reqwest` adapters:
+    SSE streaming, tool-call deltas, cumulative usage, transient retries, provider
+    diagnostics, and compat-specific request bodies.
+16. **Lane execution as a task.** `SessionTask` owns `Storage`; commands cross its
+    channel and replies return via oneshots. TUI turns reopen the same JSONL session.
+17. **Observer hub + snapshots + events.** Broadcast subscribers receive ordered
+    run and snapshot events without storage access.
+18. **Compaction.** Summary entry, lane leaf move, durable start/finish records.
+19. **Hooks.** Awaited sequential before-tool hooks with fail-closed errors.
+20. **Heartbeats.** Reload fingerprints and strict response-contract parser.
+21. **Skills.** Recursive SKILL.md discovery and frontmatter catalog injection.
+22. **Channels.** Ordered inbox hub and namespaced durable KV store.
+23. **The TUI.** Ratatui inline renderer, checkpointed Markdown streaming,
+    slash completion, subagent/inbox/steer/follow-up states, and startup spinner.
 
 ## 4. Scope cuts (explicit)
 

@@ -24,7 +24,7 @@
 use serde_json::{Map, Value};
 
 use crate::ids::{EntryId, RunId};
-use crate::model::{Model, StopReason};
+use crate::model::{Model, Request, StopReason, ToolSchema};
 use crate::records::{Entry, Outcome, Record, Replay};
 use crate::sandbox::tokio_util_lite::CancelRx;
 use crate::storage::Storage;
@@ -58,6 +58,17 @@ pub trait Tools: Send + Sync {
         name: &'a str,
         arguments: Map<String, Value>,
     ) -> crate::model::BoxFuture<'a, std::result::Result<String, String>>;
+
+    /// Cancellation-aware invocation. Existing tools inherit the non-cancel
+    /// path; the production toolbox overrides it for guest commands.
+    fn invoke_cancelled<'a>(
+        &'a self,
+        name: &'a str,
+        arguments: Map<String, Value>,
+        _cancel: Option<CancelRx>,
+    ) -> crate::model::BoxFuture<'a, std::result::Result<String, String>> {
+        self.invoke(name, arguments)
+    }
 }
 
 /// One run's report.
@@ -68,6 +79,22 @@ pub struct RunReport {
     pub attempts: u32,
 }
 
+/// Passive updates emitted while a run proceeds. The observer/TUI can consume
+/// these without owning or mutating storage.
+#[derive(Debug, Clone)]
+pub enum RunEvent {
+    AssistantDelta(String),
+    ToolStarted {
+        name: String,
+        arguments: Map<String, Value>,
+    },
+    ToolFinished {
+        name: String,
+        success: bool,
+        text: String,
+    },
+}
+
 pub struct Lane<'a> {
     pub name: String,
     pub storage: &'a mut Storage,
@@ -76,8 +103,20 @@ pub struct Lane<'a> {
 }
 
 impl Lane<'_> {
+    /// Run one operation with the default empty prompt context and no observer.
+    pub async fn run(&mut self, prompt: &str, cancel: Option<CancelRx>) -> Result<RunReport> {
+        self.run_with(prompt, cancel, "", &[], &|_| {}).await
+    }
+
     /// Run one operation to completion, abort, or the retry cap.
-    pub async fn run(&mut self, prompt: &str, mut cancel: Option<CancelRx>) -> Result<RunReport> {
+    pub async fn run_with(
+        &mut self,
+        prompt: &str,
+        mut cancel: Option<CancelRx>,
+        system: &str,
+        schemas: &[ToolSchema],
+        on_event: &(dyn Fn(RunEvent) + Send + Sync),
+    ) -> Result<RunReport> {
         let run_id = RunId::new();
         // Intent first: if the process dies after this line, recovery knows an
         // operation was open and what it was.
@@ -117,12 +156,18 @@ impl Lane<'_> {
                 .into_iter()
                 .cloned()
                 .collect();
-            let request = crate::model::Request {
+            let request = Request {
                 context: &context,
-                system: "",
-                tools: &[],
+                system,
+                tools: schemas,
             };
-            let assistant = match self.model.respond(request, &|_| {}).await {
+            let assistant = match self
+                .model
+                .respond(request, &|delta| {
+                    on_event(RunEvent::AssistantDelta(delta.to_string()));
+                })
+                .await
+            {
                 Ok(assistant) => assistant,
                 Err(e) => {
                     self.record(
@@ -151,6 +196,10 @@ impl Lane<'_> {
                 // Provision the id the result will use, then declare it.
                 let result_id = EntryId::new();
                 let replay = self.tools.replay(&call.name);
+                on_event(RunEvent::ToolStarted {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                });
                 self.record(
                     "tool_started",
                     serde_json::json!({
@@ -170,10 +219,19 @@ impl Lane<'_> {
                     break;
                 }
 
-                let text = match self.tools.invoke(&call.name, call.arguments.clone()).await {
+                let text = match self
+                    .tools
+                    .invoke_cancelled(&call.name, call.arguments.clone(), cancel.clone())
+                    .await
+                {
                     Ok(text) => text,
                     Err(message) => format!("tool {} failed: {message}", call.name),
                 };
+                on_event(RunEvent::ToolFinished {
+                    name: call.name.clone(),
+                    success: !text.starts_with("tool ") || !text.contains(" failed:"),
+                    text: text.clone(),
+                });
                 self.append_result(&result_id, call, text, false)?;
             }
             if aborted {

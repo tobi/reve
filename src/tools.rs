@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
 
+use crate::hooks::Hooks;
 use crate::lane::Tools as LaneTools;
 use crate::lua::Runtime;
 use crate::model::{BoxFuture, ToolSchema};
@@ -127,11 +128,21 @@ const MAX_OUTPUT: usize = 24_000;
 pub struct Toolbox {
     sandbox: Arc<Sandbox>,
     runtime: Arc<Runtime>,
+    hooks: Hooks,
 }
 
 impl Toolbox {
     pub fn new(sandbox: Arc<Sandbox>, runtime: Arc<Runtime>) -> Self {
-        Self { sandbox, runtime }
+        Self {
+            sandbox,
+            runtime,
+            hooks: Hooks::new(),
+        }
+    }
+
+    pub fn with_hooks(mut self, hooks: Hooks) -> Self {
+        self.hooks = hooks;
+        self
     }
 
     /// Everything the model may call: built-ins first, then this agent's own.
@@ -170,6 +181,25 @@ impl Toolbox {
 
     /// Run a tool. `Err` is a tool failure the model gets to read, not a fault.
     pub async fn call(&self, name: &str, args: Map<String, Value>) -> Result<String, String> {
+        self.call_cancelled(name, args, None).await
+    }
+
+    pub async fn call_cancelled(
+        &self,
+        name: &str,
+        args: Map<String, Value>,
+        cancel: Option<crate::sandbox::tokio_util_lite::CancelRx>,
+    ) -> Result<String, String> {
+        let before = self
+            .hooks
+            .run_before_tool(serde_json::json!({"toolName": name, "args": args}))
+            .await
+            .map_err(|e| format!("before_tool hook: {e}"))?;
+        let args = before
+            .get("args")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or(args);
         // The agent's own tools take precedence.
         if self.runtime.tool(name).is_some() {
             return self
@@ -194,7 +224,7 @@ impl Toolbox {
                             timeout: Some(std::time::Duration::from_secs(timeout)),
                             ..Default::default()
                         },
-                        None,
+                        cancel,
                     )
                     .await
                     .map_err(|e| e.to_string())?;
@@ -292,7 +322,13 @@ impl Toolbox {
             }
             other => return Err(format!("no tool named {other:?}")),
         };
-        Ok(truncate(&text))
+        let after = self
+            .hooks
+            .run_after_tool(json!({"toolName": name, "result": text}))
+            .await
+            .map_err(|e| format!("after_tool hook: {e}"))?;
+        let text = after.get("result").and_then(Value::as_str).unwrap_or("");
+        Ok(truncate(text))
     }
 
     async fn shell(&self, command: &str) -> Result<String, String> {
@@ -322,6 +358,15 @@ impl LaneTools for Toolbox {
     ) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(self.call(name, arguments))
     }
+
+    fn invoke_cancelled<'a>(
+        &'a self,
+        name: &'a str,
+        arguments: Map<String, Value>,
+        cancel: Option<crate::sandbox::tokio_util_lite::CancelRx>,
+    ) -> BoxFuture<'a, Result<String, String>> {
+        Box::pin(self.call_cancelled(name, arguments, cancel))
+    }
 }
 
 fn string(args: &Map<String, Value>, key: &str) -> Result<String, String> {
@@ -349,7 +394,6 @@ fn replace_once(content: &str, old: &str, new: &str) -> Result<String, String> {
         )),
     }
 }
-
 fn truncate(text: &str) -> String {
     if text.len() <= MAX_OUTPUT {
         return text.to_string();

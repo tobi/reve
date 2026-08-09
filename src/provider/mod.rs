@@ -74,26 +74,65 @@ impl Model for HttpModel {
                 }
             };
 
-            let mut post = self.client.post(self.endpoint()).json(&body);
-            // Authentication is spelled differently by each vendor, and this is
-            // the only place that difference exists.
-            post = match self.resolved.api {
-                Api::AnthropicMessages => post.header("anthropic-version", "2023-06-01").header(
-                    "x-api-key",
-                    self.resolved.api_key.clone().unwrap_or_default(),
-                ),
-                _ => post.bearer_auth(self.resolved.api_key.clone().unwrap_or_default()),
+            let response = {
+                let mut last_error = None;
+                let mut response = None;
+                for attempt in 0..3u32 {
+                    let mut post = self.client.post(self.endpoint()).json(&body);
+                    // Authentication is spelled differently by each vendor,
+                    // and this is the only place that difference exists.
+                    post = match self.resolved.api {
+                        Api::AnthropicMessages => {
+                            post.header("anthropic-version", "2023-06-01").header(
+                                "x-api-key",
+                                self.resolved.api_key.clone().unwrap_or_default(),
+                            )
+                        }
+                        _ => post.bearer_auth(self.resolved.api_key.clone().unwrap_or_default()),
+                    };
+                    match post.send().await {
+                        Ok(candidate) if attempt < 2 && is_retryable(candidate.status()) => {
+                            let status = candidate.status();
+                            let body = candidate.text().await.unwrap_or_default();
+                            last_error = Some(format!("transient status {status}: {body}"));
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                100 * (1 << attempt),
+                            ))
+                            .await;
+                        }
+                        Ok(candidate) => {
+                            response = Some(candidate);
+                            break;
+                        }
+                        Err(error) if attempt < 2 => {
+                            last_error = Some(match last_error.take() {
+                                Some(previous) => format!("{previous}; retry error: {error}"),
+                                None => error.to_string(),
+                            });
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                100 * (1 << attempt),
+                            ))
+                            .await;
+                        }
+                        Err(error) => {
+                            last_error = Some(match last_error.take() {
+                                Some(previous) => format!("{previous}; final request: {error}"),
+                                None => error.to_string(),
+                            });
+                            break;
+                        }
+                    }
+                }
+                response.ok_or_else(|| {
+                    ModelError(format!(
+                        "{} model {} ({}): {}",
+                        self.resolved.provider,
+                        self.resolved.model.id,
+                        self.endpoint(),
+                        last_error.unwrap_or_else(|| "request failed".into())
+                    ))
+                })?
             };
-
-            let response = post.send().await.map_err(|e| {
-                // Say which provider and which URL: "connection refused" on its
-                // own has sent people hunting in the wrong place.
-                ModelError(format!(
-                    "{} ({}): {e}",
-                    self.resolved.provider,
-                    self.endpoint()
-                ))
-            })?;
 
             let status = response.status();
             if !status.is_success() {
@@ -200,6 +239,10 @@ pub fn tool_schemas(runtime: &crate::lua::Runtime) -> Vec<ToolSchema> {
         .collect()
 }
 
+fn is_retryable(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 409 | 429) || status.is_server_error()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +253,14 @@ mod tests {
             MAIN_LANE,
             json!({"role": role, "content": [{"type": "text", "text": text}]}),
         )
+    }
+
+    #[test]
+    fn transient_statuses_are_retried_but_client_errors_are_not() {
+        assert!(is_retryable(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!is_retryable(reqwest::StatusCode::BAD_REQUEST));
+        assert!(!is_retryable(reqwest::StatusCode::UNAUTHORIZED));
     }
 
     #[test]

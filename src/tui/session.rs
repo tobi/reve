@@ -12,13 +12,15 @@ use std::time::Instant;
 
 use tokio::sync::mpsc;
 
-use crate::model::{Model, Request, StopReason};
+use crate::lane::{Lane, RunEvent, recover};
+use crate::model::Model;
 use crate::project::Project;
 use crate::provider::HttpModel;
 use crate::provider::config::Models;
-use crate::records::{Entry, MAIN_LANE};
+use crate::records::MAIN_LANE;
 use crate::sandbox::tokio_util_lite::{CancelTx, channel};
 use crate::sandbox::{ExecOptions, Sandbox};
+use crate::storage::Storage;
 use crate::tools::Toolbox;
 use crate::tui::app::{Action, App, Update};
 use crate::tui::complete::{Candidate, Command};
@@ -80,10 +82,23 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
         tokio::spawn(async move {
             // The first request of a session has a cold prefix by definition,
             // so warning about it would be noise every single launch.
-            let mut turns = 0usize;
             let toolbox = Toolbox::new(sandbox.clone(), project.runtime_arc());
-            // The conversation, which is what makes it one.
-            let mut history: Vec<Entry> = Vec::new();
+            // Storage is owned by this worker task. No other task receives a
+            // mutable handle, making the single-writer rule structural on the
+            // terminal path.
+            let session_path = project
+                .latest_session(MAIN_LANE)
+                .unwrap_or_else(|| project.conversation_path(MAIN_LANE));
+            let mut storage = match Storage::open(&session_path, "main", Some("workspace".into())) {
+                Ok(storage) => storage,
+                Err(error) => {
+                    let _ = updates
+                        .send(Update::Item(Item::Notice(format!("session: {error}"))))
+                        .await;
+                    return;
+                }
+            };
+            let _ = recover(&mut storage, MAIN_LANE, &toolbox).await;
             // Held so an Interrupt can reach the command that is running.
             let mut cancel: Option<CancelTx> = None;
             while let Some(action) = actions_rx.recv().await {
@@ -101,24 +116,83 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
 
                         // `!` is the shell escape, exactly as it is in the
                         // durable record; anything else is for the model.
-                        let item = if let Some(command) = text.strip_prefix('!') {
+                        let item = if text.trim() == "/compact" {
+                            match crate::compaction::compact(
+                                &mut storage,
+                                MAIN_LANE,
+                                20,
+                                "manual compaction",
+                            ) {
+                                Ok(report) => Some(Item::Assistant(format!(
+                                    "compacted {} entries into `{}`",
+                                    report.removed_from_context, report.summary_id
+                                ))),
+                                Err(error) => Some(Item::Notice(format!("compact: {error}"))),
+                            }
+                        } else if let Some(command) = text.strip_prefix('!') {
                             Some(run_command(&sandbox, command.trim(), rx).await)
                         } else if let Some(rest) = text.strip_prefix('/') {
                             dispatch(&project, &sandbox, rest).await
                         } else {
                             match &model {
                                 Ok(model) => {
-                                    turns += 1;
-                                    converse(
-                                        model.as_ref(),
-                                        &project,
-                                        &toolbox,
-                                        &mut history,
-                                        &text,
-                                        &updates,
-                                        turns > 1,
-                                    )
-                                    .await
+                                    let system = system_prompt(&project);
+                                    let schemas = toolbox.schemas();
+                                    let sink = updates.clone();
+                                    let events = move |event| match event {
+                                        RunEvent::AssistantDelta(delta) => {
+                                            let _ = sink.try_send(Update::Delta(delta));
+                                        }
+                                        RunEvent::ToolStarted { name, .. } => {
+                                            let _ = sink.try_send(Update::Working(Some(format!(
+                                                "Running {name}"
+                                            ))));
+                                        }
+                                        RunEvent::ToolFinished {
+                                            name,
+                                            success,
+                                            text,
+                                        } => {
+                                            let _ = sink.try_send(Update::Item(Item::Tool {
+                                                verb: "Ran".into(),
+                                                description: name,
+                                                status: if success {
+                                                    Status::Ok
+                                                } else {
+                                                    Status::Failed
+                                                },
+                                                duration: None,
+                                                detail: (!text.trim().is_empty()).then_some(text),
+                                                outcome: (!success).then(|| "failed".to_string()),
+                                            }));
+                                        }
+                                    };
+                                    let mut lane = Lane {
+                                        name: MAIN_LANE.into(),
+                                        storage: &mut storage,
+                                        model: model.as_ref(),
+                                        tools: &toolbox,
+                                    };
+                                    match lane
+                                        .run_with(&text, Some(rx), &system, &schemas, &events)
+                                        .await
+                                    {
+                                        Ok(report) => {
+                                            if report.outcome == crate::records::Outcome::Failed {
+                                                Some(Item::Notice(format!(
+                                                    "run failed after {} attempts",
+                                                    report.attempts
+                                                )))
+                                            } else if report.outcome
+                                                == crate::records::Outcome::Aborted
+                                            {
+                                                Some(Item::Notice("Interrupted".into()))
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                        Err(error) => Some(Item::Notice(format!("run: {error}"))),
+                                    }
                                 }
                                 Err(why) => Some(Item::Notice(format!("no model: {why}"))),
                             }
@@ -240,6 +314,15 @@ async fn dispatch(project: &Arc<Project>, sandbox: &Arc<Sandbox>, rest: &str) ->
             }
         }
         "sandbox" => sandbox.describe(),
+        "skills" => match crate::skills::discover(&project.workspace()) {
+            Ok(skills) if skills.is_empty() => "No skills discovered.".to_string(),
+            Ok(skills) => skills
+                .iter()
+                .map(|s| format!("- `{}` — {}", s.name, s.description))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Err(error) => format!("skills: {error}"),
+        },
         "tools" => {
             if project.runtime.tools.is_empty() {
                 "No tools. Drop a file into `tools/`.".to_string()
@@ -290,6 +373,8 @@ fn commands_for(project: &Project) -> Vec<Command> {
         Command::new("model", "show or switch the model").with_arguments(models),
         Command::new("models", "list the configured models"),
         Command::new("sandbox", "describe the microVM and its egress policy"),
+        Command::new("compact", "summarize old conversation context"),
+        Command::new("skills", "list workspace skills"),
         Command::new("tools", "list this agent's Lua tools"),
         Command::new("quit", "leave"),
     ];
@@ -316,121 +401,10 @@ fn load_model(project: &Project) -> std::result::Result<Arc<dyn Model>, String> 
     Ok(Arc::new(HttpModel::new(resolved)))
 }
 
-/// One exchange: ask, run whatever tools come back, ask again, until done.
+/// The system prompt: identity, workspace context, and the live skill catalog.
 ///
-/// `history` accumulates across exchanges — without it every prompt would
-/// start from nothing and the agent could not hold a conversation.
-#[allow(clippy::too_many_arguments)]
-async fn converse(
-    model: &dyn Model,
-    project: &Project,
-    toolbox: &Toolbox,
-    history: &mut Vec<Entry>,
-    prompt: &str,
-    updates: &mpsc::Sender<Update>,
-    warn_on_cache_miss: bool,
-) -> Option<Item> {
-    history.push(Entry::message(
-        MAIN_LANE,
-        serde_json::json!({"role": "user", "content": prompt}),
-    ));
-
-    let tools = toolbox.schemas();
-    let system = system_prompt(project);
-    let sink = updates.clone();
-    let forward = move |delta: &str| {
-        let _ = sink.try_send(Update::Delta(delta.to_string()));
-    };
-
-    // Bounded, because a model that keeps calling tools without converging
-    // costs money and never returns the terminal to the user.
-    const MAX_STEPS: usize = 24;
-    for step in 0..MAX_STEPS {
-        let request = Request {
-            context: history,
-            system: &system,
-            tools: &tools,
-        };
-        let turn = match model.respond(request, &forward).await {
-            Ok(turn) => turn,
-            Err(e) => return Some(Item::Notice(e.to_string())),
-        };
-        let _ = updates.send(Update::EndMessage).await;
-        history.push(Entry::message(MAIN_LANE, turn.message()));
-
-        if turn.stop_reason != StopReason::ToolUse || turn.tool_calls.is_empty() {
-            if warn_on_cache_miss && turn.usage.input > 0 && turn.usage.uncached_fraction() > 0.3 {
-                return Some(Item::Notice(format!(
-                    "prompt cache miss: {:.0}% of {} input tokens were uncached",
-                    turn.usage.uncached_fraction() * 100.0,
-                    turn.usage.input
-                )));
-            }
-            return None;
-        }
-
-        for call in &turn.tool_calls {
-            let started = std::time::Instant::now();
-            let _ = updates
-                .send(Update::Working(Some(format!("Running {}", call.name))))
-                .await;
-            let result = toolbox.call(&call.name, call.arguments.clone()).await;
-            let (text, status) = match &result {
-                Ok(text) => (text.clone(), Status::Ok),
-                Err(e) => (e.clone(), Status::Failed),
-            };
-
-            let _ = updates
-                .send(Update::Item(Item::Tool {
-                    verb: "Ran".into(),
-                    description: describe_call(&call.name, &call.arguments),
-                    status,
-                    duration: Some(started.elapsed()),
-                    detail: (!text.trim().is_empty()).then(|| text.clone()),
-                    outcome: result.is_err().then(|| "failed".to_string()),
-                }))
-                .await;
-
-            history.push(Entry::message(
-                MAIN_LANE,
-                serde_json::json!({
-                    "role": "toolResult",
-                    "toolCallId": call.id,
-                    "content": [{"type": "text", "text": text}],
-                }),
-            ));
-        }
-        let _ = updates.send(Update::Working(Some("Working".into()))).await;
-
-        if step + 1 == MAX_STEPS {
-            return Some(Item::Notice(format!(
-                "stopped after {MAX_STEPS} tool steps without finishing"
-            )));
-        }
-    }
-    None
-}
-
-/// The most useful part of a tool call, for the one-line summary.
-fn describe_call(name: &str, args: &serde_json::Map<String, serde_json::Value>) -> String {
-    let detail = args
-        .get("command")
-        .or_else(|| args.get("path"))
-        .or_else(|| args.get("pattern"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if detail.is_empty() {
-        name.to_string()
-    } else {
-        format!("{name} · {}", detail.lines().next().unwrap_or(""))
-    }
-}
-
-/// The system prompt: the agent's prose identity, plus the workspace files it
-/// keeps its own mind in.
-///
-/// These are read fresh every exchange rather than cached, because the agent
-/// edits them — that is the point of `workspace/` being writable.
+/// Rebuilt each exchange because the agent edits these files inside the
+/// workspace — that is the point of them being writable.
 fn system_prompt(project: &Project) -> String {
     let mut parts = Vec::new();
     if let Ok(text) = std::fs::read_to_string(project.root.join("instructions.md")) {
@@ -448,6 +422,16 @@ fn system_prompt(project: &Project) -> String {
                 parts.push(format!("# {file}\n\n{}", body.trim()));
             }
         }
+    }
+    if let Ok(skills) = crate::skills::discover(&workspace)
+        && !skills.is_empty()
+    {
+        let catalog = skills
+            .iter()
+            .map(|skill| format!("- `{}` — {}", skill.name, skill.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+        parts.push(format!("# Available skills\n\n{catalog}"));
     }
     parts.push(
         "You are running inside a microVM. The workspace is mounted at /workspace and is \

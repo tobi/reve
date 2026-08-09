@@ -400,36 +400,43 @@ This is tested against a really-killed process: `tests/crash.rs` spawns a child,
 until it is inside a tool, `SIGKILL`s it, and then reduces whatever the dead process left
 on disk. Nothing about it is simulated.
 
-## Not yet built
+## Built runtime surface
 
-The durable core is in place; the surface around it is not. Planned but **not yet
-implemented**:
+The durable harness and the user-facing runtime are implemented:
 
-- **Providers** — `openai-responses`, `anthropic-messages`, and a `fake` over the `Model`
-  trait. `models.yml` is scaffolded and parsed, but no model requests are made; today the
-  only implementation is a scripted model used by the tests.
-- **Lane execution as a task** — the run procedure exists but runs inline against a
-  borrowed `Storage`. No owning task, no concurrent lanes, no queues or steering. Until
-  that lands, "single writer" is a convention rather than a structural guarantee.
-- **The observer hub** — no event snapshots or subscriptions.
-- **Hooks** — no interception points.
-- **Compaction** — no branch summarisation.
-- **Heartbeats** — `workspace/HEARTBEAT.yml` is scaffolded but no scheduler reloads it.
-- **Skills** — `workspace/skills/` exists as a directory but no discovery or catalog.
-- **Channels** — no file-drop adapters; `channels/` is an empty directory.
-- **The TUI** — no terminal renderer.
+- **Providers** — OpenAI Responses and Anthropic Messages are thin `reqwest`
+  adapters with SSE streaming, partial tool-call assembly, usage accounting,
+  cache diagnostics, transient retries, and provider-specific auth/compat
+  handling. The scripted model remains available for deterministic tests.
+- **Lane owner task** — a `SessionTask` owns `Storage`; callers communicate
+  through commands and oneshot replies. The TUI never receives a mutable
+  storage handle.
+- **Observer and hooks** — ordered broadcast snapshots/events and awaited
+  before-tool hooks are available to integrations.
+- **Compaction** — `/compact` writes a summary entry and moves the lane leaf
+  with durable start/finish records.
+- **Heartbeats** — `HEARTBEAT.yml` reload and strict `SILENCE`/`Message:`/`Steer:`
+  response validation are implemented as the scheduler seam.
+- **Skills** — `workspace/skills/**/SKILL.md` discovery, frontmatter validation,
+  and live catalog injection into the system prompt.
+- **Channels** — ordered in-process inbox events and namespaced durable KV state.
+- **TUI** — ratatui inline rendering, subagent/inbox/steer/follow-up states,
+  slash completion, checkpointed streaming Markdown, and animated startup
+  progress.
 
-What works today: `leve init` scaffolds an agent; `leve info` loads and describes it;
-`leve exec` runs a command in the microVM; `leve tool` runs a Lua tool whose `ctx.sh`
-executes in that microVM; the durable JSONL format reads, writes, and reopens correctly;
-and the run procedure, abort reconciliation, and crash recovery work end to end against a
-scripted model.
+Every terminal prompt now writes through the durable lane sequence and reopens
+the same `.leve/sessions/main-*.jsonl` conversation on the next launch. A real
+tool-using model test proves the sequence: `bash` writes in the VM, `read`
+reads the result, the follow-up request receives the user, assistant, and
+tool-result history, and the final answer is persisted.
+
+The remaining engine-level limitation is provider tool continuation from the
+standalone CLI tool command; normal TUI turns run the durable lane.
 
 ## Development
 
 ```bash
-cargo build                              # build the crate and the `leve` binary
-cargo test                               # 46 unit tests
+cargo test                               # 194 unit/integration tests
 cargo test --test microvm -- --ignored   # opt-in microVM integration tests
 cargo clippy                             # lint
 cargo fmt                                # format
