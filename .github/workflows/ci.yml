@@ -13,10 +13,8 @@ concurrency:
 
 jobs:
   test:
-    name: Ruby 4.0
+    name: Rust
     runs-on: ubuntu-latest
-    # leve_sandbox compiles its Rust extension from source. A cold runner can
-    # spend more than ten minutes building the microsandbox crate graph.
     timeout-minutes: 30
 
     steps:
@@ -24,17 +22,11 @@ jobs:
       - name: Install native build dependencies
         run: sudo apt-get update -qq && sudo apt-get install -y libcap-ng-dev
       - uses: dtolnay/rust-toolchain@stable
-      - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: "4.0"
-          bundler-cache: true
-      - name: Compile native extension
-        run: rake compile
-      # rake and rbs ship with Ruby 4. Running outside Bundler keeps these
-      # development-only default gems out of Leve's runtime dependency set.
-      - name: Test, lint, and validate signatures
-        run: rake
-      - name: Validate gem package
-        run: |
-          gem build leve.gemspec
-          gem specification ./leve-*.gem name version summary required_ruby_version metadata >/dev/null
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
