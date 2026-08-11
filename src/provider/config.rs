@@ -50,6 +50,7 @@ pub type Result<T, E = ConfigError> = std::result::Result<T, E>;
 #[serde(rename_all = "kebab-case")]
 pub enum Api {
     OpenaiResponses,
+    OpenaiCompletions,
     AnthropicMessages,
     /// Scripted, for tests. Never reaches the network.
     Fake,
@@ -318,6 +319,14 @@ providers:
     }
 
     #[test]
+    fn chat_completions_is_a_supported_wire_protocol() {
+        let yaml =
+            "providers:\n  proxy:\n    api: openai-completions\n    models:\n      - id: chat\n";
+        let models = Models::parse(yaml, "models.yml").unwrap();
+        assert_eq!(models.providers["proxy"].api, Api::OpenaiCompletions);
+    }
+
+    #[test]
     fn a_model_can_be_named_several_ways() {
         let models = Models::parse(SAMPLE, "models.yml").unwrap();
         let lookup = env(&[("OPENAI_API_KEY", "k")]);
@@ -368,7 +377,7 @@ providers:
 
     #[test]
     fn the_scaffolded_models_file_is_valid() {
-        // The template `leve init` writes must itself load.
+        // The template `reve init` writes must itself load.
         let models = Models::parse(TEMPLATE, "models.yml").expect("the scaffold parses");
         let catalog = models.catalog();
         assert!(
@@ -409,7 +418,7 @@ providers:
             resolved.base_url, "http://127.0.0.1:8080/v1",
             "the $ENV baseUrl resolves"
         );
-        assert_eq!(resolved.api, Api::OpenaiResponses);
+        assert_eq!(resolved.api, Api::OpenaiCompletions);
         // The quirks that make llama.cpp different from OpenAI proper.
         assert!(!resolved.compat.supports_store);
         assert!(!resolved.compat.supports_developer_role);

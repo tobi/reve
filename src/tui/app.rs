@@ -20,8 +20,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
-use super::complete::{Command, Completion, accept, complete};
-use super::item::{Inbox, Item, Status, Subagent};
+use super::complete::{Candidate, Command, Completion, accept, complete};
+use super::item::{Item, Status, Subagent};
 use super::stream::Stream;
 use super::theme;
 
@@ -34,6 +34,8 @@ pub enum Action {
     Steer(String),
     /// Work to pick up after this run.
     FollowUp(String),
+    /// A message delivered by a configured channel.
+    ChannelMessage(crate::channels::Message),
     /// Abort the current operation.
     Interrupt,
     Quit,
@@ -46,7 +48,9 @@ pub enum Update {
     /// `Some(label)` while a run is in flight.
     Working(Option<String>),
     Subagents(Vec<Subagent>),
-    Received(Inbox),
+    /// Current workspace-relative file candidates.
+    Files(Vec<Candidate>),
+    Received(crate::channels::Message),
     /// A chunk of assistant text. Settled blocks go to scrollback as they
     /// complete; the rest is shown live until it settles.
     Delta(String),
@@ -153,7 +157,6 @@ impl Input {
 pub struct App {
     pub input: Input,
     pub subagents: Vec<Subagent>,
-    pub inbox: Vec<Inbox>,
     /// Model, effort, and where we are — the three things worth a permanent line.
     pub model: String,
     pub effort: String,
@@ -166,6 +169,8 @@ pub struct App {
     tail_height: u16,
     /// Slash commands, including this agent's own Lua tools.
     commands: Vec<Command>,
+    /// Workspace-relative `@file` candidates.
+    files: Vec<Candidate>,
     completion: Completion,
     /// Which candidate is highlighted. The first, until the user moves.
     selected: usize,
@@ -183,7 +188,6 @@ impl App {
         Self {
             input: Input::default(),
             subagents: Vec::new(),
-            inbox: Vec::new(),
             model: model.into(),
             effort: effort.into(),
             location: location.into(),
@@ -194,6 +198,7 @@ impl App {
             commands: Vec::new(),
             completion: Completion::default(),
             selected: 0,
+            files: Vec::new(),
             scrollback: Vec::new(),
             interrupt_armed: false,
             frame: 0,
@@ -206,6 +211,10 @@ impl App {
         self.commands = commands;
     }
 
+    pub fn set_files(&mut self, files: Vec<Candidate>) {
+        self.files = files;
+        self.refresh_completion();
+    }
     pub fn commands(&self) -> &[Command] {
         &self.commands
     }
@@ -225,7 +234,7 @@ impl App {
             .candidates
             .get(self.selected)
             .map(|c| c.value.clone());
-        self.completion = complete(self.input.text(), &self.commands);
+        self.completion = complete(self.input.text(), &self.commands, &self.files);
         // Keep the highlight on the same entry when it survives the edit.
         self.selected = previous
             .and_then(|value| {
@@ -241,10 +250,6 @@ impl App {
         self.working.is_some()
     }
 
-    pub fn unread(&self) -> usize {
-        self.inbox.iter().filter(|m| !m.read).count()
-    }
-
     pub fn apply(&mut self, update: Update) {
         match update {
             Update::Item(item) => self.scrollback.push(item),
@@ -255,6 +260,7 @@ impl App {
                 }
             }
             Update::Subagents(agents) => self.subagents = agents,
+            Update::Files(files) => self.set_files(files),
             Update::Delta(text) => {
                 self.stream.push(&text);
                 self.flush_frozen();
@@ -267,10 +273,9 @@ impl App {
             }
             Update::Received(message) => {
                 self.scrollback.push(Item::Received {
-                    channel: message.channel.clone(),
-                    text: message.text.clone(),
+                    channel: message.channel,
+                    text: message.text,
                 });
-                self.inbox.push(message);
             }
         }
     }
@@ -376,11 +381,6 @@ impl App {
                 if self.completion.is_open() {
                     let len = self.completion.candidates.len();
                     self.selected = (self.selected + len - 1) % len;
-                } else {
-                    // Mark the inbox read: you have seen it.
-                    for message in &mut self.inbox {
-                        message.read = true;
-                    }
                 }
             }
             KeyCode::Enter => {
@@ -389,12 +389,29 @@ impl App {
                 }
                 let text = self.input.take();
                 self.completion = Completion::default();
+                if text == "/queue" {
+                    self.scrollback
+                        .push(Item::Notice("usage: /queue <message>".into()));
+                    return None;
+                }
+                if let Some(message) = text.strip_prefix("/queue ") {
+                    let message = message.trim().to_string();
+                    if message.is_empty() {
+                        self.scrollback
+                            .push(Item::Notice("usage: /queue <message>".into()));
+                        return None;
+                    }
+                    self.scrollback.push(Item::FollowUp(message.clone()));
+                    return Some(Action::FollowUp(message));
+                }
                 // The same keystroke means different things depending on
                 // whether the agent is working, which is the distinction the
                 // status line above the input is there to make obvious.
                 return Some(if self.busy() {
                     if let Some(rest) = text.strip_prefix('&') {
-                        Action::FollowUp(rest.trim().to_string())
+                        let message = rest.trim().to_string();
+                        self.scrollback.push(Item::FollowUp(message.clone()));
+                        Action::FollowUp(message)
                     } else {
                         Action::Steer(text)
                     }
@@ -449,9 +466,11 @@ impl App {
             .split(area);
 
         // The three shared rows, in priority order: choosing a command beats
-        // watching a reply arrive, which beats idle status.
-        let overflow: Vec<Line<'static>> = if self.completion.is_open() {
-            self.candidate_lines(width)
+        // watching a reply arrive, which beats idle status. Menus and status
+        // hug the input; a reply starts directly below the transcript and grows
+        // downward, instead of appearing at the bottom and expanding backward.
+        let (overflow, bottom_aligned): (Vec<Line<'static>>, bool) = if self.completion.is_open() {
+            (self.candidate_lines(width), true)
         } else {
             let mut tail = self.stream_tail(width);
             if tail.len() > Self::OVERFLOW as usize {
@@ -465,14 +484,16 @@ impl App {
                 if self.busy() {
                     rows.push(self.working_line());
                 }
-                rows
+                (rows, true)
             } else {
-                tail
+                (tail, false)
             }
         };
-        // Bottom-aligned within the budget, so the newest line sits closest to
-        // the input.
-        let offset = Self::OVERFLOW as usize - overflow.len().min(Self::OVERFLOW as usize);
+        let offset = if bottom_aligned {
+            Self::OVERFLOW as usize - overflow.len().min(Self::OVERFLOW as usize)
+        } else {
+            0
+        };
         for (index, line) in overflow
             .into_iter()
             .take(Self::OVERFLOW as usize)
@@ -595,8 +616,9 @@ impl App {
         let (label, since) = self.working.as_ref().expect("busy");
         let elapsed = since.elapsed().as_secs();
         let mut spans = vec![Span::styled("◇ ", theme::dim())];
+        let period = theme::SHIMMER.len() * 2;
         for (i, ch) in label.chars().enumerate() {
-            let shade = (i + self.frame / 2) % (theme::SHIMMER.len() * 2);
+            let shade = (i + period - (self.frame / 2) % period) % period;
             let shade = if shade >= theme::SHIMMER.len() {
                 theme::SHIMMER.len() - 1
             } else {
@@ -634,14 +656,9 @@ impl App {
                 ),
                 theme::dim(),
             )
-        } else if self.unread() > 0 {
-            (
-                format!("✉ {} unread · ↑ to mark read", self.unread()),
-                theme::alert(),
-            )
         } else if self.busy() {
             (
-                "Enter steers · &text queues a follow-up".to_string(),
+                "Enter steers · /queue text follows up".to_string(),
                 theme::dim(),
             )
         } else if !self.subagents.is_empty() {
@@ -770,7 +787,25 @@ mod tests {
     }
 
     fn app() -> App {
-        App::new("leve-1", "high", "…/my-agent")
+        App::new("reve-1", "high", "…/my-agent")
+    }
+
+    #[test]
+    fn the_working_shimmer_moves_forward_through_the_label() {
+        let mut a = app();
+        a.apply(Update::Working(Some("Running".into())));
+
+        a.frame = 0;
+        let first = a.working_line();
+        a.frame = 2;
+        let second = a.working_line();
+
+        assert_eq!(first.spans[1].style.fg, Some(theme::SHIMMER[0]));
+        assert_eq!(
+            second.spans[2].style.fg,
+            Some(theme::SHIMMER[0]),
+            "the brightest cell advances from R to u"
+        );
     }
 
     #[test]
@@ -800,6 +835,20 @@ mod tests {
             a.handle_key(key(KeyCode::Enter)),
             Some(Action::FollowUp("then run the suite".into()))
         );
+    }
+
+    #[test]
+    fn queue_is_a_discoverable_follow_up_command() {
+        let mut a = app();
+        typed(&mut a, "/queue run the suite");
+        assert_eq!(
+            a.handle_key(key(KeyCode::Enter)),
+            Some(Action::FollowUp("run the suite".into()))
+        );
+        assert!(matches!(
+            a.drain_scrollback().as_slice(),
+            [Item::FollowUp(text)] if text == "run the suite"
+        ));
     }
 
     #[test]
@@ -857,21 +906,18 @@ mod tests {
     }
 
     #[test]
-    fn a_received_message_becomes_transcript_and_unread_at_once() {
+    fn a_received_message_becomes_transcript_without_an_unread_mode() {
         let mut a = app();
-        a.apply(Update::Received(Inbox {
+        a.apply(Update::Received(crate::channels::Message {
             channel: "telegram".into(),
             text: "ship it".into(),
-            read: false,
+            timestamp: 13,
         }));
-        assert_eq!(a.unread(), 1);
-        assert_eq!(
-            a.drain_scrollback().len(),
-            1,
-            "it is also in the transcript"
-        );
-        a.handle_key(key(KeyCode::Up));
-        assert_eq!(a.unread(), 0, "and can be acknowledged");
+        assert!(matches!(
+            a.drain_scrollback().as_slice(),
+            [Item::Received { channel, text }]
+                if channel == "telegram" && text == "ship it"
+        ));
     }
 
     #[test]
@@ -889,14 +935,14 @@ mod tests {
         a.apply(Update::Working(Some("Working".into())));
         assert!(text(&a).contains("Enter steers"), "{}", text(&a));
 
-        a.apply(Update::Received(Inbox {
+        a.apply(Update::Received(crate::channels::Message {
             channel: "telegram".into(),
             text: "hi".into(),
-            read: false,
+            timestamp: 13,
         }));
         assert!(
-            text(&a).contains("1 unread"),
-            "unread outranks everything: {}",
+            text(&a).contains("Enter steers"),
+            "delivery does not create a separate unread state: {}",
             text(&a)
         );
     }
@@ -1021,7 +1067,7 @@ mod tests {
     #[test]
     fn a_long_location_is_elided_from_the_left_rather_than_cut_off() {
         let a = App::new(
-            "leve-spark-1.2",
+            "reve-spark-1.2",
             "high",
             "/home/tobi/src/deeply/nested/project/worktree-green-valley-793b",
         );
@@ -1045,7 +1091,7 @@ mod tests {
 
     #[test]
     fn a_status_line_with_no_room_for_a_path_still_shows_the_model() {
-        let a = App::new("leve-spark-1.2", "high", "/very/long/path/indeed");
+        let a = App::new("reve-spark-1.2", "high", "/very/long/path/indeed");
         let status: String = a
             .status_line(24)
             .spans
@@ -1053,7 +1099,7 @@ mod tests {
             .map(|s| s.content.to_string())
             .collect();
         assert!(status.width() <= 24, "{status:?}");
-        assert!(status.contains("leve-spark-1.2"), "{status:?}");
+        assert!(status.contains("reve-spark-1.2"), "{status:?}");
     }
 
     /// Render into a buffer and read the rows back, so what is asserted is
@@ -1095,6 +1141,39 @@ mod tests {
     }
 
     #[test]
+    fn workspace_files_complete_and_render_with_details() {
+        let mut a = app();
+        a.set_files(vec![Candidate {
+            value: "@AGENTS.md".into(),
+            detail: "309 B".into(),
+        }]);
+        typed(&mut a, "inspect @AG");
+
+        let text = screen(&mut a, 60);
+        assert!(
+            text.contains("@AGENTS.md"),
+            "file candidate is visible:\n{text}"
+        );
+        assert!(text.contains("309 B"), "file detail is visible:\n{text}");
+
+        assert_eq!(a.handle_key(key(KeyCode::Tab)), None);
+        assert_eq!(a.input.text(), "inspect @AGENTS.md");
+    }
+
+    #[test]
+    fn refreshed_workspace_files_complete_without_restarting_the_tui() {
+        let mut a = app();
+        typed(&mut a, "inspect @new");
+        assert!(!a.completion().is_open());
+
+        a.apply(Update::Files(vec![Candidate {
+            value: "@new.txt".into(),
+            detail: "1 B".into(),
+        }]));
+        assert!(a.completion().is_open());
+    }
+
+    #[test]
     fn the_streaming_tail_is_actually_drawn() {
         let mut a = app();
         a.apply(Update::Delta("a sentence still arriving".into()));
@@ -1103,6 +1182,42 @@ mod tests {
             text.contains("still arriving"),
             "in-flight text is visible:\n{text}"
         );
+    }
+
+    #[test]
+    fn consecutive_turns_are_flushed_in_temporal_order() {
+        let mut a = app();
+        a.apply(Update::Delta("first answer".into()));
+        a.apply(Update::EndMessage);
+        a.apply(Update::Item(Item::User("next question".into())));
+        a.apply(Update::Delta("second answer".into()));
+        a.apply(Update::EndMessage);
+
+        assert!(matches!(
+            a.drain_scrollback().as_slice(),
+            [
+                Item::Assistant(first),
+                Item::User(question),
+                Item::Assistant(second),
+            ] if first == "first answer"
+                && question == "next question"
+                && second == "second answer"
+        ));
+    }
+
+    #[test]
+    fn a_stream_starts_below_the_transcript_and_grows_downward() {
+        let mut a = app();
+        a.apply(Update::Delta("first words".into()));
+
+        let text = screen(&mut a, 60);
+        let rows: Vec<_> = text.lines().collect();
+        assert_eq!(
+            rows[0], "  first words",
+            "new text belongs at the top of the shared rows, not at the bottom"
+        );
+        assert!(rows[1].is_empty(), "the unused room follows the text");
+        assert!(rows[2].is_empty(), "the unused room follows the text");
     }
 
     #[test]

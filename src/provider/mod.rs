@@ -1,7 +1,7 @@
 //! Talking to models.
 //!
 //! Two wire protocols, written directly against `reqwest` rather than through
-//! an SDK. Neither vendor ships an official Rust client, and leve needs a
+//! an SDK. Neither vendor ships an official Rust client, and reve needs a
 //! narrow slice of each API — stream text, stream tool calls, count tokens — so
 //! a thin adapter is less code than adapting someone else's model of the whole
 //! surface, and it keeps the dependency audit small, which matters for a
@@ -11,6 +11,7 @@
 
 pub mod anthropic;
 pub mod config;
+pub mod openai_completions;
 pub mod openai_responses;
 pub mod sse;
 
@@ -43,6 +44,7 @@ impl HttpModel {
         let base = self.resolved.base_url.trim_end_matches('/');
         match self.resolved.api {
             Api::OpenaiResponses => format!("{base}/responses"),
+            Api::OpenaiCompletions => format!("{base}/chat/completions"),
             Api::AnthropicMessages => format!("{base}/v1/messages"),
             Api::Fake => base.to_string(),
         }
@@ -61,6 +63,12 @@ impl Model for HttpModel {
                     &self.resolved,
                     request.system,
                     openai_input(request.context),
+                    request.tools,
+                ),
+                Api::OpenaiCompletions => openai_completions::build_body(
+                    &self.resolved,
+                    request.system,
+                    openai_messages(request.context),
                     request.tools,
                 ),
                 Api::AnthropicMessages => anthropic::build_body(
@@ -145,6 +153,7 @@ impl Model for HttpModel {
 
             let mut decoder = sse::Decoder::new();
             let mut openai = openai_responses::StreamState::new();
+            let mut chat = openai_completions::StreamState::new();
             let mut claude = anthropic::StreamState::new();
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
@@ -152,8 +161,10 @@ impl Model for HttpModel {
                 let text = String::from_utf8_lossy(&chunk);
                 for event in decoder.push(&text) {
                     let delta = match self.resolved.api {
+                        Api::OpenaiResponses => openai.apply(&event),
+                        Api::OpenaiCompletions => chat.apply(&event),
                         Api::AnthropicMessages => claude.apply(&event),
-                        _ => openai.apply(&event),
+                        Api::Fake => None,
                     };
                     if let Some(delta) = delta {
                         on_text(&delta);
@@ -162,8 +173,10 @@ impl Model for HttpModel {
             }
 
             match self.resolved.api {
+                Api::OpenaiResponses => openai.finish(),
+                Api::OpenaiCompletions => chat.finish(),
                 Api::AnthropicMessages => claude.finish(),
-                _ => openai.finish(),
+                Api::Fake => Err("the fake provider has no endpoint".into()),
             }
             .map_err(ModelError)
         })
@@ -172,21 +185,129 @@ impl Model for HttpModel {
 
 /// Conversation entries as the Responses API wants them.
 pub fn openai_input(context: &[Entry]) -> Vec<Value> {
-    context.iter().filter_map(entry_to_openai).collect()
+    let mut input = Vec::with_capacity(context.len());
+    for entry in context {
+        let Some(message) = entry.payload.get("message") else {
+            continue;
+        };
+        match message.get("role").and_then(Value::as_str) {
+            Some("user") => {
+                input.push(json!({"role": "user", "content": text_of(message)}));
+            }
+            Some("assistant") => {
+                let start = input.len();
+                let text = text_of(message);
+                if !text.is_empty() {
+                    input.push(json!({"role": "assistant", "content": text}));
+                }
+                for call in tool_call_parts(message) {
+                    let arguments = call.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                    input.push(json!({
+                        "type": "function_call",
+                        "call_id": call.get("id").and_then(Value::as_str).unwrap_or_default(),
+                        "name": call.get("name").and_then(Value::as_str).unwrap_or_default(),
+                        "arguments": serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".into()),
+                    }));
+                }
+                if input.len() == start {
+                    input.push(json!({"role": "assistant", "content": ""}));
+                }
+            }
+            Some("toolResult") => input.push(json!({
+                "type": "function_call_output",
+                "call_id": message.get("toolCallId").and_then(Value::as_str).unwrap_or_default(),
+                "output": text_of(message),
+            })),
+            _ => {}
+        }
+    }
+    input
 }
 
-fn entry_to_openai(entry: &Entry) -> Option<Value> {
-    let message = entry.payload.get("message")?;
-    match message.get("role")?.as_str()? {
-        "user" => Some(json!({"role": "user", "content": text_of(message)})),
-        "assistant" => Some(json!({"role": "assistant", "content": text_of(message)})),
-        "toolResult" => Some(json!({
-            "type": "function_call_output",
-            "call_id": message.get("toolCallId").and_then(Value::as_str).unwrap_or_default(),
-            "output": text_of(message),
-        })),
-        _ => None,
+/// Conversation entries as the Chat Completions API wants them.
+pub fn openai_messages(context: &[Entry]) -> Vec<Value> {
+    let messages = context
+        .iter()
+        .filter_map(|entry| {
+            let message = entry.payload.get("message")?;
+            match message.get("role")?.as_str()? {
+                "user" => Some(json!({"role": "user", "content": text_of(message)})),
+                "assistant" => {
+                    let calls = tool_call_parts(message)
+                        .map(|call| {
+                            let arguments =
+                                call.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                            json!({
+                                "id": call.get("id").and_then(Value::as_str).unwrap_or_default(),
+                                "type": "function",
+                                "function": {
+                                    "name": call.get("name").and_then(Value::as_str).unwrap_or_default(),
+                                    "arguments": serde_json::to_string(&arguments)
+                                        .unwrap_or_else(|_| "{}".into()),
+                                },
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let text = text_of(message);
+                    if calls.is_empty() {
+                        (!text.is_empty()).then(|| json!({"role": "assistant", "content": text}))
+                    } else {
+                        Some(json!({
+                            "role": "assistant",
+                            "content": (!text.is_empty()).then_some(text),
+                            "tool_calls": calls,
+                        }))
+                    }
+                }
+                "toolResult" => {
+                    let text = text_of(message);
+                    Some(json!({
+                        "role": "tool",
+                        "tool_call_id": message
+                            .get("toolCallId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        "content": if text.is_empty() { "(no output)" } else { &text },
+                    }))
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    heal_openai_messages(messages)
+}
+
+/// Chat Completions rejects an assistant tool call without one following tool
+/// result. A crash can leave the durable tip there, so close only those missing
+/// calls with an explicit interruption result before the next request.
+fn heal_openai_messages(messages: Vec<Value>) -> Vec<Value> {
+    let answered = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+        .filter_map(|message| message.get("tool_call_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut healed = Vec::with_capacity(messages.len());
+    for message in messages {
+        let missing = message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|call| call.get("id").and_then(Value::as_str))
+            .filter(|id| !answered.iter().any(|answered| answered == id))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        healed.push(message);
+        healed.extend(missing.into_iter().map(|id| {
+            json!({
+                "role": "tool",
+                "tool_call_id": id,
+                "content": "Tool execution was interrupted before producing a result.",
+            })
+        }));
     }
+    healed
 }
 
 /// Conversation entries as the Messages API wants them.
@@ -197,6 +318,22 @@ pub fn anthropic_messages(context: &[Entry]) -> Vec<Value> {
             let message = entry.payload.get("message")?;
             match message.get("role")?.as_str()? {
                 "user" => Some(json!({"role": "user", "content": text_of(message)})),
+                "assistant" if tool_call_parts(message).next().is_some() => {
+                    let mut content = Vec::new();
+                    let text = text_of(message);
+                    if !text.is_empty() {
+                        content.push(json!({"type": "text", "text": text}));
+                    }
+                    for call in tool_call_parts(message) {
+                        content.push(json!({
+                            "type": "tool_use",
+                            "id": call.get("id").and_then(Value::as_str).unwrap_or_default(),
+                            "name": call.get("name").and_then(Value::as_str).unwrap_or_default(),
+                            "input": call.get("arguments").cloned().unwrap_or_else(|| json!({})),
+                        }));
+                    }
+                    Some(json!({"role": "assistant", "content": content}))
+                }
                 "assistant" => Some(json!({"role": "assistant", "content": text_of(message)})),
                 // A tool result is a user-role message on this API.
                 "toolResult" => Some(json!({
@@ -211,6 +348,15 @@ pub fn anthropic_messages(context: &[Entry]) -> Vec<Value> {
             }
         })
         .collect()
+}
+
+fn tool_call_parts(message: &Value) -> impl Iterator<Item = &Value> {
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("toolCall"))
 }
 
 /// The plain text of a message, whatever shape its content is in.
@@ -270,14 +416,31 @@ mod tests {
         assert_eq!(openai[0]["role"], "user");
         assert_eq!(openai[0]["content"], "hello");
 
+        let chat = openai_messages(&context);
+        assert_eq!(chat[0]["role"], "user");
+        assert_eq!(chat[1]["content"], "hi");
+
         let claude = anthropic_messages(&context);
         assert_eq!(claude[1]["role"], "assistant");
         assert_eq!(claude[1]["content"], "hi");
     }
 
     #[test]
-    fn a_tool_result_is_shaped_differently_by_each_api() {
-        let mut result = Entry::message(
+    fn tool_calls_are_replayed_before_their_results() {
+        let call = Entry::message(
+            MAIN_LANE,
+            json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "toolCall",
+                    "id": "call_1",
+                    "name": "read",
+                    "arguments": {"path": "AGENTS.md"},
+                }],
+                "stopReason": "toolUse",
+            }),
+        );
+        let result = Entry::message(
             MAIN_LANE,
             json!({
                 "role": "toolResult",
@@ -285,21 +448,55 @@ mod tests {
                 "content": [{"type": "text", "text": "ok"}],
             }),
         );
-        result.parent_id = None;
-        let context = vec![result];
+        let context = vec![call, result];
 
         let openai = openai_input(&context);
-        assert_eq!(openai[0]["type"], "function_call_output");
+        assert_eq!(openai[0]["type"], "function_call");
         assert_eq!(openai[0]["call_id"], "call_1");
-        assert_eq!(openai[0]["output"], "ok");
+        assert_eq!(openai[0]["name"], "read");
+        assert_eq!(openai[0]["arguments"], r#"{"path":"AGENTS.md"}"#);
+        assert_eq!(openai[1]["type"], "function_call_output");
+        assert_eq!(openai[1]["call_id"], "call_1");
+
+        let chat = openai_messages(&context);
+        assert_eq!(chat[0]["role"], "assistant");
+        assert_eq!(chat[0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(chat[0]["tool_calls"][0]["function"]["name"], "read");
+        assert_eq!(
+            chat[0]["tool_calls"][0]["function"]["arguments"],
+            r#"{"path":"AGENTS.md"}"#
+        );
+        assert_eq!(chat[1]["role"], "tool");
+        assert_eq!(chat[1]["tool_call_id"], "call_1");
 
         let claude = anthropic_messages(&context);
-        assert_eq!(
-            claude[0]["role"], "user",
-            "Anthropic carries results as user turns"
+        assert_eq!(claude[0]["role"], "assistant");
+        assert_eq!(claude[0]["content"][0]["type"], "tool_use");
+        assert_eq!(claude[0]["content"][0]["id"], "call_1");
+        assert_eq!(claude[1]["role"], "user");
+        assert_eq!(claude[1]["content"][0]["type"], "tool_result");
+        assert_eq!(claude[1]["content"][0]["tool_use_id"], "call_1");
+    }
+
+    #[test]
+    fn chat_history_closes_a_tool_call_interrupted_before_its_result() {
+        let call = Entry::message(
+            MAIN_LANE,
+            json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "toolCall",
+                    "id": "call_lost",
+                    "name": "bash",
+                    "arguments": {"command": "sleep 30"},
+                }],
+            }),
         );
-        assert_eq!(claude[0]["content"][0]["type"], "tool_result");
-        assert_eq!(claude[0]["content"][0]["tool_use_id"], "call_1");
+        let chat = openai_messages(&[call]);
+        assert_eq!(chat.len(), 2);
+        assert_eq!(chat[1]["role"], "tool");
+        assert_eq!(chat[1]["tool_call_id"], "call_lost");
+        assert!(chat[1]["content"].as_str().unwrap().contains("interrupted"));
     }
 
     #[test]
@@ -312,6 +509,7 @@ mod tests {
     fn entries_that_are_not_messages_are_skipped() {
         let custom = Entry::custom(MAIN_LANE, "bash_execution", json!({"command": "ls"}));
         assert!(openai_input(std::slice::from_ref(&custom)).is_empty());
+        assert!(openai_messages(std::slice::from_ref(&custom)).is_empty());
         assert!(anthropic_messages(&[custom]).is_empty());
     }
 
@@ -337,6 +535,10 @@ mod tests {
         assert_eq!(
             make(Api::OpenaiResponses).endpoint(),
             "https://example.test/v1/responses"
+        );
+        assert_eq!(
+            make(Api::OpenaiCompletions).endpoint(),
+            "https://example.test/v1/chat/completions"
         );
         assert_eq!(
             make(Api::AnthropicMessages).endpoint(),

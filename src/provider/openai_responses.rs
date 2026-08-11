@@ -1,6 +1,6 @@
 //! The OpenAI Responses API.
 //!
-//! Only the streaming path is implemented, because that is the one leve uses:
+//! Only the streaming path is implemented, because that is the one reve uses:
 //! text arrives as `response.output_text.delta`, tool calls are announced by
 //! `response.output_item.added` and then filled in by
 //! `response.function_call_arguments.delta`, and `response.completed` carries

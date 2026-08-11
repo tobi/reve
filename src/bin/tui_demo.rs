@@ -7,8 +7,9 @@
 
 use std::time::Duration;
 
-use leve::tui::app::{Action, App, Update};
-use leve::tui::item::{Inbox, Item, Status, Subagent};
+use reve::channels::Message;
+use reve::tui::app::{Action, App, Update};
+use reve::tui::item::{Item, Status, Subagent};
 use tokio::sync::mpsc;
 
 #[tokio::main]
@@ -23,7 +24,7 @@ async fn main() -> std::io::Result<()> {
             let item = match action {
                 Action::Prompt(text) => Item::User(text),
                 Action::Steer(text) => Item::Steer(text),
-                Action::FollowUp(text) => Item::FollowUp(text),
+                Action::FollowUp(_) | Action::ChannelMessage(_) => continue,
                 Action::Interrupt => Item::Notice("Interrupted".into()),
                 Action::Quit => break,
             };
@@ -62,8 +63,8 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
-    let app = App::new("leve-spark-1.2", "high", "…/my-agent");
-    leve::tui::run::run(app, merged_rx, action_tx).await
+    let app = App::new("reve-spark-1.2", "high", "…/my-agent");
+    reve::tui::run::run(app, merged_rx, action_tx).await
 }
 
 fn ms(n: u64) -> Duration {
@@ -144,10 +145,10 @@ fn script() -> Vec<(Duration, Update)> {
         (ms(1500), agents(Status::Running, Status::Running, 2)),
         (
             ms(1200),
-            Update::Received(Inbox {
+            Update::Received(Message {
                 channel: "telegram".into(),
                 text: "any update? I need this before the demo".into(),
-                read: false,
+                timestamp: 13,
             }),
         ),
         (ms(1800), agents(Status::Ok, Status::Running, 5)),
@@ -232,5 +233,16 @@ fn script() -> Vec<(Duration, Update)> {
             }),
         ),
         (ms(600), Update::Working(None)),
+        (
+            ms(800),
+            Update::Item(Item::User("summarize that in one line".into())),
+        ),
+        (ms(100), Update::Working(Some("Running".into()))),
+        (
+            ms(250),
+            Update::Delta("Recovery is durable; lane ownership is now structural.".into()),
+        ),
+        (ms(250), Update::EndMessage),
+        (ms(100), Update::Working(None)),
     ]
 }

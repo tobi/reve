@@ -22,7 +22,7 @@ use serde_json::{Map, Value};
 
 use crate::ids::{EntryId, RecordId};
 
-/// The format this build reads and writes. There is no v3 compatibility: leve
+/// The format this build reads and writes. There is no v3 compatibility: reve
 /// is new, and there is nothing to be compatible with.
 pub const FORMAT_VERSION: u32 = 4;
 

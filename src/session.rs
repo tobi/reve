@@ -306,7 +306,7 @@ mod tests {
         session.prompt("hi", None).await.unwrap();
         let mut saw_finished = false;
         let mut saw_snapshot = false;
-        for _ in 0..3 {
+        for _ in 0..4 {
             match events.recv().await.unwrap() {
                 Event::Finished { .. } => saw_finished = true,
                 Event::Snapshot(snapshot) => {

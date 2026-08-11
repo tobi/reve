@@ -1,4 +1,4 @@
-//! Leve: a durable coding agent.
+//! Reve: a durable coding agent.
 //!
 //! The core is Rust; the scripting surface an agent author touches — its
 //! configuration, project tools, sandbox policy, and channels — is Lua.

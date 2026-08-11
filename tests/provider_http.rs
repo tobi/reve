@@ -10,10 +10,12 @@
 
 use std::sync::Arc;
 
-use leve::model::{Model, Request, StopReason};
-use leve::provider::HttpModel;
-use leve::provider::config::{Api, Compat, ModelSpec, Resolved};
 use parking_lot::Mutex;
+use reve::model::{Model, Request, StopReason, ToolSchema};
+use reve::provider::HttpModel;
+use reve::provider::config::{Api, Compat, ModelSpec, Resolved};
+use reve::records::{Entry, MAIN_LANE};
+use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -106,6 +108,73 @@ async fn an_openai_response_is_streamed_and_assembled() {
         request.contains("\"instructions\":\"be terse\""),
         "{request}"
     );
+}
+
+const CHAT_STREAM: &str = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"chat works\"},\"finish_reason\":null}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":2}}\n\n\
+data: [DONE]\n\n";
+
+#[tokio::test]
+async fn a_chat_completion_streams_and_replays_tool_history() {
+    let (base, request) = serve("200 OK", CHAT_STREAM).await;
+    let model = model(Api::OpenaiCompletions, base);
+    let context = vec![
+        Entry::message(
+            MAIN_LANE,
+            json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "toolCall",
+                    "id": "call_1",
+                    "name": "read",
+                    "arguments": {"path": "AGENTS.md"},
+                }],
+            }),
+        ),
+        Entry::message(
+            MAIN_LANE,
+            json!({
+                "role": "toolResult",
+                "toolCallId": "call_1",
+                "content": [{"type": "text", "text": "file body"}],
+            }),
+        ),
+    ];
+    let tools = vec![ToolSchema {
+        name: "read".into(),
+        description: "read a file".into(),
+        schema: json!({"type": "object"}),
+    }];
+    let turn = model
+        .respond(
+            Request {
+                context: &context,
+                system: "be terse",
+                tools: &tools,
+            },
+            &|_| {},
+        )
+        .await
+        .expect("the turn succeeds");
+
+    assert_eq!(turn.text, "chat works");
+    assert_eq!(turn.usage.input, 12);
+    assert_eq!(turn.usage.output, 2);
+    let request = request.lock().clone();
+    assert!(request.starts_with("POST /chat/completions "), "{request}");
+    let body: serde_json::Value = serde_json::from_str(
+        request
+            .split_once("\r\n\r\n")
+            .expect("HTTP body separator")
+            .1,
+    )
+    .unwrap();
+    assert_eq!(body["messages"][0]["role"], "developer");
+    assert_eq!(body["messages"][1]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(body["messages"][2]["role"], "tool");
+    assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
+    assert_eq!(body["tools"][0]["function"]["name"], "read");
 }
 
 const ANTHROPIC_STREAM: &str = "\

@@ -50,7 +50,7 @@ providers:
   #
   # llamacpp:
   #   baseUrl: $LLAMA_CPP_BASE
-  #   api: openai-responses
+  #   api: openai-completions
   #   apiKey: $LLAMA_API_KEY
   #   models:
   #     - id: local-model

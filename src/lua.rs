@@ -413,7 +413,6 @@ fn policy_from_table(table: &Table) -> Result<Policy> {
         policy.bootstrap = string_list(&list)?;
     }
     if let Ok(list) = table.get::<Table>("allow") {
-        // Additive: the GitHub default stays unless the author replaces it.
         let mut hosts = policy.allow_hosts.clone();
         hosts.extend(string_list(&list)?);
         hosts.sort();
@@ -435,7 +434,12 @@ fn policy_from_table(table: &Table) -> Result<Policy> {
             let env: String = entry
                 .get("env")
                 .map_err(|_| invalid("sandbox secret", "each secret needs an `env` name"))?;
-            let value: String = entry.get("value").unwrap_or_default();
+            let source: String = entry.get("source").map_err(|_| {
+                invalid(
+                    "sandbox secret",
+                    "each secret needs a host environment `source`; literal `value` secrets are not supported",
+                )
+            })?;
             let hosts = entry
                 .get::<Table>("hosts")
                 .ok()
@@ -452,7 +456,7 @@ fn policy_from_table(table: &Table) -> Result<Policy> {
             }
             secrets.push(Secret {
                 env,
-                value,
+                source,
                 placeholder: entry
                     .get::<String>("placeholder")
                     .ok()
@@ -514,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_lua_extends_the_deny_by_default_allowlist() {
+    fn sandbox_lua_builds_an_explicit_deny_by_default_allowlist() {
         let dir = tempfile::tempdir().unwrap();
         let path = write(
             dir.path(),
@@ -534,13 +538,11 @@ mod tests {
         assert_eq!(rt.policy.image, "alpine");
         assert_eq!(rt.policy.cpus, 1);
         assert!(!rt.policy.provision);
-        let hosts = rt.policy.egress_hosts();
-        assert!(hosts.contains(&"api.example.com".to_string()));
-        assert!(
-            hosts.contains(&"github.com".to_string()),
-            "the default is kept, not replaced"
+        assert_eq!(
+            rt.policy.egress_hosts(),
+            vec!["api.example.com".to_string()],
+            "no host appears unless sandbox.lua names it"
         );
-        assert!(!hosts.contains(&"deb.debian.org".to_string()));
     }
 
     #[test]
@@ -586,7 +588,7 @@ mod tests {
             "sandbox.lua",
             r#"
             sandbox {
-              secrets = { { env = "TOKEN", value = "abc" } },
+              secrets = { { env = "TOKEN", source = "HOST_TOKEN" } },
             }
         "#,
         );
@@ -604,8 +606,8 @@ mod tests {
             r#"
             sandbox {
               secrets = {
-                { env = "GITHUB_TOKEN", value = "real", placeholder = "leve-github-token",
-                  hosts = { "github.com" } },
+                { env = "GITHUB_TOKEN", source = "HOST_GITHUB_TOKEN",
+                  placeholder = "reve-github-token", hosts = { "github.com" } },
               },
             }
         "#,
@@ -614,8 +616,32 @@ mod tests {
         rt.load_sandbox(&path).unwrap();
         let secret = &rt.policy.secrets[0];
         assert_eq!(secret.env, "GITHUB_TOKEN");
-        assert_eq!(secret.placeholder.as_deref(), Some("leve-github-token"));
+        assert_eq!(secret.source, "HOST_GITHUB_TOKEN");
+        assert_eq!(secret.placeholder.as_deref(), Some("reve-github-token"));
         assert_eq!(secret.hosts, vec!["github.com".to_string()]);
+    }
+
+    #[test]
+    fn a_literal_secret_value_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "sandbox.lua",
+            r#"
+            sandbox {
+              secrets = {
+                { env = "TOKEN", value = "must-not-be-persisted",
+                  hosts = { "example.com" } },
+              },
+            }
+        "#,
+        );
+        let mut rt = Runtime::new().unwrap();
+        let err = rt.load_sandbox(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("host environment `source`"),
+            "got {err}"
+        );
     }
 
     #[test]

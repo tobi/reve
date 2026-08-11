@@ -1,12 +1,13 @@
 //! The terminal, wired to a real microVM.
 //!
-//! This is what bare `leve` runs. There is no model yet, so a prompt is taken
+//! This is what bare `reve` runs. There is no model yet, so a prompt is taken
 //! literally: it is run in the agent's VM and the result rendered as a tool
 //! call. That is a genuinely useful shell — everything you type executes under
 //! the sandbox policy in `sandbox.lua`, not on your machine — and it is the
 //! same loop a model turn will use, so wiring providers replaces one step
 //! rather than the structure.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -52,6 +53,7 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
         location,
     );
     app.set_commands(commands_for(&project));
+    app.set_files(file_candidates(&project.workspace()));
 
     let tools: Vec<String> = project
         .runtime
@@ -108,10 +110,22 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
                             tx.cancel();
                         }
                     }
-                    Action::Prompt(text) | Action::Steer(text) | Action::FollowUp(text) => {
+                    action @ (Action::Prompt(_)
+                    | Action::Steer(_)
+                    | Action::FollowUp(_)
+                    | Action::ChannelMessage(_)) => {
+                        let (text, echo_user) = match action {
+                            Action::Prompt(text) | Action::Steer(text) | Action::FollowUp(text) => {
+                                (text, true)
+                            }
+                            Action::ChannelMessage(message) => (channel_prompt(&message), false),
+                            _ => unreachable!(),
+                        };
                         let (tx, rx) = channel();
                         cancel.replace(tx);
-                        let _ = updates.send(Update::Item(Item::User(text.clone()))).await;
+                        if echo_user {
+                            let _ = updates.send(Update::Item(Item::User(text.clone()))).await;
+                        }
                         let _ = updates.send(Update::Working(Some("Running".into()))).await;
 
                         // `!` is the shell escape, exactly as it is in the
@@ -142,6 +156,9 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
                                     let events = move |event| match event {
                                         RunEvent::AssistantDelta(delta) => {
                                             let _ = sink.try_send(Update::Delta(delta));
+                                        }
+                                        RunEvent::AssistantFinished => {
+                                            let _ = sink.try_send(Update::EndMessage);
                                         }
                                         RunEvent::ToolStarted { name, .. } => {
                                             let _ = sink.try_send(Update::Working(Some(format!(
@@ -201,6 +218,9 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
                         if let Some(item) = item {
                             let _ = updates.send(Update::Item(item)).await;
                         }
+                        let _ = updates
+                            .send(Update::Files(file_candidates(&project.workspace())))
+                            .await;
                         let _ = updates.send(Update::Working(None)).await;
                         cancel.take();
                     }
@@ -374,6 +394,7 @@ fn commands_for(project: &Project) -> Vec<Command> {
         Command::new("models", "list the configured models"),
         Command::new("sandbox", "describe the microVM and its egress policy"),
         Command::new("compact", "summarize old conversation context"),
+        Command::new("queue", "send a message after the current run"),
         Command::new("skills", "list workspace skills"),
         Command::new("tools", "list this agent's Lua tools"),
         Command::new("quit", "leave"),
@@ -385,6 +406,62 @@ fn commands_for(project: &Project) -> Vec<Command> {
     }
     commands.sort_by(|a, b| a.name.cmp(&b.name));
     commands
+}
+
+const MAX_FILE_CANDIDATES: usize = 5_000;
+
+fn file_candidates(root: &Path) -> Vec<Candidate> {
+    let mut candidates = Vec::new();
+    collect_files(root, root, &mut candidates, 0);
+    candidates.sort_by(|a, b| a.value.cmp(&b.value));
+    candidates
+}
+
+fn collect_files(root: &Path, directory: &Path, out: &mut Vec<Candidate>, depth: usize) {
+    if out.len() >= MAX_FILE_CANDIDATES || depth >= 64 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let mut entries = entries.flatten().collect::<Vec<_>>();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+
+    for entry in entries {
+        if out.len() >= MAX_FILE_CANDIDATES {
+            break;
+        }
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            collect_files(root, &entry.path(), out, depth + 1);
+        } else if kind.is_file() {
+            let path = entry.path();
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            let bytes = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            out.push(Candidate {
+                value: format!("@{}", relative.to_string_lossy()),
+                detail: file_size(bytes),
+            });
+        }
+    }
+}
+
+fn file_size(bytes: u64) -> String {
+    if bytes < 1_024 {
+        format!("{bytes} B")
+    } else if bytes < 1_048_576 {
+        format!("{:.1} KB", bytes as f64 / 1_024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    }
 }
 
 /// Resolve the configured model from the agent's own `models.yml`.
@@ -441,6 +518,34 @@ fn system_prompt(project: &Project) -> String {
     parts.join("\n\n")
 }
 
+fn channel_prompt(message: &crate::channels::Message) -> String {
+    format!(
+        "<message channel=\"{}\" timestamp=\"{}\">\n{}\n</message>",
+        escape_xml(&message.channel, true),
+        message.timestamp,
+        escape_xml(&message.text, false)
+    )
+}
+
+fn escape_xml(text: &str, attribute: bool) -> String {
+    let extra = text
+        .bytes()
+        .filter(|byte| matches!(byte, b'&' | b'<' | b'>' | b'"'))
+        .count()
+        * 4;
+    let mut escaped = String::with_capacity(text.len() + extra);
+    for ch in text.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' if attribute => escaped.push_str("&quot;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 async fn run_tool(project: &Project, sandbox: &Arc<Sandbox>, name: &str) -> Item {
     let started = Instant::now();
     match project
@@ -464,5 +569,45 @@ async fn run_tool(project: &Project, sandbox: &Arc<Sandbox>, name: &str) -> Item
             detail: None,
             outcome: Some(e.to_string()),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_messages_carry_source_and_timestamp_metadata() {
+        let prompt = channel_prompt(&crate::channels::Message {
+            channel: "telegram&alerts".into(),
+            text: "<ship & \"go\">".into(),
+            timestamp: 13,
+        });
+        assert_eq!(
+            prompt,
+            "<message channel=\"telegram&amp;alerts\" timestamp=\"13\">\n\
+             &lt;ship &amp; \"go\"&gt;\n\
+             </message>"
+        );
+    }
+
+    #[test]
+    fn workspace_file_candidates_are_relative_sorted_and_private() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("knowledge")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join("z.txt"), "z").unwrap();
+        std::fs::write(dir.path().join("knowledge/a.md"), "hello").unwrap();
+        std::fs::write(dir.path().join(".git/config"), "secret").unwrap();
+
+        let candidates = file_candidates(dir.path());
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["@knowledge/a.md", "@z.txt"]
+        );
+        assert_eq!(candidates[0].detail, "5 B");
     }
 }

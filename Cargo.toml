@@ -1,23 +1,23 @@
 [package]
-name = "leve"
+name = "reve"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 description = "A durable coding agent: Rust core, Lua scripting, mandatory microVM sandbox"
 license = "MIT"
-repository = "https://github.com/tobi/leve"
-default-run = "leve"
+repository = "https://github.com/tobi/reve"
+default-run = "reve"
 
 [[bin]]
-name = "leve"
+name = "reve"
 path = "src/main.rs"
 
 [lib]
-name = "leve"
+name = "reve"
 path = "src/lib.rs"
 
 [dependencies]
-# The sandbox. Pinned exactly: leve is written against this API and a silent
+# The sandbox. Pinned exactly: reve is written against this API and a silent
 # minor bump would rebind us to something we never read.
 microsandbox = "=0.6.8"
 microsandbox-network = "=0.6.8"

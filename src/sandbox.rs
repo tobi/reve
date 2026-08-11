@@ -1,6 +1,6 @@
 //! The mandatory microVM.
 //!
-//! Leve links the `microsandbox` crate directly. There is no CLI, no daemon, no
+//! Reve links the `microsandbox` crate directly. There is no CLI, no daemon, no
 //! FFI shim, and no host-shell path: if the VM cannot boot, the agent refuses
 //! to run rather than quietly executing model-authored commands on your machine.
 //!
@@ -12,8 +12,10 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
-use microsandbox::Sandbox as MsbSandbox;
+use microsandbox::{Sandbox as MsbSandbox, SandboxModificationBuilder, SecretSource};
 use microsandbox_network::policy::{NetworkPolicy, Rule};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -52,35 +54,18 @@ pub const APT_PACKAGES: &[&str] = &[
 pub const MISE_TOOLS: &[&str] = &["node@lts"];
 pub const NPM_TOOLS: &[&str] = &["@ast-grep/cli"];
 
-/// Reachable by default, and nothing else.
-pub const GITHUB_HOSTS: &[&str] = &[
-    "github.com",
-    "api.github.com",
-    "codeload.github.com",
-    "objects.githubusercontent.com",
-    "raw.githubusercontent.com",
-];
-/// Package mirrors, allowed *only* while provisioning is on. Bake your own
-/// image and the policy collapses back to github-only.
-pub const PROVISION_HOSTS: &[&str] = &[
-    "deb.debian.org",
-    "security.debian.org",
-    "ftp.debian.org",
-    "mise.run",
-    "mise.jdx.dev",
-    "registry.npmjs.org",
-    "nodejs.org",
-    "github.com",
-    "objects.githubusercontent.com",
-];
+const PROVISION_MARKER: &str = "/var/lib/reve/provisioned";
 
-const PROVISION_MARKER: &str = "/var/lib/leve/provisioned";
+const GIT_CREDENTIAL_SETUP: &str = "if command -v git >/dev/null && command -v gh >/dev/null; \
+then git config --system credential.https://github.com.helper '!gh auth git-credential'; fi";
 
-/// A host credential the VM may use but never see.
+/// A host environment reference whose value is resolved only while the VM runs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Secret {
+    /// Environment variable exposed in the guest. Its value is a placeholder.
     pub env: String,
-    pub value: String,
+    /// Host environment variable resolved by microsandbox's network proxy.
+    pub source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placeholder: Option<String>,
     #[serde(default)]
@@ -120,7 +105,7 @@ impl Default for Policy {
             packages: APT_PACKAGES.iter().map(|s| s.to_string()).collect(),
             mise: MISE_TOOLS.iter().map(|s| s.to_string()).collect(),
             npm: NPM_TOOLS.iter().map(|s| s.to_string()).collect(),
-            allow_hosts: GITHUB_HOSTS.iter().map(|s| s.to_string()).collect(),
+            allow_hosts: Vec::new(),
             secrets: Vec::new(),
             bootstrap: Vec::new(),
             env: BTreeMap::from([
@@ -133,12 +118,10 @@ impl Default for Policy {
 }
 
 impl Policy {
-    /// Every host this policy may reach.
+    /// Every host this policy explicitly allows. An empty list means no
+    /// egress: provisioning never widens the network policy implicitly.
     pub fn egress_hosts(&self) -> Vec<String> {
         let mut hosts = self.allow_hosts.clone();
-        if self.provision {
-            hosts.extend(PROVISION_HOSTS.iter().map(|s| s.to_string()));
-        }
         hosts.sort();
         hosts.dedup();
         hosts
@@ -165,19 +148,18 @@ impl Policy {
             })
             .collect();
         let digest = Sha256::digest(root.to_string_lossy().as_bytes());
-        format!("leve-{label}-{}", &hex(&digest)[..10])
+        format!("reve-{label}-{}", &hex(&digest)[..10])
     }
 
-    /// Identifies the *shape* of this VM. A policy or toolchain change must
-    /// force a rebuild; a secret rotation must too, so the proxy cannot keep
-    /// serving a stale value. The secret itself is hashed, never stored.
+    /// Identifies the *disk and VM shape*. Runtime environment and secret
+    /// sources are deliberately excluded: they are refreshed live and must
+    /// never force a rebuild or place credential material in this file.
     pub fn fingerprint(&self, host_workspace: &Path) -> String {
-        let mut redacted = self.clone();
-        for secret in &mut redacted.secrets {
-            secret.value = format!("sha256:{}", hex(&Sha256::digest(secret.value.as_bytes())));
-        }
+        let mut shape = self.clone();
+        shape.secrets.clear();
+        shape.env.clear();
         let mut hasher = Sha256::new();
-        hasher.update(serde_json::to_vec(&redacted).unwrap_or_default());
+        hasher.update(serde_json::to_vec(&shape).unwrap_or_default());
         hasher.update(host_workspace.to_string_lossy().as_bytes());
         hex(&hasher.finalize())
     }
@@ -209,7 +191,7 @@ retry() {{
     sleep "$attempts"
   done
 }}
-mkdir -p /var/lib/leve
+mkdir -p /var/lib/reve
 if command -v apt-get > /dev/null; then
   apt-get -o Acquire::Retries=5 update -qq
   apt-get -o Acquire::Retries=5 install -y --no-install-recommends {packages} > /dev/null
@@ -258,13 +240,41 @@ pub struct ExecOptions {
     pub timeout: Option<std::time::Duration>,
 }
 
-/// A live microVM.
+/// A microVM that starts on its first effect and stops after a short idle
+/// window. `start` still boots once up front, so Reve fails closed when the VM
+/// runtime or policy is unavailable.
 pub struct Sandbox {
     policy: Policy,
     host_workspace: PathBuf,
     name: String,
-    vm: Mutex<Option<MsbSandbox>>,
+    vm: Arc<Mutex<VmState>>,
 }
+
+struct VmState {
+    vm: Option<MsbSandbox>,
+    active: usize,
+    generation: u64,
+    secret_digests: BTreeMap<String, String>,
+}
+
+impl VmState {
+    fn begin(&mut self) {
+        self.active += 1;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn finish(&mut self) -> Option<u64> {
+        self.active = self.active.saturating_sub(1);
+        self.generation = self.generation.wrapping_add(1);
+        (self.active == 0).then_some(self.generation)
+    }
+
+    fn may_stop(&self, generation: u64) -> bool {
+        self.active == 0 && self.generation == generation
+    }
+}
+
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Sandbox {
     /// Boot the VM: restart the persisted one when the policy is unchanged,
@@ -280,6 +290,11 @@ impl Sandbox {
         tokio::fs::create_dir_all(&host_workspace)
             .await
             .map_err(|e| SandboxError::Unavailable(format!("cannot create workspace: {e}")))?;
+        for secret in &policy.secrets {
+            if let Some(warning) = missing_secret_warning(secret) {
+                progress.warning(&warning);
+            }
+        }
 
         if !microsandbox::setup::is_installed() {
             progress.stage("installing the microsandbox runtime");
@@ -287,8 +302,7 @@ impl Sandbox {
                 .await
                 .map_err(|e| SandboxError::Unavailable(format!("cannot install runtime: {e}")))?;
         }
-
-        // Never adopt a VM another leve owns: replacing it would break
+        // Never adopt a VM another Reve owns: replacing it would break
         // isolation for both processes.
         if let Ok(handle) = MsbSandbox::get(&name).await {
             use microsandbox::sandbox::SandboxStatus;
@@ -297,7 +311,7 @@ impl Sandbox {
                 SandboxStatus::Running | SandboxStatus::Draining
             ) {
                 return Err(SandboxError::Unavailable(format!(
-                    "microVM {name} is already running in another leve process"
+                    "microVM {name} is already running in another Reve process"
                 )));
             }
         }
@@ -308,27 +322,48 @@ impl Sandbox {
             .await
             .map(|text| text.trim() == fingerprint)
             .unwrap_or(false);
-
         if reusable {
+            // Refresh source references while stopped. Microsandbox resolves
+            // their values only when the VM starts; no credential is persisted.
+            if let Ok(handle) = MsbSandbox::get(&name).await {
+                let config = handle.config().map_err(secret_config_error)?;
+                let existing = persisted_secret_names(&config);
+                remove_secret_definitions(handle.modify(), &existing, true).await?;
+                install_secret_definitions(handle.modify(), &policy.secrets, true).await?;
+            }
             progress.stage(&format!("restarting microVM {name}"));
             if let Ok(vm) = MsbSandbox::start(&name).await {
-                progress.finish("sandbox ready");
-                return Ok(Self {
+                let secret_digests = runtime_secret_digests(&policy);
+                let sandbox = Self {
                     policy,
                     host_workspace,
                     name,
-                    vm: Mutex::new(Some(vm)),
-                });
+                    vm: Arc::new(Mutex::new(VmState {
+                        vm: Some(vm),
+                        active: 0,
+                        generation: 0,
+                        secret_digests,
+                    })),
+                };
+                sandbox.configure_git_credentials().await;
+                progress.finish("sandbox ready");
+                return Ok(sandbox);
             }
         }
 
         progress.stage(&format!("building microVM {name} from {}", policy.image));
         let vm = build(&policy, &name, &host_workspace).await?;
+        let secret_digests = runtime_secret_digests(&policy);
         let sandbox = Self {
             policy,
             host_workspace,
             name,
-            vm: Mutex::new(Some(vm)),
+            vm: Arc::new(Mutex::new(VmState {
+                vm: Some(vm),
+                active: 0,
+                generation: 0,
+                secret_digests,
+            })),
         };
 
         let mut ok = true;
@@ -368,6 +403,7 @@ impl Sandbox {
             }
             let _ = tokio::fs::write(&fingerprint_path, format!("{fingerprint}\n")).await;
         }
+        sandbox.configure_git_credentials().await;
         progress.finish(if ok {
             "sandbox ready"
         } else {
@@ -404,80 +440,101 @@ impl Sandbox {
         options: ExecOptions,
         cancel: Option<tokio_util_lite::CancelRx>,
     ) -> Result<Output> {
-        let vm = self.live().await?;
-        let cwd = options
-            .cwd
-            .clone()
-            .unwrap_or_else(|| self.policy.workdir.clone());
-        let script = command.to_string();
-        let env = options.env.clone();
-        let timeout = options.timeout;
+        let vm = self.acquire().await?;
+        let result = async {
+            let cwd = options
+                .cwd
+                .clone()
+                .unwrap_or_else(|| self.policy.workdir.clone());
+            let script = command.to_string();
+            let mut env = self.policy.env.clone();
+            env.extend(options.env.clone());
+            let timeout = options.timeout;
 
-        let mut handle = vm
-            .exec_stream_with("sh", move |mut e| {
-                e = e.args(["-lc", script.as_str()]).cwd(cwd).stdin_null();
-                for (key, value) in &env {
-                    e = e.env(key.as_str(), value.as_str());
-                }
-                if let Some(t) = timeout {
-                    e = e.timeout(t);
-                }
-                e
-            })
-            .await
-            .map_err(|e| SandboxError::Failed(e.to_string()))?;
-
-        let control = handle.control();
-        match cancel {
-            None => {
-                let output = handle
-                    .collect()
-                    .await
-                    .map_err(|e| SandboxError::Failed(e.to_string()))?;
-                Ok(encode(&output, false))
-            }
-            Some(mut rx) => {
-                tokio::select! {
-                    collected = handle.collect() => {
-                        let output = collected.map_err(|e| SandboxError::Failed(e.to_string()))?;
-                        Ok(encode(&output, false))
+            let mut handle = vm
+                .exec_stream_with("sh", move |mut e| {
+                    e = e.args(["-lc", script.as_str()]).cwd(cwd).stdin_null();
+                    for (key, value) in &env {
+                        e = e.env(key.as_str(), value.as_str());
                     }
-                    _ = rx.cancelled() => {
-                        let _ = control.kill().await;
-                        Ok(Output {
-                            stdout: String::new(),
-                            stderr: String::new(),
-                            exit_code: 130,
-                            success: false,
-                            cancelled: true,
-                        })
+                    if let Some(t) = timeout {
+                        e = e.timeout(t);
+                    }
+                    e
+                })
+                .await
+                .map_err(|e| SandboxError::Failed(e.to_string()))?;
+
+            let control = handle.control();
+            match cancel {
+                None => {
+                    let output = handle
+                        .collect()
+                        .await
+                        .map_err(|e| SandboxError::Failed(e.to_string()))?;
+                    Ok(encode(&output, false))
+                }
+                Some(mut rx) => {
+                    tokio::select! {
+                        collected = handle.collect() => {
+                            let output =
+                                collected.map_err(|e| SandboxError::Failed(e.to_string()))?;
+                            Ok(encode(&output, false))
+                        }
+                        _ = rx.cancelled() => {
+                            let _ = control.kill().await;
+                            Ok(Output {
+                                stdout: String::new(),
+                                stderr: String::new(),
+                                exit_code: 130,
+                                success: false,
+                                cancelled: true,
+                            })
+                        }
                     }
                 }
             }
         }
+        .await;
+        self.release().await;
+        result
     }
 
     pub async fn read_file(&self, path: &str) -> Result<String> {
-        let vm = self.live().await?;
-        vm.fs()
+        let vm = self.acquire().await?;
+        let result = vm
+            .fs()
             .read_to_string(&self.absolute(path))
             .await
-            .map_err(|e| SandboxError::Failed(e.to_string()))
+            .map_err(|e| SandboxError::Failed(e.to_string()));
+        self.release().await;
+        result
     }
 
     pub async fn write_file(&self, path: &str, content: &str) -> Result<()> {
-        let vm = self.live().await?;
-        vm.fs()
+        let vm = self.acquire().await?;
+        let result = vm
+            .fs()
             .write(&self.absolute(path), content.as_bytes())
             .await
-            .map_err(|e| SandboxError::Failed(e.to_string()))
+            .map_err(|e| SandboxError::Failed(e.to_string()));
+        self.release().await;
+        result
     }
 
-    /// Stop the VM but keep its root disk and definition, so the next launch
-    /// restarts it. Idempotent.
+    /// Stop the VM but keep its root disk and source-only secret definitions,
+    /// so the next effect restarts it with values resolved from the current
+    /// host environment. Idempotent.
     pub async fn stop(&self) -> Result<()> {
-        let vm = { self.vm.lock().await.take() };
-        match vm {
+        // Keep the lifecycle lock until microsandbox confirms the stop. If the
+        // handle were removed first, a simultaneous effect could try to start
+        // the persisted definition while its previous process was still
+        // draining and receive "sandbox still running".
+        let mut state = self.vm.lock().await;
+        state.active = 0;
+        state.generation = state.generation.wrapping_add(1);
+        state.secret_digests.clear();
+        match state.vm.take() {
             Some(vm) => vm
                 .stop()
                 .await
@@ -495,6 +552,7 @@ impl Sandbox {
             extras.push(format!("mise {}", self.policy.mise.join(",")));
         }
         extras.push(format!("net {} hosts", self.policy.egress_hosts().len()));
+        extras.push(format!("idle {}s", IDLE_TIMEOUT.as_secs()));
         if !self.policy.secrets.is_empty() {
             let names: Vec<&str> = self.policy.secrets.iter().map(|s| s.env.as_str()).collect();
             extras.push(format!("secrets {}", names.join(",")));
@@ -525,14 +583,66 @@ impl Sandbox {
         }
     }
 
-    /// Clone the handle out of the mutex before any await, so a long command
-    /// never blocks `stop`, `read_file`, or the next `exec`.
-    async fn live(&self) -> Result<MsbSandbox> {
-        self.vm
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| SandboxError::Failed(format!("sandbox {} is stopped", self.name)))
+    /// Start on demand, then account for one effect. Holding the mutex across
+    /// `start` serializes simultaneous first effects inside this process.
+    async fn acquire(&self) -> Result<MsbSandbox> {
+        let mut state = self.vm.lock().await;
+        let desired = runtime_secret_digests(&self.policy);
+        if state.vm.is_none() {
+            if let Ok(handle) = MsbSandbox::get(&self.name).await {
+                let config = handle.config().map_err(secret_config_error)?;
+                let existing = persisted_secret_names(&config);
+                remove_secret_definitions(handle.modify(), &existing, true).await?;
+                install_secret_definitions(handle.modify(), &self.policy.secrets, true).await?;
+            }
+            state.vm = Some(MsbSandbox::start(&self.name).await.map_err(|error| {
+                SandboxError::Unavailable(format!("cannot start microVM {}: {error}", self.name))
+            })?);
+            state.secret_digests = desired;
+        } else if state.active == 0 && state.secret_digests != desired {
+            let vm = state.vm.take().expect("checked above");
+            vm.stop()
+                .await
+                .map_err(|e| SandboxError::Failed(e.to_string()))?;
+            let config = vm.config();
+            let existing = persisted_secret_names(config);
+            remove_secret_definitions(vm.modify(), &existing, true).await?;
+            install_secret_definitions(vm.modify(), &self.policy.secrets, true).await?;
+            state.vm = Some(MsbSandbox::start(&self.name).await.map_err(|error| {
+                SandboxError::Unavailable(format!(
+                    "cannot restart microVM {} after secret rotation: {error}",
+                    self.name
+                ))
+            })?);
+            state.secret_digests = desired;
+        }
+        state.begin();
+        Ok(state.vm.as_ref().expect("set above").clone())
+    }
+
+    async fn release(&self) {
+        let generation = {
+            let mut state = self.vm.lock().await;
+            state.finish()
+        };
+        let Some(generation) = generation else {
+            return;
+        };
+        let state = Arc::clone(&self.vm);
+        tokio::spawn(async move {
+            tokio::time::sleep(IDLE_TIMEOUT).await;
+            // Starting and stopping are one serialized lifecycle transition.
+            // New effects wait here, then restart the fully stopped VM; active
+            // effects still share the existing cloned handle concurrently.
+            let mut state = state.lock().await;
+            if !state.may_stop(generation) {
+                return;
+            }
+            state.secret_digests.clear();
+            if let Some(vm) = state.vm.take() {
+                let _ = vm.stop().await;
+            }
+        });
     }
 
     async fn provision(&self) -> bool {
@@ -564,6 +674,14 @@ impl Sandbox {
             }
         }
     }
+
+    async fn configure_git_credentials(&self) {
+        let options = ExecOptions {
+            cwd: Some("/".into()),
+            ..Default::default()
+        };
+        let _ = self.exec(GIT_CREDENTIAL_SETUP, options, None).await;
+    }
 }
 
 fn encode(output: &microsandbox::ExecOutput, cancelled: bool) -> Output {
@@ -577,6 +695,99 @@ fn encode(output: &microsandbox::ExecOutput, cancelled: bool) -> Output {
     }
 }
 
+fn runtime_secret_digests(policy: &Policy) -> BTreeMap<String, String> {
+    policy
+        .secrets
+        .iter()
+        .filter_map(|secret| {
+            let value = std::env::var(&secret.source).ok()?;
+            Some((secret.env.clone(), hex(&Sha256::digest(value.as_bytes()))))
+        })
+        .collect()
+}
+fn secret_config_error(error: microsandbox::MicrosandboxError) -> SandboxError {
+    SandboxError::Failed(format!("cannot inspect runtime secrets: {error}"))
+}
+
+fn persisted_secret_names(config: &microsandbox::SandboxConfig) -> Vec<String> {
+    config
+        .spec
+        .network
+        .secrets
+        .iter()
+        .flat_map(|config| &config.secrets)
+        .map(|secret| secret.env_var.clone())
+        .collect()
+}
+
+async fn remove_secret_definitions(
+    mut modification: SandboxModificationBuilder,
+    names: &[String],
+    next_start: bool,
+) -> Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    for name in names {
+        modification = modification.remove_secret(name.as_str());
+    }
+    if next_start {
+        modification = modification.next_start();
+    }
+    modification
+        .apply()
+        .await
+        .map(|_| ())
+        .map_err(|e| SandboxError::Failed(format!("cannot remove runtime secrets: {e}")))
+}
+
+async fn install_secret_definitions(
+    mut modification: SandboxModificationBuilder,
+    secrets: &[Secret],
+    next_start: bool,
+) -> Result<()> {
+    let available: Vec<Secret> = secrets
+        .iter()
+        .filter(|secret| std::env::var_os(&secret.source).is_some())
+        .cloned()
+        .collect();
+    if available.is_empty() {
+        return Ok(());
+    }
+    for secret in available {
+        modification = modification.secret(move |mut patch| {
+            patch = patch.env(secret.env.as_str()).source(SecretSource::Env {
+                var: secret.source.clone(),
+            });
+            if let Some(placeholder) = &secret.placeholder {
+                patch = patch.placeholder(placeholder.as_str());
+            }
+            for host in &secret.hosts {
+                patch = patch.allow_host(host.as_str());
+            }
+            patch
+        });
+    }
+    if next_start {
+        modification = modification.next_start();
+    }
+    modification
+        .apply()
+        .await
+        .map(|_| ())
+        .map_err(|e| SandboxError::Failed(format!("cannot apply runtime secrets: {e}")))
+}
+
+fn missing_secret_warning(secret: &Secret) -> Option<String> {
+    std::env::var_os(&secret.source).is_none().then(|| {
+        format!(
+            "{} is unset; authenticated access for {} is disabled",
+            secret.source,
+            secret.hosts.join(", ")
+        )
+    })
+}
+
 /// Turn a [`Policy`] into a booted VM.
 async fn build(policy: &Policy, name: &str, host_workspace: &Path) -> Result<MsbSandbox> {
     let mut builder = MsbSandbox::builder(name.to_string())
@@ -586,9 +797,7 @@ async fn build(policy: &Policy, name: &str, host_workspace: &Path) -> Result<Msb
         .workdir(policy.workdir.clone())
         .replace();
 
-    for (key, value) in &policy.env {
-        builder = builder.env(key.as_str(), value.as_str());
-    }
+    // Ordinary environment values are exec-time parameters, not VM state.
 
     if policy.mount_workspace {
         let host = host_workspace.to_path_buf();
@@ -604,23 +813,27 @@ async fn build(policy: &Policy, name: &str, host_workspace: &Path) -> Result<Msb
         .map_err(|e| SandboxError::Policy(format!("invalid allowed host: {e}")))?;
     builder = builder.network(move |n| n.enabled(true).policy(network));
 
-    for secret in &policy.secrets {
-        if secret.value.is_empty() {
-            continue;
-        }
-        let secret = secret.clone();
-        builder = builder.secret(move |mut s| {
-            s = s.env(secret.env.as_str()).value(secret.value.as_str());
+    // Only host environment references enter the durable definition. Values
+    // are resolved by microsandbox when the VM starts and remain host-side.
+    for secret in policy
+        .secrets
+        .iter()
+        .filter(|secret| std::env::var_os(&secret.source).is_some())
+        .cloned()
+    {
+        builder = builder.secret(move |mut entry| {
+            entry = entry.env(secret.env.as_str()).source(SecretSource::Env {
+                var: secret.source.clone(),
+            });
             if let Some(placeholder) = &secret.placeholder {
-                s = s.placeholder(placeholder.as_str());
+                entry = entry.placeholder(placeholder.as_str());
             }
             for host in &secret.hosts {
-                s = s.allow_host(host.as_str());
+                entry = entry.allow_host(host.as_str());
             }
-            s
+            entry
         });
     }
-
     builder
         .create()
         .await
@@ -630,6 +843,7 @@ async fn build(policy: &Policy, name: &str, host_workspace: &Path) -> Result<Msb
 /// Startup happens before the TUI exists, so a long image pull needs somewhere
 /// to say so.
 pub trait Progress: Send + Sync {
+    fn warning(&self, label: &str);
     fn stage(&self, label: &str);
     fn finish(&self, label: &str);
 }
@@ -638,6 +852,7 @@ pub trait Progress: Send + Sync {
 pub struct Silent;
 
 impl Progress for Silent {
+    fn warning(&self, _label: &str) {}
     fn stage(&self, _label: &str) {}
     fn finish(&self, _label: &str) {}
 }
@@ -693,24 +908,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn egress_is_github_only_once_provisioning_is_off() {
-        let policy = Policy {
-            provision: false,
-            ..Default::default()
-        };
-        let hosts = policy.egress_hosts();
-        assert!(hosts.contains(&"github.com".to_string()));
+    fn default_egress_denies_every_host_even_during_provisioning() {
         assert!(
-            !hosts.contains(&"deb.debian.org".to_string()),
-            "mirrors are provisioning-only"
+            Policy::default().egress_hosts().is_empty(),
+            "network access must be named explicitly in sandbox.lua"
         );
     }
 
     #[test]
-    fn provisioning_opens_package_mirrors_and_nothing_more() {
-        let hosts = Policy::default().egress_hosts();
-        assert!(hosts.contains(&"deb.debian.org".to_string()));
-        assert!(!hosts.contains(&"example.com".to_string()));
+    fn explicit_hosts_are_sorted_and_deduplicated() {
+        let policy = Policy {
+            allow_hosts: vec![
+                "deb.debian.org".into(),
+                "github.com".into(),
+                "deb.debian.org".into(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            policy.egress_hosts(),
+            vec!["deb.debian.org".to_string(), "github.com".to_string()]
+        );
     }
 
     #[test]
@@ -721,7 +939,7 @@ mod tests {
         let other = policy.sandbox_name(Path::new("/tmp/other-agent/workspace"));
         assert_eq!(a, b, "the same agent restarts the same VM");
         assert_ne!(a, other);
-        assert!(a.starts_with("leve-my-agent-"), "got {a}");
+        assert!(a.starts_with("reve-my-agent-"), "got {a}");
     }
 
     #[test]
@@ -734,40 +952,23 @@ mod tests {
     }
 
     #[test]
-    fn a_secret_value_never_reaches_the_fingerprint() {
+    fn runtime_parameters_do_not_change_the_vm_fingerprint() {
         let ws = Path::new("/tmp/agent/workspace");
-        let policy = Policy {
-            secrets: vec![Secret {
-                env: "T".into(),
-                value: "SUPERSECRET".into(),
-                placeholder: None,
-                hosts: vec!["x.com".into()],
-            }],
-            ..Default::default()
-        };
-        let fingerprint = policy.fingerprint(ws);
-        assert!(!fingerprint.contains("SUPERSECRET"));
-        assert_eq!(fingerprint, policy.fingerprint(ws), "and it is stable");
-    }
-
-    #[test]
-    fn rotating_a_secret_forces_a_rebuild() {
-        let ws = Path::new("/tmp/agent/workspace");
-        let mut policy = Policy {
-            secrets: vec![Secret {
-                env: "T".into(),
-                value: "old".into(),
-                placeholder: None,
-                hosts: vec!["x.com".into()],
-            }],
-            ..Default::default()
-        };
-        let before = policy.fingerprint(ws);
-        policy.secrets[0].value = "new".into();
-        assert_ne!(
-            before,
-            policy.fingerprint(ws),
-            "the proxy must not keep a stale value"
+        let base = Policy::default();
+        let mut runtime_changed = base.clone();
+        runtime_changed
+            .env
+            .insert("RUNTIME_FLAG".into(), "different".into());
+        runtime_changed.secrets.push(Secret {
+            env: "TOKEN".into(),
+            source: "HOST_TOKEN".into(),
+            placeholder: Some("reve-token".into()),
+            hosts: vec!["x.com".into()],
+        });
+        assert_eq!(
+            base.fingerprint(ws),
+            runtime_changed.fingerprint(ws),
+            "exec environment and proxy secrets refresh without rebuilding the VM"
         );
     }
 
@@ -791,11 +992,52 @@ mod tests {
         assert!(script.contains("node@lts"));
     }
 
+    #[test]
+    fn an_unset_scoped_secret_is_reported_before_boot() {
+        let secret = Secret {
+            env: "GITHUB_TOKEN".into(),
+            source: "REVE_TEST_MISSING_GITHUB_TOKEN_9D2B".into(),
+            placeholder: Some("reve-github-token".into()),
+            hosts: vec!["github.com".into(), "api.github.com".into()],
+        };
+        assert_eq!(
+            missing_secret_warning(&secret).as_deref(),
+            Some(
+                "REVE_TEST_MISSING_GITHUB_TOKEN_9D2B is unset; authenticated access for github.com, api.github.com is disabled"
+            )
+        );
+    }
+
+    #[test]
+    fn git_uses_the_guest_github_cli_as_its_credential_helper() {
+        assert!(GIT_CREDENTIAL_SETUP.contains("credential.https://github.com.helper"));
+        assert!(GIT_CREDENTIAL_SETUP.contains("gh auth git-credential"));
+    }
+
     #[tokio::test]
     async fn a_cancel_flag_resolves_once_and_stays_resolved() {
         let (tx, mut rx) = tokio_util_lite::channel();
         tx.cancel();
         rx.cancelled().await;
         rx.cancelled().await; // still resolved, does not hang
+    }
+
+    #[test]
+    fn new_activity_invalidates_an_older_idle_deadline() {
+        let mut state = VmState {
+            vm: None,
+            active: 0,
+            generation: 0,
+            secret_digests: BTreeMap::new(),
+        };
+        state.begin();
+        let first_deadline = state.finish().unwrap();
+        assert!(state.may_stop(first_deadline));
+
+        state.begin();
+        assert!(!state.may_stop(first_deadline));
+        let second_deadline = state.finish().unwrap();
+        assert!(!state.may_stop(first_deadline));
+        assert!(state.may_stop(second_deadline));
     }
 }

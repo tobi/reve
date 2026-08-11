@@ -47,14 +47,6 @@ pub struct Subagent {
     pub elapsed: std::time::Duration,
 }
 
-/// Something a channel delivered while the agent was busy.
-#[derive(Debug, Clone)]
-pub struct Inbox {
-    pub channel: String,
-    pub text: String,
-    pub read: bool,
-}
-
 #[derive(Debug, Clone)]
 pub enum Item {
     /// What the user typed.

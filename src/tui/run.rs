@@ -84,10 +84,53 @@ async fn event_loop(
             }
             update = updates.recv() => {
                 match update {
-                    Some(update) => app.apply(update),
+                    Some(update) => {
+                        if !apply_update(app, actions, update).await {
+                            return Ok(());
+                        }
+                    }
                     None => return Ok(()),
                 }
             }
         }
+    }
+}
+
+async fn apply_update(app: &mut App, actions: &mpsc::Sender<Action>, update: Update) -> bool {
+    match update {
+        Update::Received(message) => {
+            app.apply(Update::Received(message.clone()));
+            actions.send(Action::ChannelMessage(message)).await.is_ok()
+        }
+        update => {
+            app.apply(update);
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::channels::Message;
+    use crate::tui::item::Item;
+
+    #[tokio::test]
+    async fn a_channel_update_is_forwarded_to_the_agent() {
+        let mut app = App::new("model", "low", "workspace");
+        let (actions, mut received) = mpsc::channel(1);
+        let message = Message {
+            channel: "telegram".into(),
+            text: "ship it".into(),
+            timestamp: 13,
+        };
+
+        assert!(apply_update(&mut app, &actions, Update::Received(message.clone())).await);
+        assert_eq!(received.recv().await, Some(Action::ChannelMessage(message)));
+        assert!(matches!(
+            app.drain_scrollback().as_slice(),
+            [Item::Received { channel, text }]
+                if channel == "telegram" && text == "ship it"
+        ));
     }
 }

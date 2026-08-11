@@ -84,6 +84,9 @@ pub struct RunReport {
 #[derive(Debug, Clone)]
 pub enum RunEvent {
     AssistantDelta(String),
+    /// One model response is complete. Any following delta belongs to a new
+    /// assistant turn and must not be appended to this one in the renderer.
+    AssistantFinished,
     ToolStarted {
         name: String,
         arguments: Map<String, Value>,
@@ -180,6 +183,7 @@ impl Lane<'_> {
                     break Outcome::Failed;
                 }
             };
+            on_event(RunEvent::AssistantFinished);
 
             // The assistant entry lands before any tool result, so context
             // stays append-only: a result can never precede the turn that
@@ -286,7 +290,7 @@ fn cancelled(cancel: &mut Option<CancelRx>) -> bool {
 }
 
 fn interrupted_text() -> String {
-    "Interrupted: leve aborted this operation before the tool finished.".to_string()
+    "Interrupted: reve aborted this operation before the tool finished.".to_string()
 }
 
 // ── recovery ─────────────────────────────────────────────────────────────
@@ -538,6 +542,44 @@ mod tests {
         let promised = EntryId::from(intent.str("resultEntryId").unwrap());
         let result = storage.entry(&promised).expect("the promised entry exists");
         assert_eq!(result.role(), Some("toolResult"));
+    }
+
+    #[tokio::test]
+    async fn every_model_response_emits_its_own_turn_boundary() {
+        let (_d, model) = scripted(vec![
+            Assistant::call("probe", serde_json::json!({})),
+            Assistant::text("done"),
+        ]);
+        let tools = TestTools::new(Replay::Safe);
+        let mut storage = Storage::memory("s1");
+        let events = Mutex::new(Vec::new());
+        Lane {
+            name: MAIN_LANE.into(),
+            storage: &mut storage,
+            model: &model,
+            tools: &tools,
+        }
+        .run_with("go", None, "", &[], &|event| {
+            events.lock().push(match event {
+                RunEvent::AssistantDelta(_) => "delta",
+                RunEvent::AssistantFinished => "assistant_finished",
+                RunEvent::ToolStarted { .. } => "tool_started",
+                RunEvent::ToolFinished { .. } => "tool_finished",
+            });
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *events.lock(),
+            [
+                "assistant_finished",
+                "tool_started",
+                "tool_finished",
+                "delta",
+                "assistant_finished",
+            ]
+        );
     }
 
     /// Append-only context: a tool result can never precede the turn that asked

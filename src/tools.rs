@@ -9,6 +9,7 @@
 //! that only reads may be re-run after a crash, one that writes may not.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Map, Value, json};
 
@@ -120,10 +121,11 @@ const BUILTINS: &[Builtin] = &[
     },
 ];
 
-/// Output longer than this is truncated in the model's view. A tool that dumps
-/// a whole repository into the context window costs money and crowds out the
-/// conversation; the file is still there to read a piece of.
+/// Output longer than this is truncated in the model's view and spilled to a
+/// guest `/tmp` file so the model can inspect narrower ranges without paying
+/// to keep the entire result in its context.
 const MAX_OUTPUT: usize = 24_000;
+static SPILL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub struct Toolbox {
     sandbox: Arc<Sandbox>,
@@ -202,12 +204,12 @@ impl Toolbox {
             .unwrap_or(args);
         // The agent's own tools take precedence.
         if self.runtime.tool(name).is_some() {
-            return self
+            let text = self
                 .runtime
                 .call_tool(name, args, self.sandbox.clone())
                 .await
-                .map(|text| truncate(&text))
-                .map_err(|e| e.to_string());
+                .map_err(|e| e.to_string())?;
+            return Ok(self.present_output(&text).await);
         }
         let text = match name {
             "bash" => {
@@ -249,26 +251,9 @@ impl Toolbox {
                     .read_file(&path)
                     .await
                     .map_err(|e| e.to_string())?;
-                let offset = args
-                    .get("offset")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(1)
-                    .max(1) as usize;
-                let limit = args
-                    .get("limit")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(u64::MAX) as usize;
-                // Numbered, because the next thing asked is usually "edit line N".
-                content
-                    .lines()
-                    .enumerate()
-                    .skip(offset - 1)
-                    .take(limit)
-                    // Spaces, not a tab: a tab in a gutter lands wherever the
-                    // terminal's tab stops happen to be.
-                    .map(|(i, line)| format!("{:>5}  {line}", i + 1))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                let offset = args.get("offset").and_then(Value::as_i64);
+                let limit = args.get("limit").and_then(Value::as_i64);
+                read_range(&content, offset, limit)?
             }
             "write" => {
                 let path = string(&args, "path")?;
@@ -328,7 +313,7 @@ impl Toolbox {
             .await
             .map_err(|e| format!("after_tool hook: {e}"))?;
         let text = after.get("result").and_then(Value::as_str).unwrap_or("");
-        Ok(truncate(text))
+        Ok(self.present_output(text).await)
     }
 
     async fn shell(&self, command: &str) -> Result<String, String> {
@@ -343,6 +328,26 @@ impl Toolbox {
             out.stdout
         };
         Ok(text.trim_end().to_string())
+    }
+
+    async fn present_output(&self, text: &str) -> String {
+        if text.len() <= MAX_OUTPUT {
+            return text.to_string();
+        }
+        let sequence = SPILL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = format!(
+            "/tmp/reve-tool-output-{}-{sequence}.log",
+            crate::ids::now_ms()
+        );
+        match self.sandbox.write_file(&path, text).await {
+            Ok(()) => truncate(text, &path),
+            Err(error) => {
+                let kept: String = text.chars().take(MAX_OUTPUT).collect();
+                format!(
+                    "{kept}\n… truncated at {MAX_OUTPUT} characters; full output could not be saved: {error}"
+                )
+            }
+        }
     }
 }
 
@@ -394,12 +399,41 @@ fn replace_once(content: &str, old: &str, new: &str) -> Result<String, String> {
         )),
     }
 }
-fn truncate(text: &str) -> String {
-    if text.len() <= MAX_OUTPUT {
-        return text.to_string();
+fn read_range(content: &str, offset: Option<i64>, limit: Option<i64>) -> Result<String, String> {
+    // Match Pi: lines are split on `\n`, including a trailing empty line;
+    // offsets are 1-indexed, zero/negative offsets start at the first line.
+    let lines: Vec<&str> = content.split('\n').collect();
+    let start = offset.unwrap_or(1).saturating_sub(1).max(0) as usize;
+    if start >= lines.len() {
+        return Err(format!(
+            "Offset {} is beyond end of file ({} lines total)",
+            offset.unwrap_or(1),
+            lines.len()
+        ));
     }
+    let end = match limit {
+        Some(limit) => start.saturating_add(limit.max(0) as usize).min(lines.len()),
+        None => lines.len(),
+    };
+    let mut output = lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(index, line)| format!("{:>5}  {line}", start + index + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if limit.is_some() && end < lines.len() {
+        let remaining = lines.len() - end;
+        let next_offset = end + 1;
+        output.push_str(&format!(
+            "\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]"
+        ));
+    }
+    Ok(output)
+}
+
+fn truncate(text: &str, path: &str) -> String {
     let kept: String = text.chars().take(MAX_OUTPUT).collect();
-    format!("{kept}\n… truncated at {MAX_OUTPUT} characters; read a narrower range for the rest")
+    format!("{kept}\n… truncated at {MAX_OUTPUT} characters. Full output: {path}")
 }
 
 #[cfg(test)]
@@ -458,17 +492,32 @@ mod tests {
     }
 
     #[test]
-    fn output_is_truncated_with_a_pointer_to_the_rest() {
+    fn long_output_points_to_its_spill_file() {
         let long = "x".repeat(MAX_OUTPUT * 2);
-        let out = truncate(&long);
+        let out = truncate(&long, "/tmp/reve-tool-output-test.log");
         assert!(out.len() < long.len());
         assert!(out.contains("truncated"), "and says so");
-        assert!(out.contains("narrower range"), "and what to do about it");
+        assert!(
+            out.contains("/tmp/reve-tool-output-test.log"),
+            "and names the full output"
+        );
     }
 
     #[test]
-    fn short_output_is_left_exactly_alone() {
-        assert_eq!(truncate("hello"), "hello");
+    fn read_ranges_match_pi_at_file_boundaries() {
+        let content = "one\ntwo\nthree\n";
+        assert_eq!(
+            read_range(content, Some(2), Some(2)).unwrap(),
+            "    2  two\n    3  three\n\n[1 more lines in file. Use offset=4 to continue.]"
+        );
+        assert_eq!(
+            read_range(content, Some(0), Some(1)).unwrap(),
+            "    1  one\n\n[3 more lines in file. Use offset=2 to continue.]"
+        );
+        assert_eq!(
+            read_range(content, Some(5), None).unwrap_err(),
+            "Offset 5 is beyond end of file (4 lines total)"
+        );
     }
 
     #[test]

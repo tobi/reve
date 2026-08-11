@@ -39,7 +39,7 @@ pub struct Kv {
 impl Kv {
     pub fn new(root: &Path, namespace: &str) -> Self {
         Self {
-            path: root.join(".leve/channels.json"),
+            path: root.join(".reve/channels.json"),
             namespace: namespace.into(),
         }
     }

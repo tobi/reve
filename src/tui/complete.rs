@@ -55,10 +55,24 @@ impl Completion {
 
 /// Work out what could come next.
 ///
-/// Returns nothing unless the line is a slash command: ordinary prompts are for
-/// the model, and popping a list open while someone writes prose would be
-/// worse than useless.
-pub fn complete(input: &str, commands: &[Command]) -> Completion {
+/// Slash commands complete from the command registry. An `@` token at the
+/// start of the line or after whitespace completes a workspace-relative file.
+/// The token must be at the end of the input so accepting it cannot overwrite
+/// prose to the right of the cursor.
+pub fn complete(input: &str, commands: &[Command], files: &[Candidate]) -> Completion {
+    if let Some(replace_from) = file_token_start(input) {
+        let typed = &input[replace_from..];
+        let candidates = files
+            .iter()
+            .filter(|file| file.value.starts_with(typed))
+            .cloned()
+            .collect();
+        return Completion {
+            candidates,
+            replace_from,
+        };
+    }
+
     let Some(rest) = input.strip_prefix('/') else {
         return Completion::default();
     };
@@ -100,6 +114,14 @@ pub fn complete(input: &str, commands: &[Command]) -> Completion {
     }
 }
 
+fn file_token_start(input: &str) -> Option<usize> {
+    let start = input.rfind('@')?;
+    if start > 0 && !input[..start].ends_with(char::is_whitespace) {
+        return None;
+    }
+    (!input[start + 1..].chars().any(char::is_whitespace)).then_some(start)
+}
+
 /// Apply a candidate to the input, leaving the cursor after it.
 ///
 /// A command that takes an argument gains a trailing space, because the next
@@ -123,6 +145,10 @@ pub fn accept(input: &str, completion: &Completion, index: usize, commands: &[Co
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn complete(input: &str, commands: &[Command]) -> Completion {
+        super::complete(input, commands, &[])
+    }
 
     fn candidates(values: &[&str]) -> Vec<Candidate> {
         values
@@ -176,6 +202,27 @@ mod tests {
         for input in ["", "how do I", "what about /model", "!ls"] {
             assert!(!complete(input, &registry()).is_open(), "{input:?}");
         }
+    }
+
+    #[test]
+    fn an_at_token_completes_workspace_files_inside_a_prompt() {
+        let files = candidates(&["@AGENTS.md", "@knowledge/project.md"]);
+        let completion = super::complete("compare @know", &registry(), &files);
+        assert_eq!(
+            values(&completion),
+            vec!["@knowledge/project.md".to_string()]
+        );
+        assert_eq!(completion.replace_from, "compare ".len());
+        assert_eq!(
+            accept("compare @know", &completion, 0, &registry()),
+            "compare @knowledge/project.md"
+        );
+    }
+
+    #[test]
+    fn an_at_sign_inside_a_word_is_not_a_file_reference() {
+        let files = candidates(&["@example.com"]);
+        assert!(!super::complete("mail me@example", &registry(), &files).is_open());
     }
 
     #[test]

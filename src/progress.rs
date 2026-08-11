@@ -6,7 +6,7 @@
 //! stage on screen with what it cost:
 //!
 //! ```text
-//!   ✓ built microVM leve-my-agent-4cc1857b63       4.1s
+//!   ✓ built microVM reve-my-agent-4cc1857b63       4.1s
 //!   ⠹ provisioning APT packages and node@lts       12s
 //! ```
 //!
@@ -131,6 +131,9 @@ impl Spinner {
 }
 
 impl Progress for Spinner {
+    fn warning(&self, label: &str) {
+        self.settle("!", theme::RGB_ALERT, label, Duration::ZERO);
+    }
     fn stage(&self, label: &str) {
         let previous = {
             let mut state = self.state.lock();
@@ -294,7 +297,7 @@ mod tests {
         let line = strip_ansi(&render_at(
             "⠋",
             theme::RGB_ALERT,
-            "building microVM leve-try2-96d47e5f27 from debian:trixie-slim",
+            "building microVM reve-try2-96d47e5f27 from debian:trixie-slim",
             Duration::from_secs(3),
             40,
         ));

@@ -8,9 +8,9 @@
 
 use std::path::PathBuf;
 
-use leve::lane::{Lane, Tools};
-use leve::model::{Assistant, BoxFuture, ScriptedModel};
-use leve::records::{MAIN_LANE, Replay};
+use reve::lane::{Lane, Tools};
+use reve::model::{Assistant, BoxFuture, ScriptedModel};
+use reve::records::{MAIN_LANE, Replay};
 use serde_json::{Map, Value};
 
 /// Signals readiness, then never returns. The parent kills us here.
@@ -46,7 +46,7 @@ async fn main() {
     let cursor = session.with_extension("cursor");
 
     let mut storage =
-        leve::storage::Storage::open(&session, "crash", None).expect("open the session");
+        reve::storage::Storage::open(&session, "crash", None).expect("open the session");
     let model = ScriptedModel::new(
         vec![
             Assistant::call("hang", serde_json::json!({})),

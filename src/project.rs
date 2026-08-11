@@ -14,7 +14,7 @@ use crate::lua::Runtime;
 #[derive(Debug, Error)]
 pub enum ProjectError {
     #[error(
-        "not an agent directory: {0}\n\n  an agent needs at least one of:\n    instructions.md   what the agent is and how it works\n    agent.lua         its configuration (model, tools, sandbox)\n\n  run `leve init` to scaffold one here"
+        "not an agent directory: {0}\n\n  an agent needs at least one of:\n    instructions.md   what the agent is and how it works\n    agent.lua         its configuration (model, tools, sandbox)\n\n  run `reve init` to scaffold one here"
     )]
     NotAnAgent(PathBuf),
     #[error("io error at {path}: {source}")]
@@ -29,7 +29,7 @@ pub enum ProjectError {
 
 pub type Result<T, E = ProjectError> = std::result::Result<T, E>;
 
-/// The files `leve init` writes. Kept as one table so `init` is idempotent and
+/// The files `reve init` writes. Kept as one table so `init` is idempotent and
 /// can report created / unchanged / changed-and-kept per file.
 const TEMPLATES: &[(&str, &str)] = &[
     ("agent.lua", include_str!("templates/agent.lua")),
@@ -83,7 +83,7 @@ pub fn init(root: impl AsRef<Path>) -> Result<InitReport> {
         let path = root.join(dir);
         std::fs::create_dir_all(&path).map_err(|source| ProjectError::Io { path, source })?;
     }
-    // `.leve` is durable state, not scaffold; it is created on first launch.
+    // `.reve` is durable state, not scaffold; it is created on first launch.
     for (name, body) in TEMPLATES {
         let path = root.join(name);
         if let Some(parent) = path.parent() {
@@ -116,7 +116,7 @@ pub struct Project {
 }
 
 impl Project {
-    /// Is this a directory leve is willing to run?
+    /// Is this a directory reve is willing to run?
     ///
     /// The check exists so an agent cannot silently attach itself to an
     /// arbitrary checkout and start acting like it belongs there.
@@ -148,7 +148,7 @@ impl Project {
     }
 
     pub fn state_dir(&self) -> PathBuf {
-        self.root.join(".leve")
+        self.root.join(".reve")
     }
 
     pub fn sessions_dir(&self) -> PathBuf {
@@ -242,7 +242,7 @@ mod tests {
             "got {err}"
         );
         assert!(
-            err.to_string().contains("leve init"),
+            err.to_string().contains("reve init"),
             "and it says how to fix that"
         );
     }

@@ -5,7 +5,7 @@
 //! came before — freeze everything up to the last one, and re-render only the
 //! tail.
 //!
-//! For leve that is not merely an optimisation, it is what makes streaming
+//! For reve that is not merely an optimisation, it is what makes streaming
 //! possible at all. Finished transcript goes into the terminal's own scrollback
 //! with `insert_before`, and printed lines cannot be taken back. So a line may
 //! only be printed once it is known to be final. Without checkpoints the choice

@@ -1,7 +1,7 @@
 //! Session state: entries, records, lanes, facts, and one monotonic `seq`.
 //!
 //! This type is deliberately *not* thread-safe and deliberately not shared.
-//! Exactly one task owns it (see [`crate::store`]), which is how leve gets the
+//! Exactly one task owns it (see [`crate::store`]), which is how reve gets the
 //! single-writer guarantee structurally instead of by convention.
 
 pub mod jsonl;

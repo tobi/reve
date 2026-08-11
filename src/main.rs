@@ -1,17 +1,17 @@
-//! The `leve` command.
+//! The `reve` command.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use leve::progress::Spinner;
-use leve::project::{self, Project};
-use leve::sandbox::{ExecOptions, Sandbox};
+use reve::progress::Spinner;
+use reve::project::{self, Project};
+use reve::sandbox::{ExecOptions, Sandbox};
 
 #[derive(Parser)]
 #[command(
-    name = "leve",
+    name = "reve",
     version,
     about = "A durable coding agent: Rust core, Lua scripting, mandatory microVM"
 )]
@@ -50,7 +50,7 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("\x1b[31mleve:\x1b[0m {e}");
+            eprintln!("\x1b[31mreve:\x1b[0m {e}");
             ExitCode::FAILURE
         }
     }
@@ -59,10 +59,15 @@ async fn main() -> ExitCode {
 async fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let Some(command) = cli.command else {
-        // Bare `leve` is the thing `leve init` tells you to run.
+        // Boot once to fail closed, then release the cheap persisted VM until
+        // the first sandbox effect. This lets idle TUI sessions coexist.
         let project = Project::load(std::env::current_dir()?)?;
         let sandbox = start_sandbox(&project).await?;
-        leve::tui::session::run(project, sandbox).await?;
+        sandbox.stop().await?;
+        let result = reve::tui::session::run(project, sandbox.clone()).await;
+        let stopped = sandbox.stop().await;
+        result?;
+        stopped?;
         return Ok(ExitCode::SUCCESS);
     };
     match command {
@@ -80,7 +85,7 @@ async fn run() -> anyhow::Result<ExitCode> {
                 println!("  \x1b[2m· {name} (edited; kept)\x1b[0m");
             }
             println!();
-            println!("  edit \x1b[1minstructions.md\x1b[0m, then run \x1b[1mleve\x1b[0m here");
+            println!("  edit \x1b[1minstructions.md\x1b[0m, then run \x1b[1mreve\x1b[0m here");
             Ok(ExitCode::SUCCESS)
         }
 
