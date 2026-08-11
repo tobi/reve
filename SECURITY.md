@@ -1,6 +1,6 @@
 # Security policy
 
-Leve executes model-authored code, so sandbox boundary failures and credential disclosure
+Reve executes model-authored code, so sandbox boundary failures and credential disclosure
 are security issues, not ordinary bugs.
 
 ## Supported versions
@@ -13,9 +13,9 @@ users should update to the newest 0.x release rather than expecting fixes on old
 Please do not open a public issue for a suspected vulnerability. Use GitHub's private
 security advisory form:
 
-<https://github.com/tobi/leve/security/advisories/new>
+<https://github.com/tobi/reve/security/advisories/new>
 
-Include the Leve version (`leve --version`), operating system, the pinned `microsandbox`
+Include the Reve version (`reve --version`), operating system, the pinned `microsandbox`
 crate version (`=0.6.8`, the only sandbox dependency, declared in `Cargo.toml`), reproduction
 steps, and potential impact. Remove API keys, model transcripts, session contents, and
 other private workspace data from reports.
@@ -27,23 +27,24 @@ status update after the report has been reproduced.
 
 ## Security model
 
-Leve deliberately fails closed:
+Reve deliberately fails closed:
 
-- Every command a tool issues — `ctx.sh` — and every `leve exec` runs in the same mandatory
+- Every command a tool issues — `ctx.sh` — and every `reve exec` runs in the same mandatory
   microsandbox microVM. There is no host-shell, local, CLI, or FFI fallback.
 - The sandbox is provided exclusively by the `microsandbox` Rust crate, pinned `=0.6.8` in
-  `Cargo.toml`. It is Leve's only sandbox dependency, linked and called directly — no FFI
+  `Cargo.toml`. It is Reve's only sandbox dependency, linked and called directly — no FFI
   shim, no daemon, no CLI transport.
 - Only `workspace/` is bind-mounted into the VM, at `/workspace`, and set as the working
   directory. The agent's own definition files stay outside the mount.
-- Network access is deny-by-default. The policy is built in Rust from
-  `NetworkPolicy::none()` — deny both directions — plus one narrow gateway-DNS rule plus
-  one allow rule per host named by `sandbox.lua`. Nothing in the crate can widen it to
-  "the internet". GitHub hosts are reachable by default; `allow` is additive on top.
-- Secrets are scoped per host. The guest sees only the placeholder; the real value is
-  injected into requests to the named hosts at the network boundary. An unscoped secret
-  (no `hosts`) is refused at load time. Secrets are hashed into the VM fingerprint, never
-  stored in cleartext.
+- Network access starts from `NetworkPolicy::none()` and remains deny-all except for the
+  narrow gateway-DNS rule and hostnames explicitly listed by `sandbox.lua`. An empty
+  `allow` list permits no outbound host. Provisioning never widens the allowlist
+  implicitly; the generated scaffold names every package and toolchain host it needs.
+- Secrets are scoped per host. Configuration stores a host environment variable name, not
+  its value. Microsandbox resolves that source when the VM starts; the guest sees only the
+  placeholder, and the real value is injected into requests to named hosts at the network
+  boundary. An unscoped secret is refused. Removed secrets are deleted from reused VM
+  definitions before restart, and runtime secret changes never enter the disk fingerprint.
 - Durable intent records are written before effects so recovery does not guess whether an
   effectful operation should be replayed.
 

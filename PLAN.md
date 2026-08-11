@@ -1,10 +1,10 @@
-# Leve coding agent in Rust, with Lua scripting
+# Reve coding agent in Rust, with Lua scripting
 
 Implementation plan. The durable-harness design it follows is documented by Pi at
 [harness-v2.md](https://github.com/earendil-works/pi/blob/main/packages/agent/docs/harness-v2.md);
 this document maps it onto Rust modules and records what was built and what is pending.
 
-Leve is a Rust crate (edition 2024) with Lua for scripting, written as a fresh 0.1.0.
+Reve is a Rust crate (edition 2024) with Lua for scripting, written as a fresh 0.1.0.
 
 ## 0. Why Rust and single-owner state
 
@@ -17,9 +17,10 @@ owning task. Every other invariant — lanes owning their own queues, records ne
 across lanes, hooks awaited at interception points, tools as isolated effects — maps onto
 "one task, one owner, channels in between".
 
-Concurrency is tokio tasks. The sandbox holds a live microVM handle behind a
-`tokio::sync::Mutex`, cloned out before any `await` so a long command never blocks `stop` or
-the next `exec`. Cancellation is a hand-rolled one-bit watch channel
+Concurrency is tokio tasks. The sandbox holds its optional live microVM handle and activity
+generation behind a `tokio::sync::Mutex`: effects start it on demand, clone the handle
+before running, and schedule an idle stop only when the last effect finishes. A new effect
+invalidates the older idle deadline. Cancellation is a hand-rolled one-bit watch channel
 (`tokio_util_lite`), delivered once.
 
 ## 1. Module map
@@ -40,7 +41,7 @@ src/
   provider/
     config.rs         models.yml, $ENV enforcement, compat resolution
     sse.rs            chunk-safe SSE decoder
-    openai_responses.rs / anthropic.rs  streaming adapters
+    openai_responses.rs / openai_completions.rs / anthropic.rs  streaming adapters
     mod.rs            reqwest transport, retry and diagnostics
   sandbox.rs          mandatory microsandbox VM, deny-by-default egress
   lua.rs              agent.lua, sandbox.lua, tools/*.lua, JSON schemas
@@ -48,10 +49,10 @@ src/
   skills.rs           recursive SKILL.md catalog and validation
   heartbeat.rs        schedule reload and response-contract validation
   channels.rs         inbox broadcast and namespaced durable KV
-  project.rs          agent directory and leve init
+  project.rs          agent directory and reve init
   tui/{app,item,markdown,stream,complete,run,session}.rs
                        inline ratatui renderer and terminal session
-  main.rs              init / info / exec / tool / bare leve TUI
+  main.rs              init / info / exec / tool / bare reve TUI
 tests/{crash,microvm,provider_http}.rs
 ```
 
@@ -89,20 +90,25 @@ tests/{crash,microvm,provider_http}.rs
    Torn-tail truncation on reopen; a malformed line in the middle refused as corruption;
    version check on reopen (`src/storage/jsonl.rs`).
 5. **The mandatory sandbox.** Links `microsandbox =0.6.8` directly. Deny-by-default egress
-   from `NetworkPolicy::none()` + gateway-DNS + one allow per host. Scoped secrets with
-   placeholders. Fingerprint-based VM reuse (secrets hashed, not stored). Cancellation via
-   the exec control channel. Workspace bind mount at `/workspace` (`src/sandbox.rs`).
+   from `NetworkPolicy::none()` + gateway-DNS + one allow per host. Scoped, source-backed
+   secrets with guest placeholders; only host environment references persist. Runtime
+   env values and secrets are excluded from the VM fingerprint and refreshed without a
+   disk rebuild; removed secrets are reconciled before restart. Fail-closed boot,
+   effect-driven restart, 30-second idle shutdown, cancellation through the exec control
+   channel, and a workspace bind mount at `/workspace` (`src/sandbox.rs`).
 6. **The scripting surface.** `agent { }`, `sandbox { }`, `tool("name", { })`. Params →
    JSON schema; defaults applied, required enforced. `ctx.sh` → microVM (only command
    path); `ctx.workdir`; `ctx.shellescape`. Runtime owns the Lua VM and all declared tools
    (`src/lua.rs`).
-7. **The agent directory.** `leve init` scaffolds the real templates idempotently. Agent-dir
-   guard. Durable paths under `.leve/` (`src/project.rs`).
-8. **The CLI.** `leve init [dir]`, `leve info`, `leve exec <cmd...>`, `leve tool [name]
+7. **The agent directory.** `reve init` scaffolds the real templates idempotently. Agent-dir
+   guard. Durable paths under `.reve/` (`src/project.rs`).
+8. **The CLI.** `reve init [dir]`, `reve info`, `reve exec <cmd...>`, `reve tool [name]
    [--args JSON]`, `--version` (`src/main.rs`).
 9. **Opt-in microVM tests.** `tests/microvm.rs`: a Lua tool's `ctx.sh` in the guest with
-   the workspace mount read/write; `github.com` reachable, unlisted host blocked;
-   cancellation kills the guest command, VM still usable. `#[ignore]` by default.
+   the workspace mount read/write; a released VM restarting on the next effect;
+   `github.com` reachable, unlisted host blocked; cancellation kills the guest command;
+   runtime environment refresh, source-backed secret rotation/revocation, and full-output
+   spill to guest `/tmp`. `#[ignore]` by default.
 10. **The model seam.** `Model` trait plus `ScriptedModel`, whose cursor lives in a file so
     a killed-and-restarted process resumes at the turn it had reached (`src/model.rs`).
 11. **The run procedure.** Intent before effect, end to end: `operation_started` →
@@ -137,7 +143,8 @@ tests/{crash,microvm,provider_http}.rs
 21. **Skills.** Recursive SKILL.md discovery and frontmatter catalog injection.
 22. **Channels.** Ordered inbox hub and namespaced durable KV store.
 23. **The TUI.** Ratatui inline renderer, checkpointed Markdown streaming,
-    slash completion, subagent/inbox/steer/follow-up states, and startup spinner.
+    slash-command and workspace `@file` completion, subagent/inbox/steer/follow-up states,
+    and startup spinner.
 
 The session task is the owner boundary: the TUI and integrations receive only
 `SessionHandle` commands and broadcast events, never a mutable `Storage`.

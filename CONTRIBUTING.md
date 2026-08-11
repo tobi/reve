@@ -1,15 +1,15 @@
-# Contributing to Leve
+# Contributing to Reve
 
-Thanks for helping improve Leve.
+Thanks for helping improve Reve.
 
 ## Development setup
 
-Leve requires Rust 1.91 or newer, on Linux with KVM or macOS on Apple Silicon (the
+Reve requires Rust 1.91 or newer, on Linux with KVM or macOS on Apple Silicon (the
 microsandbox runtime needs one or the other).
 
 ```bash
-git clone https://github.com/tobi/leve.git
-cd leve
+git clone https://github.com/tobi/reve.git
+cd reve
 cargo build
 cargo test
 ```
@@ -37,7 +37,7 @@ git diff --check
 
 Please read `AGENTS.md` and `PLAN.md` before changing architecture. In particular:
 
-- Leve has no host-shell, local-sandbox, CLI, or FFI fallback. If the microVM cannot boot,
+- Reve has no host-shell, local-sandbox, CLI, or FFI fallback. If the microVM cannot boot,
   startup fails closed.
 - There is exactly one sandbox transport, the `microsandbox` Rust crate (pinned `=0.6.8` in
   `Cargo.toml`). Do not add a second transport or a host-shell path — not even for tests,
@@ -49,7 +49,7 @@ Please read `AGENTS.md` and `PLAN.md` before changing architecture. In particula
   behind a mutex. Serialize access through the owning task.
 - Record an effect's intent and result identifiers before performing the effect; ids are
   provisioned before the effect they name.
-- Never silently overwrite files a user has edited in an agent directory. `leve init` is
+- Never silently overwrite files a user has edited in an agent directory. `reve init` is
   idempotent and keeps edited files.
 - Add a focused test for every behavior change. Keep `cargo test` green.
 

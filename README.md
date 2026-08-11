@@ -1,9 +1,9 @@
-# Leve
+# Reve
 
-[![CI](https://github.com/tobi/leve/actions/workflows/ci.yml/badge.svg)](https://github.com/tobi/leve/actions/workflows/ci.yml)
+[![CI](https://github.com/tobi/reve/actions/workflows/ci.yml/badge.svg)](https://github.com/tobi/reve/actions/workflows/ci.yml)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Leve is a durable coding agent built in Rust with Lua for scripting. Its central idea is:
+Reve is a durable coding agent built in Rust with Lua for scripting. Its central idea is:
 
 > **The directory is the agent.**
 
@@ -14,7 +14,7 @@ agent.
 
 ## Philosophy
 
-Leve combines three ideas:
+Reve combines three ideas:
 
 1. **Rust is the core; Lua is the agent language.** The engine is a Rust crate. Everything
    an agent author touches — its configuration, project tools, sandbox policy — is Lua:
@@ -22,12 +22,12 @@ Leve combines three ideas:
    tokio tasks over single-owner session state, not a shared mutable graph. A small task
    boundary keeps the durable core independent from anything that renders it.
 2. **The environment is a real sandbox.** Every model-authored command and every tool's
-   `ctx.sh` runs in a full microVM — never in a host-shell fallback. Leve links the
+   `ctx.sh` runs in a full microVM — never in a host-shell fallback. Reve links the
    official [`microsandbox`](https://github.com/superradcompany/microsandbox) Rust crate
    directly (pinned `=0.6.8`): no FFI shim, no CLI, no daemon, no host shell. The host
    only orchestrates; the agent works inside its mounted `workspace/` with deny-by-default
    networking and explicitly scoped secrets.
-3. **State is durable data, not process memory.** Leve's append-only conversation tree and
+3. **State is durable data, not process memory.** Reve's append-only conversation tree and
    intent-before-effect records are based on the durable harness work in
    [Pi](https://github.com/badlogic/pi-mon). A crash can leave an incomplete operation,
    but not an ambiguous one: recovery has the identifiers and intent needed to reconcile
@@ -37,7 +37,7 @@ The result is an agent you can inspect with normal filesystem tools, constrain a
 operating environment, stop at any moment, and resume without pretending the
 interruption never happened.
 
-There is no machine-wide Leve profile, home-directory prompt, global model file, or session
+There is no machine-wide Reve profile, home-directory prompt, global model file, or session
 store outside the agent directory.
 
 ## Install and create an agent
@@ -51,32 +51,33 @@ Requirements:
   `~/.microsandbox` and pull the VM image.
 
 ```bash
-cargo install --path .          # installs the `leve` binary
+cargo install --path .          # installs the `reve` binary
 mkdir my-agent && cd my-agent
-leve init
+reve init
 export OPENAI_API_KEY=...
 ```
 
-The first launch builds and provisions the microVM and shows live startup progress. Later
-launches restart its persisted root disk.
+The first launch builds and provisions the microVM and shows live startup progress. Bare
+`reve` verifies that the VM can boot, then releases it until the first sandbox effect.
+Later launches reuse its persisted root disk.
 
 ## The CLI
 
-`leve` has four subcommands, and `--version`:
+`reve` has four subcommands, and `--version`:
 
 | Command | Purpose |
 |---|---|
-| `leve init [dir]` | Scaffold an agent directory (default: the current directory). Idempotent. |
-| `leve info` | Show the loaded agent's model, sandbox policy, egress hosts, and tools. |
-| `leve exec <cmd...>` | Run a command inside this agent's microVM. |
-| `leve tool [name] [--args JSON]` | Run one of this agent's Lua tools. No `name` lists them. |
-| `leve --version` | Print the version. |
+| `reve init [dir]` | Scaffold an agent directory (default: the current directory). Idempotent. |
+| `reve info` | Show the loaded agent's model, sandbox policy, egress hosts, and tools. |
+| `reve exec <cmd...>` | Run a command inside this agent's microVM. |
+| `reve tool [name] [--args JSON]` | Run one of this agent's Lua tools. No `name` lists them. |
+| `reve --version` | Print the version. |
 
 A worked session:
 
 ```bash
 $ mkdir my-agent && cd my-agent
-$ leve init
+$ reve init
 initialised /home/you/my-agent
   + agent.lua
   + sandbox.lua
@@ -89,9 +90,9 @@ initialised /home/you/my-agent
   + workspace/HEARTBEAT.yml
   + .gitignore
 
-  edit instructions.md, then run leve here
+  edit instructions.md, then run reve here
 
-$ leve info
+$ reve info
 root      /home/you/my-agent
 model     openai/gpt-5.6-luna
 thinking  low
@@ -99,14 +100,14 @@ sandbox   debian:trixie-slim (2 cpu, 2048MB)
 egress    api.github.com, codeload.github.com, github.com, objects.githubusercontent.com, raw.githubusercontent.com
 tools     example
 
-$ leve exec -- git log --oneline -n 3
-  · restarting microVM leve-my-agent-1b3d5e7f92
+$ reve exec -- git log --oneline -n 3
+  · restarting microVM reve-my-agent-1b3d5e7f92
   ✓ sandbox ready
 abc1234 init
 def5678 add tools
 ghi9012 fix provision
 
-$ leve tool example --args '{"commits":2}'
+$ reve tool example --args '{"commits":2}'
 branch: main
 status:
 (clean)
@@ -116,14 +117,19 @@ abc1234 init
 def5678 add tools
 ```
 
-`leve exec` joins the command vector and runs it through `sh -lc` in the guest, so the
+`reve exec` joins the command vector and runs it through `sh -lc` in the guest, so the
 provisioned login PATH (mise shims included) is in effect. Its exit status becomes the
-process exit code. `leve tool` loads the agent, boots the VM, runs the named Lua tool, and
+process exit code. `reve tool` loads the agent, boots the VM, runs the named Lua tool, and
 stops the VM; with no `name` it lists every tool and its description.
+
+In the TUI, type `@` at the start of a token to complete a file under `workspace/`.
+Candidates are workspace-relative, skip hidden files, show file sizes, and refresh after
+each run so files the agent just created are immediately available. Press Tab to accept the
+highlighted path.
 
 ## Agent directory
 
-`leve init` writes exactly these files, and nothing outside the target root:
+`reve init` writes exactly these files, and nothing outside the target root:
 
 ```text
 my-agent/                     the agent root
@@ -141,17 +147,17 @@ my-agent/                     the agent root
 │   ├── knowledge/             mutable durable facts
 │   ├── notes/                 append-only daily narrative
 │   └── skills/                all skills
-├── .gitignore                 ignores .leve/
-└── .leve/                     durable state (created on first launch, not scaffolded)
+├── .gitignore                 ignores .reve/
+└── .reve/                     durable state (created on first launch, not scaffolded)
     └── sessions/              JSONL durable session logs
 ```
 
-`leve init` is idempotent: a file that matches the template is left `unchanged`; a file you
+`reve init` is idempotent: a file that matches the template is left `unchanged`; a file you
 have edited is reported as `changed` and kept as you wrote it; a missing file is created.
 It also creates the empty `tools/`, `channels/`, `workspace/knowledge/`,
 `workspace/notes/`, and `workspace/skills/` directories.
 
-`leve` refuses to run in a directory that is not an agent. An agent directory needs at
+`reve` refuses to run in a directory that is not an agent. An agent directory needs at
 least one of `agent.lua` or `instructions.md` — the guard that stops an agent from
 silently attaching itself to an arbitrary checkout.
 
@@ -173,8 +179,8 @@ agent {
 ### State the sandbox policy
 
 `sandbox.lua` is ordinary Lua. The real template allows GitHub egress and lends a token
-only to those hosts. The guest sees `leve-github-token`; the microsandbox runtime
-substitutes the real value at the network boundary:
+only to those hosts. The guest sees `reve-github-token`; the microsandbox runtime resolves
+the named host environment variable at VM start and substitutes its value at the network boundary:
 
 ```lua
 -- The sandbox every command runs in.
@@ -183,18 +189,31 @@ substitutes the real value at the network boundary:
 -- relative path means the same thing on the host and in the VM. The agent's
 -- own definition files stay outside it.
 --
--- The microVM is mandatory: leve links the microsandbox Rust crate directly
+-- The microVM is mandatory: Reve links the microsandbox Rust crate directly
 -- and refuses to run without it. There is no host or local mode.
 --
--- Egress is deny-by-default. `allow` adds to the GitHub hosts that are
--- reachable out of the box; it never opens the whole internet.
+-- Egress starts with deny-all. Every reachable hostname must be listed here;
+-- provisioning does not add hidden exceptions.
 
 sandbox {
   image = "debian:trixie-slim",
   cpus = 2,
   memory = 2048,
 
-  allow = { "api.github.com" },
+  allow = {
+    "github.com",
+    "api.github.com",
+    "codeload.github.com",
+    "objects.githubusercontent.com",
+    "raw.githubusercontent.com",
+    "deb.debian.org",
+    "security.debian.org",
+    "ftp.debian.org",
+    "mise.run",
+    "mise.jdx.dev",
+    "registry.npmjs.org",
+    "nodejs.org",
+  },
 
   -- A credential the VM may use without ever holding it: the guest sees only
   -- the placeholder and the proxy substitutes the real value for these hosts.
@@ -203,8 +222,8 @@ sandbox {
   secrets = {
     {
       env = "GITHUB_TOKEN",
-      value = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN") or "",
-      placeholder = "leve-github-token",
+      source = "GITHUB_TOKEN",
+      placeholder = "reve-github-token",
       hosts = { "github.com", "api.github.com" },
     },
   },
@@ -288,33 +307,42 @@ providers:
 
 ## The mandatory sandbox
 
-Leve links the `microsandbox` Rust crate directly (pinned `=0.6.8` in `Cargo.toml`). There
+Reve links the `microsandbox` Rust crate directly (pinned `=0.6.8` in `Cargo.toml`). There
 is no CLI, no daemon, no FFI shim, and no host-shell path: if the VM cannot boot, the agent
 refuses to run rather than quietly executing model-authored commands on your machine.
 
-Egress is **deny-by-default**. The policy is built in Rust from
-`NetworkPolicy::none()` — deny both directions — plus exactly two kinds of rule: one narrow
-gateway-DNS rule so names resolve at all, and one allow rule per host the agent's
-`sandbox.lua` names. Nothing here can widen that to "the internet". GitHub hosts
-(`github.com`, `api.github.com`, `codeload.github.com`, `objects.githubusercontent.com`,
-`raw.githubusercontent.com`) are reachable by default; `allow` is additive on top of them.
-Package mirrors are allowed only while provisioning is enabled, so an agent that bakes its
-own image collapses back to the GitHub-only policy.
+Egress is **deny-by-default**. The policy starts from `NetworkPolicy::none()` — deny both
+directions — adds the narrow gateway-DNS rule required for name resolution, then adds one
+allow rule for each hostname explicitly listed in `sandbox.lua`. An empty `allow` list
+means no outbound host is reachable. Provisioning does not create hidden exceptions: the
+generated scaffold visibly lists the GitHub, Debian, mise, npm, and Node hosts its default
+toolchain needs.
 
-Secrets are scoped, never borrowed implicitly. Each secret carries its own host scope; the
-guest sees only the placeholder, and the real value is injected into requests to those
-hosts at the network boundary. An unscoped secret (no `hosts`) is refused at load time.
+Secrets are scoped, never borrowed implicitly. Each secret names a host environment
+`source` and carries its own destination-host scope. Microsandbox persists only that source
+reference, resolves its value when the VM starts, exposes only the placeholder in the
+guest, and substitutes the real value at the network boundary. An unscoped secret (no
+`hosts`) is refused at load time. Removing a secret from `sandbox.lua` removes its persisted
+definition before a reused VM starts.
 
-The VM is reused by fingerprint. A stable hash of the policy and toolchain (secrets hashed,
-never stored) is written to `.leve/sandbox-fingerprint`. A later launch whose fingerprint
-matches restarts the provisioned VM instead of reinstalling APT and language tools. A
-policy or toolchain change — or a secret rotation — forces a rebuild. A VM already running
-in another `leve` process is never adopted; replacing it would break isolation for both.
+The VM is reused by fingerprint. A stable hash of the disk and toolchain shape is written
+to `.reve/sandbox-fingerprint`; runtime environment values and secrets are excluded. A
+matching launch restarts the provisioned VM instead of reinstalling APT and language tools.
+Changing a secret source value refreshes the source-only definition and restarts the same
+disk; it does not rebuild the VM. Ordinary sandbox environment values are applied to each
+exec and likewise do not affect disk reuse.
+
+Bare TUI sessions verify that the VM boots, then release it until a command or tool needs
+the sandbox. After the last effect, a 30-second idle window keeps follow-up commands fast;
+then the VM stops while retaining its disk. Idle TUI sessions therefore do not reserve the
+sandbox. A VM actively owned by another `reve` process is never adopted or replaced,
+because that would break isolation for both processes.
 
 Cancellation kills the guest command. `Sandbox::exec` takes an optional cancel receiver; on
 cancel it calls `control.kill()` through the exec control channel and returns a cancelled
-result (exit 130). The VM itself stays usable afterwards. The hand-rolled cancel channel
-(`tokio_util_lite`) is one bit, delivered once.
+result (exit 130). The VM stays usable for follow-up effects and then follows the same idle
+shutdown lifecycle. The hand-rolled cancel channel (`tokio_util_lite`) is one bit,
+delivered once.
 
 `workspace/` is the only writable bind mount, mounted at `/workspace` and set as the
 working directory, so relative paths mean the same thing on the host and in the VM. The
@@ -323,6 +351,11 @@ provisioned with `git`, `gh`, `ripgrep`, `fd-find`, `jq`, `build-essential`, and
 (via mise); ast-grep comes from npm. A non-zero exit is data, not an error: the model reads
 the code and stderr and decides what to do next.
 
+Built-in `read` accepts Pi-compatible 1-indexed `offset` and `limit` parameters, reports an
+offset past end-of-file, and gives the next offset when a limit stops early. Tool results
+longer than 24,000 characters are shortened in model context; the complete result is saved
+inside the VM under `/tmp/reve-tool-output-*.log`, and the model receives that path.
+
 These guarantees are verified live against a real microVM by the opt-in integration tests:
 
 ```bash
@@ -330,12 +363,13 @@ cargo test --test microvm -- --ignored
 ```
 
 They confirm a Lua tool's `ctx.sh` running in the guest with the workspace bind mount
-readable and writable; `github.com` reachable while an unlisted host is blocked; and
-cancellation killing the guest command with the VM still usable afterwards.
+readable and writable; a released VM restarting on its next effect; `github.com` reachable
+while an unlisted host is blocked; and cancellation killing the guest command with the VM
+still usable afterwards.
 
 ## Durable records
 
-One session is one JSONL file under `.leve/sessions/`, one line per mutation, in exactly
+One session is one JSONL file under `.reve/sessions/`, one line per mutation, in exactly
 three shapes — `header`, `record`, and `entry`:
 
 ```jsonl
@@ -344,7 +378,7 @@ three shapes — `header`, `record`, and `entry`:
 {"kind":"entry","lane":"main","type":"message","message":{"role":"user"}}
 ```
 
-The format version is `4`; there is no v3 compatibility (leve is new). **Entries are the
+The format version is `4`; there is no v3 compatibility (reve is new). **Entries are the
 conversation tree; records are metadata.** Deleting every record must still leave a valid
 conversation — that invariant is what lets compaction and recovery rewrite bookkeeping
 without touching history. An entry's `parent_id` is what makes it a tree rather than a log:
@@ -363,8 +397,8 @@ Replay is only safe when the recorded declaration **and** the current one both s
 a tool that became effectful must not be replayed on the strength of an old record.
 
 Every append is flushed. The only failure a crash can produce is a torn last line; on
-reopen, leve truncates back to the last complete line and resumes appending. A malformed
-line anywhere *else* is not something a crash can do, so it is corruption and leve refuses
+reopen, reve truncates back to the last complete line and resumes appending. A malformed
+line anywhere *else* is not something a crash can do, so it is corruption and reve refuses
 to open the file.
 
 ## The durable harness
@@ -404,8 +438,9 @@ on disk. Nothing about it is simulated.
 
 The durable harness and the user-facing runtime are implemented:
 
-- **Providers** — OpenAI Responses and Anthropic Messages are thin `reqwest`
-  adapters with SSE streaming, partial tool-call assembly, usage accounting,
+- **Providers** — OpenAI Responses, OpenAI Chat Completions, and Anthropic
+  Messages are thin `reqwest` adapters with SSE streaming, partial tool-call assembly,
+  usage accounting,
   cache diagnostics, transient retries, and provider-specific auth/compat
   handling. The scripted model remains available for deterministic tests.
 - **Lane owner task** — a `SessionTask` owns `Storage`; callers communicate
@@ -421,11 +456,11 @@ The durable harness and the user-facing runtime are implemented:
   and live catalog injection into the system prompt.
 - **Channels** — ordered in-process inbox events and namespaced durable KV state.
 - **TUI** — ratatui inline rendering, subagent/inbox/steer/follow-up states,
-  slash completion, checkpointed streaming Markdown, and animated startup
-  progress.
+  slash-command and workspace `@file` completion, checkpointed streaming Markdown, and
+  animated startup progress.
 
 Every terminal prompt now writes through the durable lane sequence and reopens
-the same `.leve/sessions/main-*.jsonl` conversation on the next launch. A real
+the same `.reve/sessions/main-*.jsonl` conversation on the next launch. A real
 tool-using model test proves the sequence: `bash` writes in the VM, `read`
 reads the result, the follow-up request receives the user, assistant, and
 tool-result history, and the final answer is persisted.
@@ -436,14 +471,14 @@ standalone CLI tool command; normal TUI turns run the durable lane.
 ## Development
 
 ```bash
-cargo test                               # 194 unit/integration tests
-cargo test --test microvm -- --ignored   # opt-in microVM integration tests
-cargo clippy                             # lint
-cargo fmt                                # format
-leve --version
+cargo test
+cargo test --test microvm -- --ignored   # opt-in real microVM tests
+cargo clippy
+cargo fmt --check
+reve --version
 ```
 
 Requirements: Rust 1.91+, Linux with KVM or macOS on Apple Silicon. The repository itself
-is also an ordinary Leve agent directory for development purposes. Tests create isolated
+is also an ordinary Reve agent directory for development purposes. Tests create isolated
 temporary agent folders; they do not consult a user profile or write persistent state
 outside their fixture folder.
