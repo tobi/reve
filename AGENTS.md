@@ -62,6 +62,8 @@ touches — configuration, project tools, sandbox policy — is Lua.
 ## Commands
 
     cargo build                              build the crate and the `reve` binary
+    cargo install --path . --bin reve        install it; `--bin reve` keeps the two
+                                             test-helper binaries out of ~/.cargo/bin
     cargo test                               run the unit test suite
     cargo test --test microvm -- --ignored   opt-in microVM integration tests
     cargo clippy                             lint
