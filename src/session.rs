@@ -394,9 +394,15 @@ pub enum Restored {
 
 fn restore(s: &Storage, lane: &str) -> Result<Restored> {
     let corrupt = |m: String| SessionError::Corrupt(format!("lane {lane}: {m}"));
-    let (lane_state, lane_state_seq) = s
-        .register_value::<LaneState>(Namespace::LaneState, lane)
-        .ok_or_else(|| corrupt("missing lane.state".into()))?;
+    // A lane *is* its `lane.state` register — that is what `lanes()`
+    // enumerates. So no register means the lane was never created, which is
+    // idle, not corrupt. Reporting corruption here made an interrupt pressed
+    // before the first successful prompt look like a damaged session.
+    let Some((lane_state, lane_state_seq)) =
+        s.register_value::<LaneState>(Namespace::LaneState, lane)
+    else {
+        return Ok(Restored::Idle { lane: lane.into() });
+    };
     let (leaf, _) = s
         .register_value::<Option<EntryId>>(Namespace::LaneLeaf, lane)
         .ok_or_else(|| corrupt("missing lane.leaf".into()))?;
@@ -781,6 +787,20 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_lane_that_was_never_created_is_idle_not_corrupt() {
+        // Regression: pressing interrupt before the first successful prompt
+        // reported "corrupt session state: lane main: missing lane.state".
+        // A lane *is* its `lane.state` register, so its absence means the lane
+        // does not exist yet -- which is idle, and there is nothing to abort.
+        let session = Session::spawn(Storage::memory("s"));
+        assert!(session.lanes().await.unwrap().is_empty());
+        assert!(matches!(
+            session.restore("main").await.unwrap(),
+            Restored::Idle { .. }
+        ));
     }
 
     #[tokio::test]

@@ -254,9 +254,17 @@ impl App {
         match update {
             Update::Item(item) => self.scrollback.push(item),
             Update::Working(label) => {
-                self.working = label.map(|l| (l, Instant::now()));
-                if self.working.is_none() {
-                    self.interrupt_armed = false;
+                match label {
+                    // The clock measures the operation, not the current label,
+                    // so a tool starting must not reset it back to zero.
+                    Some(label) => {
+                        let since = self.working.take().map_or_else(Instant::now, |(_, t)| t);
+                        self.working = Some((label, since));
+                    }
+                    None => {
+                        self.working = None;
+                        self.interrupt_armed = false;
+                    }
                 }
             }
             Update::Subagents(agents) => self.subagents = agents,
@@ -317,9 +325,11 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('c') if ctrl => {
-                // While work is in flight, the first ctrl-c aborts it; only a
-                // second one, with nothing running, leaves.
-                if self.busy() {
+                // While work is in flight, the first ctrl-c aborts it and the
+                // second one leaves. `interrupt_armed`, not `busy()`, decides
+                // that: if the indicator is ever wrong the user is still not
+                // trapped in an application they cannot quit.
+                if self.busy() && !self.interrupt_armed {
                     self.interrupt_armed = true;
                     return Some(Action::Interrupt);
                 }
@@ -861,6 +871,37 @@ mod tests {
         assert_eq!(a.handle_key(key(KeyCode::Enter)), None);
         typed(&mut a, "   ");
         assert_eq!(a.handle_key(key(KeyCode::Enter)), None);
+    }
+
+    #[test]
+    fn a_second_ctrl_c_quits_even_if_the_working_indicator_is_wrong() {
+        // Regression: `busy()` was the sole gate, so a spinner left on by a
+        // run this loop did not start turned ctrl-c into an interrupt forever
+        // and there was no way out of the application.
+        let mut a = app();
+        a.apply(Update::Working(Some("Working".into())));
+        assert_eq!(a.handle_key(ctrl('c')), Some(Action::Interrupt));
+        assert_eq!(
+            a.handle_key(ctrl('c')),
+            Some(Action::Quit),
+            "the second press always leaves"
+        );
+    }
+
+    #[test]
+    fn the_elapsed_clock_measures_the_operation_not_the_label() {
+        let mut a = app();
+        a.apply(Update::Working(Some("Working".into())));
+        let started = a.working.as_ref().unwrap().1;
+        a.apply(Update::Working(Some("Running read".into())));
+        assert_eq!(
+            a.working.as_ref().unwrap().1,
+            started,
+            "a tool starting does not reset the timer"
+        );
+        a.apply(Update::Working(None));
+        assert!(!a.busy());
+        assert!(!a.interrupt_armed, "leaving work disarms the interrupt");
     }
 
     #[test]

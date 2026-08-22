@@ -207,7 +207,6 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
                             let _ = updates
                                 .send(Update::Files(file_candidates(&project.workspace())))
                                 .await;
-                            let _ = updates.send(Update::Working(None)).await;
                         }
                         continue;
                     }
@@ -262,7 +261,6 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
                         if echo {
                             let _ = updates.send(Update::Item(Item::User(text.clone()))).await;
                         }
-                        let _ = updates.send(Update::Working(Some("Working".into()))).await;
                         // A prompt while the lane is busy is a steer. The
                         // harness decides that, not this loop: it commits
                         // against the operation it read, so the race between
@@ -332,7 +330,16 @@ async fn forward_events(
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             Err(_) => break,
         };
+        // The event stream is the only authority on whether an operation is
+        // running, so it is the only thing allowed to raise or clear the
+        // working indicator. The action loop used to do its own bookkeeping,
+        // which meant a run it did not start -- a resume at launch, a queued
+        // next run -- left the spinner on forever, and a stuck spinner turns
+        // ctrl-c into an interrupt that never becomes a quit.
         let update = match event.kind {
+            Kind::RunStart | Kind::RunResume { .. } => {
+                Some(Update::Working(Some("Working".into())))
+            }
             Kind::MessageUpdate { delta } => Some(Update::Delta(delta)),
             Kind::MessageEnd { .. } => Some(Update::EndMessage),
             Kind::ToolStart { tool_name, .. } => {
@@ -358,21 +365,30 @@ async fn forward_events(
             } => Some(Update::Working(Some(format!(
                 "Retrying ({attempt}/{max_attempts})"
             )))),
-            Kind::RunEnd { outcome, error, .. } => match outcome {
-                Outcome::Failed => Some(Update::Item(Item::Notice(match error {
-                    Some(error) => format!("run failed: {}", error.message),
-                    None => "run failed".into(),
-                }))),
-                Outcome::Aborted => Some(Update::Item(Item::Notice("Interrupted".into()))),
-                _ => None,
-            },
-            Kind::CompactionEnd { outcome, .. } => match outcome {
-                Outcome::Completed => Some(Update::Item(Item::Notice(
-                    "compacted the conversation".into(),
-                ))),
-                Outcome::Failed => Some(Update::Item(Item::Notice("compaction failed".into()))),
-                _ => None,
-            },
+            Kind::RunEnd { outcome, error, .. } => {
+                // The run is over however it ended, so the indicator goes down
+                // before the notice explaining why.
+                let _ = updates.send(Update::Working(None)).await;
+                match outcome {
+                    Outcome::Failed => Some(Update::Item(Item::Notice(match error {
+                        Some(error) => format!("run failed: {}", error.message),
+                        None => "run failed".into(),
+                    }))),
+                    Outcome::Aborted => Some(Update::Item(Item::Notice("Interrupted".into()))),
+                    _ => None,
+                }
+            }
+            Kind::CompactionStart { .. } => Some(Update::Working(Some("Compacting".into()))),
+            Kind::CompactionEnd { outcome, .. } => {
+                let _ = updates.send(Update::Working(None)).await;
+                match outcome {
+                    Outcome::Completed => Some(Update::Item(Item::Notice(
+                        "compacted the conversation".into(),
+                    ))),
+                    Outcome::Failed => Some(Update::Item(Item::Notice("compaction failed".into()))),
+                    _ => None,
+                }
+            }
             Kind::HandlerError { hook, error } => {
                 Some(Update::Item(Item::Notice(format!("{hook}: {error}"))))
             }
