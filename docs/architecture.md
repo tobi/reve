@@ -183,6 +183,7 @@ Every row names a real test. A claim with no test says so instead of appearing c
 | The compaction tail is widened to a user turn | `compaction::tests::the_tail_is_widened_to_a_user_turn_and_the_head_is_summarised` |
 | Lua cannot execute a command on the host | `lua::tests::{the_host_command_path_is_gone_before_any_script_runs, a_tool_that_tries_to_shell_out_on_the_host_fails_to_load}` |
 | The default guest is pre-provisioned, and git reads its token from the environment | `sandbox::tests::{the_default_policy_boots_a_preprovisioned_guest, git_reads_its_token_from_the_environment_not_a_credential_store}` |
+| Every invokable tool is offered to the model | `tools::tests::the_active_tool_list_covers_every_builtin` |
 | An unmentioned Lua flag keeps its default | `lua::tests::an_unmentioned_flag_keeps_its_default` |
 | Model discovery contacts only upstreams whose key is set, and never fails the agent | `provider::discovery::tests::{only_upstreams_that_have_a_key_are_probed, an_unreachable_upstream_is_recorded_not_fatal, a_missing_or_corrupt_cache_is_simply_absent}` |
 | A namespaced model id survives discovery intact (`openrouter/x-ai/grok-4.6`) | `provider::discovery::tests::the_openrouter_shape_yields_a_pasteable_reference` |

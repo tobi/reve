@@ -157,7 +157,7 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
                 session.clone(),
                 HarnessConfig {
                     model,
-                    tools: toolbox,
+                    tools: toolbox.clone(),
                     hooks: Hooks::new(),
                     system_prompt: {
                         let project = project.clone();
@@ -187,7 +187,11 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
                             .thinking
                             .clone()
                             .unwrap_or_else(|| "default".into()),
-                        active_tool_names: tools.clone(),
+                        // Everything the toolbox has, not just the Lua tools:
+                        // `lane.rs` offers the model only what this names, so a
+                        // list built from `runtime.tools` left an agent with no
+                        // bash, no ls, and no way to read a file.
+                        active_tool_names: toolbox.tool_names(),
                     },
                     event_capacity: 1024,
                 },
@@ -597,17 +601,35 @@ async fn dispatch(
             Err(error) => format!("skills: {error}"),
         },
         "tools" => {
-            if project.runtime.tools.is_empty() {
-                "No tools. Drop a file into `tools/`.".to_string()
-            } else {
-                project
-                    .runtime
-                    .tools
-                    .iter()
-                    .map(|t| format!("- `/{}` — {}", t.name, t.description))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+            // Everything the model is offered, not just this agent's Lua tools.
+            // Listing only the latter is how you conclude your agent has no
+            // bash.
+            let mut out = vec!["**Built in**".to_string()];
+            let lua: Vec<String> = project
+                .runtime
+                .tools
+                .iter()
+                .map(|t| t.name.clone())
+                .collect();
+            for schema in crate::tools::schemas(&project.runtime) {
+                if lua.contains(&schema.name) {
+                    continue;
+                }
+                out.push(format!("- `{}` — {}", schema.name, schema.description));
             }
+            if project.runtime.tools.is_empty() {
+                out.push("\nNo Lua tools yet. Drop a file into `tools/`.".into());
+            } else {
+                out.push("\n**This agent's** (also `/name` from here)".into());
+                out.extend(
+                    project
+                        .runtime
+                        .tools
+                        .iter()
+                        .map(|t| format!("- `{}` — {}", t.name, t.description)),
+                );
+            }
+            out.join("\n")
         }
         "quit" => return None,
         // Anything else is a tool, or nothing.
@@ -673,7 +695,7 @@ fn commands_with(project: &Project, discovered: &[Discovered]) -> Vec<Command> {
         Command::new("compact", "summarize old conversation context"),
         Command::new("queue", "send a message after the current run"),
         Command::new("skills", "list workspace skills"),
-        Command::new("tools", "list this agent's Lua tools"),
+        Command::new("tools", "list every tool the model is offered"),
         Command::new("quit", "leave"),
     ];
     // An agent's own tools are commands too; that is the whole point of

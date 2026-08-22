@@ -151,6 +151,38 @@ const BUILTINS: &[Builtin] = &[
 const MAX_OUTPUT: usize = 24_000;
 static SPILL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Every tool a runtime can offer: the built-ins, with the agent's own Lua
+/// tools appended and shadowing any built-in of the same name.
+///
+/// Free rather than a method because it depends on nothing but the runtime, and
+/// because the sandbox cannot be constructed without booting a microVM -- which
+/// would have made the regression this guards untestable.
+pub fn schemas(runtime: &Runtime) -> Vec<ToolSchema> {
+    let mut schemas: Vec<ToolSchema> = BUILTINS
+        .iter()
+        .map(|b| ToolSchema {
+            name: b.name.to_string(),
+            description: b.description.to_string(),
+            schema: (b.schema)(),
+        })
+        .collect();
+    for tool in &runtime.tools {
+        // A Lua tool with a built-in's name would be ambiguous, so the agent's
+        // own definition wins and replaces it.
+        schemas.retain(|s| s.name != tool.name);
+        schemas.push(ToolSchema {
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+            schema: tool.schema(),
+        });
+    }
+    schemas
+}
+
+pub fn tool_names(runtime: &Runtime) -> Vec<String> {
+    schemas(runtime).into_iter().map(|s| s.name).collect()
+}
+
 pub struct Toolbox {
     sandbox: Arc<Sandbox>,
     runtime: Arc<Runtime>,
@@ -162,26 +194,19 @@ impl Toolbox {
     }
 
     /// Everything the model may call: built-ins first, then this agent's own.
+    /// Every tool this toolbox can actually invoke: the built-ins plus the
+    /// agent's own Lua tools.
+    ///
+    /// A `LaneConfiguration` names the tools a run may use, and anything not
+    /// named is not offered to the model at all. Building that list by hand is
+    /// how an agent ends up with no `bash` and no `ls`, so it is derived from
+    /// here.
+    pub fn tool_names(&self) -> Vec<String> {
+        tool_names(&self.runtime)
+    }
+
     pub fn schemas(&self) -> Vec<ToolSchema> {
-        let mut schemas: Vec<ToolSchema> = BUILTINS
-            .iter()
-            .map(|b| ToolSchema {
-                name: b.name.to_string(),
-                description: b.description.to_string(),
-                schema: (b.schema)(),
-            })
-            .collect();
-        for tool in &self.runtime.tools {
-            // A Lua tool with a built-in's name would be ambiguous, so the
-            // agent's own definition wins and replaces it.
-            schemas.retain(|s| s.name != tool.name);
-            schemas.push(ToolSchema {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                schema: tool.schema(),
-            });
-        }
-        schemas
+        schemas(&self.runtime)
     }
 
     pub fn replay_of(&self, name: &str) -> Option<Replay> {
@@ -446,6 +471,31 @@ mod tests {
             assert!(schema["required"].is_array(), "{}", builtin.name);
             assert!(!builtin.description.is_empty(), "{}", builtin.name);
         }
+    }
+
+    #[test]
+    fn the_active_tool_list_covers_every_builtin() {
+        // Regression: the terminal built `active_tool_names` from the agent's
+        // Lua tools alone, and `lane.rs` offers the model only what that names.
+        // A fresh agent therefore had no bash, no ls, and no way to read a file.
+        let runtime = Runtime::new().unwrap();
+        let names = tool_names(&runtime);
+        for builtin in BUILTINS {
+            assert!(
+                names.contains(&builtin.name.to_string()),
+                "{} is invokable but would not be offered to the model",
+                builtin.name
+            );
+        }
+        assert_eq!(
+            names.len(),
+            schemas(&runtime).len(),
+            "the names and the schemas are the same set"
+        );
+        assert!(
+            names.contains(&"bash".to_string()) && names.contains(&"ls".to_string()),
+            "{names:?}"
+        );
     }
 
     #[test]
