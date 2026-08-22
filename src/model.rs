@@ -1,8 +1,7 @@
 //! What the lane asks for a turn.
 //!
-//! Real providers are still pending; this is the seam they will implement. It
-//! exists now because the run procedure cannot be written — or tested — against
-//! nothing, and a scripted model makes the durability tests deterministic.
+//! The seam every provider implements. A scripted model makes the durability
+//! tests deterministic; `crate::provider::HttpModel` is the real one.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -10,13 +9,35 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::records::Entry;
+use crate::entry::Entry;
+pub use crate::entry::Usage;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-#[derive(Debug, thiserror::Error)]
-#[error("model error: {0}")]
-pub struct ModelError(pub String);
+/// A provider failure. `retryable` is the transport's opinion — a 5xx, a
+/// timeout, a stream that ended early — and the lane's retry policy decides
+/// how many times to believe it.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("model error: {message}")]
+pub struct ModelError {
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl ModelError {
+    pub fn terminal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+        }
+    }
+    pub fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+        }
+    }
+}
 
 pub type Result<T, E = ModelError> = std::result::Result<T, E>;
 
@@ -38,32 +59,29 @@ pub enum StopReason {
     Stop,
     /// The model wants tools run, then to be asked again.
     ToolUse,
+    /// The output limit cut the response short.
+    Length,
+    /// The request failed; `error_message` says how. Committed, then dropped
+    /// from context by projection.
+    Error,
+    /// The harness's own abort signal fired. Only the harness writes this.
+    Aborted,
 }
 
-/// What a turn cost.
-///
-/// `cached_input` drives the cache-miss warning: a normal request whose prefix
-/// mostly missed the cache means something invalidated it, and that is worth
-/// saying out loud rather than paying for quietly.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Usage {
-    pub input: u32,
-    pub output: u32,
-    pub cached_input: u32,
-}
-
-impl Usage {
-    /// Fraction of the input that had to be re-read, 0.0 to 1.0.
-    pub fn uncached_fraction(&self) -> f32 {
-        if self.input == 0 {
-            return 0.0;
+impl StopReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::ToolUse => "toolUse",
+            Self::Length => "length",
+            Self::Error => "error",
+            Self::Aborted => "aborted",
         }
-        1.0 - (self.cached_input as f32 / self.input as f32)
     }
 }
 
-/// One assistant turn.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// One settled assistant turn.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Assistant {
     #[serde(default)]
     pub text: String,
@@ -72,6 +90,8 @@ pub struct Assistant {
     pub stop_reason: StopReason,
     #[serde(default)]
     pub usage: Usage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
 }
 
 impl Assistant {
@@ -83,16 +103,84 @@ impl Assistant {
     }
 
     pub fn call(name: &str, arguments: Value) -> Self {
+        Self::calls(vec![(name.to_string(), arguments)])
+    }
+
+    pub fn calls(calls: Vec<(String, Value)>) -> Self {
         Self {
             text: String::new(),
-            tool_calls: vec![ToolCall {
-                id: format!("tc_{}", crate::ids::RunId::new().as_str()),
-                name: name.into(),
-                arguments: arguments.as_object().cloned().unwrap_or_default(),
-            }],
+            tool_calls: calls
+                .into_iter()
+                .map(|(name, arguments)| ToolCall {
+                    id: format!("tc_{}", &crate::ids::uuid_v7(crate::ids::now_ms())[..8]),
+                    name,
+                    arguments: arguments.as_object().cloned().unwrap_or_default(),
+                })
+                .collect(),
             stop_reason: StopReason::ToolUse,
             usage: Usage::default(),
+            error_message: None,
         }
+    }
+
+    /// A failed request, as the transcript records it.
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            stop_reason: StopReason::Error,
+            error_message: Some(message.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Rebuild a turn from the entry payload `message()` produced.
+    pub fn from_message(message: &Value) -> Option<Self> {
+        if message.get("role")?.as_str()? != "assistant" {
+            return None;
+        }
+        let mut text = String::new();
+        let mut tool_calls = Vec::new();
+        for part in message.get("content")?.as_array()? {
+            match part.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    text.push_str(part.get("text").and_then(Value::as_str).unwrap_or(""))
+                }
+                Some("toolCall") => tool_calls.push(ToolCall {
+                    id: part
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    name: part
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    arguments: part
+                        .get("arguments")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default(),
+                }),
+                _ => {}
+            }
+        }
+        let stop_reason = message
+            .get("stopReason")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        Some(Self {
+            text,
+            tool_calls,
+            stop_reason,
+            usage: message
+                .get("usage")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default(),
+            error_message: message
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
     }
 
     /// The entry payload this turn becomes.
@@ -109,11 +197,16 @@ impl Assistant {
                 "arguments": Value::Object(call.arguments.clone()),
             }));
         }
-        serde_json::json!({
+        let mut message = serde_json::json!({
             "role": "assistant",
             "content": content,
             "stopReason": self.stop_reason,
-        })
+            "usage": self.usage,
+        });
+        if let Some(error) = &self.error_message {
+            message["errorMessage"] = Value::String(error.clone());
+        }
+        message
     }
 }
 
@@ -167,6 +260,11 @@ impl ScriptedModel {
         }
     }
 
+    /// How many turns have been consumed so far.
+    pub fn consumed(&self) -> usize {
+        self.cursor()
+    }
+
     fn cursor(&self) -> usize {
         std::fs::read_to_string(&self.cursor_path)
             .ok()
@@ -190,11 +288,10 @@ impl Model for ScriptedModel {
     ) -> BoxFuture<'a, Result<Assistant>> {
         Box::pin(async move {
             let index = self.cursor();
-            let turn = self
-                .script
-                .get(index)
-                .cloned()
-                .ok_or_else(|| ModelError(format!("script exhausted at turn {index}")))?;
+            let turn =
+                self.script.get(index).cloned().ok_or_else(|| {
+                    ModelError::terminal(format!("script exhausted at turn {index}"))
+                })?;
             self.advance(index + 1);
             if !turn.text.is_empty() {
                 on_text(&turn.text);

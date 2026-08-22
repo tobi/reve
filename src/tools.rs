@@ -13,12 +13,36 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Map, Value, json};
 
-use crate::hooks::Hooks;
-use crate::lane::Tools as LaneTools;
 use crate::lua::Runtime;
 use crate::model::{BoxFuture, ToolSchema};
-use crate::records::Replay;
+use crate::sandbox::tokio_util_lite::CancelRx;
 use crate::sandbox::{ExecOptions, Sandbox};
+use crate::state::Replay;
+
+/// What a lane can run. Implemented over Lua tools plus the built-ins.
+///
+/// Hooks are *not* run here: the harness runs `before_tool` before it commits
+/// the tool intent and `after_tool` before it commits the result, so the
+/// effective arguments and the final content are what the durable record
+/// says they are.
+pub trait Tools: Send + Sync {
+    /// The tool's replay declaration, or `None` for a tool that does not
+    /// exist. Recovery re-executes an interrupted call only when the recorded
+    /// *and* current declarations both say `safe`.
+    fn replay(&self, name: &str) -> Option<Replay>;
+
+    /// Everything the model may call.
+    fn schemas(&self) -> Vec<ToolSchema>;
+
+    /// Run it. `Err` is a tool failure, which is a normal result the model
+    /// gets to see — not a lane failure.
+    fn invoke<'a>(
+        &'a self,
+        name: &'a str,
+        arguments: Map<String, Value>,
+        cancel: Option<CancelRx>,
+    ) -> BoxFuture<'a, std::result::Result<String, String>>;
+}
 
 /// A built-in, and whether recovery may re-run it.
 struct Builtin {
@@ -130,21 +154,11 @@ static SPILL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub struct Toolbox {
     sandbox: Arc<Sandbox>,
     runtime: Arc<Runtime>,
-    hooks: Hooks,
 }
 
 impl Toolbox {
     pub fn new(sandbox: Arc<Sandbox>, runtime: Arc<Runtime>) -> Self {
-        Self {
-            sandbox,
-            runtime,
-            hooks: Hooks::new(),
-        }
-    }
-
-    pub fn with_hooks(mut self, hooks: Hooks) -> Self {
-        self.hooks = hooks;
-        self
+        Self { sandbox, runtime }
     }
 
     /// Everything the model may call: built-ins first, then this agent's own.
@@ -170,15 +184,11 @@ impl Toolbox {
         schemas
     }
 
-    pub fn replay_of(&self, name: &str) -> Replay {
+    pub fn replay_of(&self, name: &str) -> Option<Replay> {
         if let Some(tool) = self.runtime.tool(name) {
-            return tool.replay;
+            return Some(tool.replay);
         }
-        BUILTINS
-            .iter()
-            .find(|b| b.name == name)
-            .map(|b| b.replay)
-            .unwrap_or(Replay::Never)
+        BUILTINS.iter().find(|b| b.name == name).map(|b| b.replay)
     }
 
     /// Run a tool. `Err` is a tool failure the model gets to read, not a fault.
@@ -190,18 +200,8 @@ impl Toolbox {
         &self,
         name: &str,
         args: Map<String, Value>,
-        cancel: Option<crate::sandbox::tokio_util_lite::CancelRx>,
+        cancel: Option<CancelRx>,
     ) -> Result<String, String> {
-        let before = self
-            .hooks
-            .run_before_tool(serde_json::json!({"toolName": name, "args": args}))
-            .await
-            .map_err(|e| format!("before_tool hook: {e}"))?;
-        let args = before
-            .get("args")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or(args);
         // The agent's own tools take precedence.
         if self.runtime.tool(name).is_some() {
             let text = self
@@ -314,20 +314,10 @@ impl Toolbox {
             }
             other => return Err(format!("no tool named {other:?}")),
         };
-        let after = self
-            .hooks
-            .run_after_tool(json!({"toolName": name, "result": text}))
-            .await
-            .map_err(|e| format!("after_tool hook: {e}"))?;
-        let text = after.get("result").and_then(Value::as_str).unwrap_or("");
-        Ok(self.present_output(text).await)
+        Ok(self.present_output(&text).await)
     }
 
-    async fn shell(
-        &self,
-        command: &str,
-        cancel: Option<crate::sandbox::tokio_util_lite::CancelRx>,
-    ) -> Result<String, String> {
+    async fn shell(&self, command: &str, cancel: Option<CancelRx>) -> Result<String, String> {
         let out = self
             .sandbox
             .exec(command, ExecOptions::default(), cancel)
@@ -362,24 +352,20 @@ impl Toolbox {
     }
 }
 
-impl LaneTools for Toolbox {
-    fn replay(&self, name: &str) -> Replay {
+impl Tools for Toolbox {
+    fn replay(&self, name: &str) -> Option<Replay> {
         self.replay_of(name)
+    }
+
+    fn schemas(&self) -> Vec<ToolSchema> {
+        Toolbox::schemas(self)
     }
 
     fn invoke<'a>(
         &'a self,
         name: &'a str,
         arguments: Map<String, Value>,
-    ) -> BoxFuture<'a, Result<String, String>> {
-        Box::pin(self.call(name, arguments))
-    }
-
-    fn invoke_cancelled<'a>(
-        &'a self,
-        name: &'a str,
-        arguments: Map<String, Value>,
-        cancel: Option<crate::sandbox::tokio_util_lite::CancelRx>,
+        cancel: Option<CancelRx>,
     ) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(self.call_cancelled(name, arguments, cancel))
     }

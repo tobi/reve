@@ -1,11 +1,14 @@
-//! The terminal, wired to a real microVM.
+//! The terminal, wired to the durable harness and a real microVM.
 //!
-//! This is what bare `reve` runs. There is no model yet, so a prompt is taken
-//! literally: it is run in the agent's VM and the result rendered as a tool
-//! call. That is a genuinely useful shell — everything you type executes under
-//! the sandbox policy in `sandbox.lua`, not on your machine — and it is the
-//! same loop a model turn will use, so wiring providers replaces one step
-//! rather than the structure.
+//! This is what bare `reve` runs. Everything the user types either goes to the
+//! model — as a durable operation on the `main` lane — or, prefixed with `!`,
+//! straight into the agent's microVM. Nothing runs on the host.
+//!
+//! The worker here does not own the session file. A [`Session`] owner task
+//! does, and this task holds a handle. That is what lets a run be a spawned
+//! task while the terminal stays responsive: a steer typed mid-run is a
+//! *conditional commit* against the running operation, not a message this loop
+//! has to be free to receive.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -14,31 +17,45 @@ use std::time::Instant;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use crate::lane::{Lane, RunEvent, recover};
-use crate::model::Model;
+use crate::entry::MAIN_LANE;
+use crate::events::Kind;
+use crate::harness::{Harness, HarnessConfig, HarnessError};
+use crate::hooks::Hooks;
+use crate::model::{Assistant, BoxFuture, Deltas, Model, ModelError, Request};
 use crate::project::Project;
 use crate::provider::HttpModel;
 use crate::provider::config::Models;
-use crate::records::MAIN_LANE;
 use crate::sandbox::tokio_util_lite::{CancelTx, channel};
 use crate::sandbox::{ExecOptions, Sandbox};
+use crate::session::Session;
+use crate::state::{LaneConfiguration, ModelRef, Outcome, RetryPolicy, RunSettings};
 use crate::storage::Storage;
 use crate::tools::Toolbox;
 use crate::tui::app::{Action, App, Update};
 use crate::tui::complete::{Candidate, Command};
 use crate::tui::item::{Item, Status};
 
+/// A model that only knows why there is no model.
+///
+/// Better than refusing to start: the shell escape, the tools, and the
+/// transcript all still work, and the first prompt explains itself instead of
+/// the whole terminal failing at launch.
+struct Unconfigured(String);
+
+impl Model for Unconfigured {
+    fn respond<'a>(
+        &'a self,
+        _request: Request<'a>,
+        _on_text: Deltas<'a>,
+    ) -> BoxFuture<'a, crate::model::Result<Assistant>> {
+        Box::pin(async move { Err(ModelError::terminal(format!("no model: {}", self.0))) })
+    }
+}
+
 /// Run the terminal until the user leaves.
 pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> {
     let (updates, updates_rx) = mpsc::channel(256);
-    let (actions, actions_rx) = mpsc::channel(64);
-    let (worker_actions, mut worker_actions_rx) = mpsc::channel(64);
-    let active_cancel = Arc::new(Mutex::new(None));
-    let action_router = tokio::spawn(route_actions(
-        actions_rx,
-        worker_actions,
-        active_cancel.clone(),
-    ));
+    let (actions, mut actions_rx) = mpsc::channel(64);
 
     let location = project
         .root
@@ -89,18 +106,12 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
     let worker = {
         let updates = updates.clone();
         let project = Arc::new(project);
-        let active_cancel = active_cancel.clone();
         tokio::spawn(async move {
-            // The first request of a session has a cold prefix by definition,
-            // so warning about it would be noise every single launch.
-            let toolbox = Toolbox::new(sandbox.clone(), project.runtime_arc());
-            // Storage is owned by this worker task. No other task receives a
-            // mutable handle, making the single-writer rule structural on the
-            // terminal path.
+            let toolbox = Arc::new(Toolbox::new(sandbox.clone(), project.runtime_arc()));
             let session_path = project
                 .latest_session(MAIN_LANE)
                 .unwrap_or_else(|| project.conversation_path(MAIN_LANE));
-            let mut storage = match Storage::open(&session_path, "main", Some("workspace".into())) {
+            let storage = match Storage::open(&session_path, "main", Some("workspace".into())) {
                 Ok(storage) => storage,
                 Err(error) => {
                     let _ = updates
@@ -109,159 +120,297 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
                     return;
                 }
             };
-            let _ = recover(&mut storage, MAIN_LANE, &toolbox).await;
-            while let Some(action) = worker_actions_rx.recv().await {
+            // The owner task is the single writer; everything below holds a
+            // handle and commits through it.
+            let session = Session::spawn(storage);
+            let model: Arc<dyn Model> = match model {
+                Ok(model) => model,
+                Err(why) => Arc::new(Unconfigured(why)),
+            };
+            let harness = Harness::new(
+                session.clone(),
+                HarnessConfig {
+                    model,
+                    tools: toolbox,
+                    hooks: Hooks::new(),
+                    system_prompt: {
+                        let project = project.clone();
+                        // Rebuilt per turn: the agent edits these files.
+                        Arc::new(move || system_prompt(&project))
+                    },
+                    settings: RunSettings::default(),
+                    retry: RetryPolicy::default(),
+                    configuration: LaneConfiguration {
+                        model: ModelRef {
+                            provider: project
+                                .runtime
+                                .agent
+                                .model
+                                .clone()
+                                .unwrap_or_else(|| "none".into()),
+                            model_id: project
+                                .runtime
+                                .agent
+                                .model
+                                .clone()
+                                .unwrap_or_else(|| "none".into()),
+                        },
+                        thinking_level: project
+                            .runtime
+                            .agent
+                            .thinking
+                            .clone()
+                            .unwrap_or_else(|| "default".into()),
+                        active_tool_names: tools.clone(),
+                    },
+                    event_capacity: 1024,
+                },
+            );
+
+            let events = tokio::spawn(forward_events(harness.subscribe(), updates.clone()));
+
+            // Whatever the last process was doing, finish it before taking
+            // anything new. This is the only place resume is called, and it is
+            // called before the first prompt can claim the lane.
+            match harness.resume_all().await {
+                Ok(results) if !results.is_empty() => {
+                    let _ = updates
+                        .send(Update::Item(Item::Notice(format!(
+                            "resumed {} interrupted operation(s) from the last session",
+                            results.len()
+                        ))))
+                        .await;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = updates
+                        .send(Update::Item(Item::Notice(format!("resume: {error}"))))
+                        .await;
+                }
+            }
+
+            // Side commands (`!`, `/tool`) are not durable operations, so they
+            // keep their own cancellation.
+            let side_cancel: Arc<Mutex<Option<CancelTx>>> = Arc::new(Mutex::new(None));
+            let (finished, mut finished_rx) = mpsc::channel::<()>(8);
+            let mut running = 0usize;
+
+            loop {
+                let action = tokio::select! {
+                    action = actions_rx.recv() => match action {
+                        Some(action) => action,
+                        None => break,
+                    },
+                    Some(()) = finished_rx.recv() => {
+                        running = running.saturating_sub(1);
+                        if running == 0 {
+                            let _ = updates
+                                .send(Update::Files(file_candidates(&project.workspace())))
+                                .await;
+                            let _ = updates.send(Update::Working(None)).await;
+                        }
+                        continue;
+                    }
+                };
                 match action {
+                    Action::Prompt(text)
+                    | Action::Steer(text)
+                    | Action::FollowUp(text)
+                    | Action::ChannelMessage(crate::channels::Message { text, .. })
+                        if text.trim().starts_with('!') =>
+                    {
+                        let (tx, rx) = channel();
+                        *side_cancel.lock() = Some(tx);
+                        let _ = updates.send(Update::Item(Item::User(text.clone()))).await;
+                        let item = run_command(&sandbox, text.trim()[1..].trim(), rx).await;
+                        side_cancel.lock().take();
+                        let _ = updates.send(Update::Item(item)).await;
+                    }
+                    Action::Prompt(text)
+                    | Action::Steer(text)
+                    | Action::FollowUp(text)
+                    | Action::ChannelMessage(crate::channels::Message { text, .. })
+                        if text.trim().starts_with('/') =>
+                    {
+                        let (tx, rx) = channel();
+                        *side_cancel.lock() = Some(tx);
+                        let _ = updates.send(Update::Item(Item::User(text.clone()))).await;
+                        let rest = text.trim()[1..].to_string();
+                        let item = if let Some(argument) = rest.strip_prefix("compact") {
+                            Some(compact(&harness, argument.trim()).await)
+                        } else if let Some(argument) = rest.strip_prefix("queue") {
+                            Some(queue(&harness, argument.trim()).await)
+                        } else {
+                            dispatch(&project, &sandbox, &rest, rx).await
+                        };
+                        side_cancel.lock().take();
+                        if let Some(item) = item {
+                            let _ = updates.send(Update::Item(item)).await;
+                        }
+                    }
                     action @ (Action::Prompt(_)
                     | Action::Steer(_)
                     | Action::FollowUp(_)
                     | Action::ChannelMessage(_)) => {
-                        let (text, echo_user) = match action {
+                        let (text, echo) = match action {
                             Action::Prompt(text) | Action::Steer(text) | Action::FollowUp(text) => {
                                 (text, true)
                             }
                             Action::ChannelMessage(message) => (channel_prompt(&message), false),
                             _ => unreachable!(),
                         };
-                        let (tx, rx) = channel();
-                        *active_cancel.lock() = Some(tx);
-                        if echo_user {
+                        if echo {
                             let _ = updates.send(Update::Item(Item::User(text.clone()))).await;
                         }
-                        let _ = updates.send(Update::Working(Some("Running".into()))).await;
-
-                        // `!` is the shell escape, exactly as it is in the
-                        // durable record; anything else is for the model.
-                        let item = if text.trim() == "/compact" {
-                            match crate::compaction::compact(
-                                &mut storage,
-                                MAIN_LANE,
-                                20,
-                                "manual compaction",
-                            ) {
-                                Ok(report) => Some(Item::Assistant(format!(
-                                    "compacted {} entries into `{}`",
-                                    report.removed_from_context, report.summary_id
-                                ))),
-                                Err(error) => Some(Item::Notice(format!("compact: {error}"))),
+                        let _ = updates.send(Update::Working(Some("Working".into()))).await;
+                        // A prompt while the lane is busy is a steer. The
+                        // harness decides that, not this loop: it commits
+                        // against the operation it read, so the race between
+                        // "the run just ended" and "the user just typed"
+                        // resolves in the store.
+                        match harness.steer(MAIN_LANE, &text).await {
+                            Ok(_) => continue,
+                            Err(HarnessError::Idle(_)) => {}
+                            Err(error) => {
+                                let _ = updates
+                                    .send(Update::Item(Item::Notice(format!("steer: {error}"))))
+                                    .await;
+                                continue;
                             }
-                        } else if let Some(command) = text.strip_prefix('!') {
-                            Some(run_command(&sandbox, command.trim(), rx).await)
-                        } else if let Some(rest) = text.strip_prefix('/') {
-                            dispatch(&project, &sandbox, rest, rx).await
-                        } else {
-                            match &model {
-                                Ok(model) => {
-                                    let system = system_prompt(&project);
-                                    let schemas = toolbox.schemas();
-                                    let sink = updates.clone();
-                                    let events = move |event| match event {
-                                        RunEvent::AssistantDelta(delta) => {
-                                            let _ = sink.try_send(Update::Delta(delta));
-                                        }
-                                        RunEvent::AssistantFinished => {
-                                            let _ = sink.try_send(Update::EndMessage);
-                                        }
-                                        RunEvent::ToolStarted { name, .. } => {
-                                            let _ = sink.try_send(Update::Working(Some(format!(
-                                                "Running {name}"
-                                            ))));
-                                        }
-                                        RunEvent::ToolFinished {
-                                            name,
-                                            success,
-                                            text,
-                                        } => {
-                                            let _ = sink.try_send(Update::Item(Item::Tool {
-                                                verb: "Ran".into(),
-                                                description: name,
-                                                status: if success {
-                                                    Status::Ok
-                                                } else {
-                                                    Status::Failed
-                                                },
-                                                duration: None,
-                                                detail: (!text.trim().is_empty()).then_some(text),
-                                                outcome: (!success).then(|| "failed".to_string()),
-                                            }));
-                                        }
-                                    };
-                                    let mut lane = Lane {
-                                        name: MAIN_LANE.into(),
-                                        storage: &mut storage,
-                                        model: model.as_ref(),
-                                        tools: &toolbox,
-                                    };
-                                    match lane
-                                        .run_with(&text, Some(rx), &system, &schemas, &events)
-                                        .await
-                                    {
-                                        Ok(report) => {
-                                            if report.outcome == crate::records::Outcome::Failed {
-                                                Some(Item::Notice(format!(
-                                                    "run failed after {} attempts",
-                                                    report.attempts
-                                                )))
-                                            } else if report.outcome
-                                                == crate::records::Outcome::Aborted
-                                            {
-                                                Some(Item::Notice("Interrupted".into()))
-                                            } else {
-                                                None
-                                            }
-                                        }
-                                        Err(error) => Some(Item::Notice(format!("run: {error}"))),
-                                    }
-                                }
-                                Err(why) => Some(Item::Notice(format!("no model: {why}"))),
-                            }
-                        };
-
-                        if let Some(item) = item {
-                            let _ = updates.send(Update::Item(item)).await;
                         }
-                        let _ = updates
-                            .send(Update::Files(file_candidates(&project.workspace())))
-                            .await;
-                        let _ = updates.send(Update::Working(None)).await;
-                        active_cancel.lock().take();
+                        running += 1;
+                        let harness = harness.clone();
+                        let updates = updates.clone();
+                        let finished = finished.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = harness.prompt(MAIN_LANE, &text).await {
+                                let _ = updates
+                                    .send(Update::Item(Item::Notice(format!("run: {error}"))))
+                                    .await;
+                            }
+                            let _ = finished.send(()).await;
+                        });
                     }
                     Action::Interrupt => {
-                        unreachable!("interrupts are handled by the action router")
+                        // Both, in this order: the durable request is what
+                        // makes the operation end aborted even if we die now.
+                        if let Err(error) = harness.abort(MAIN_LANE).await
+                            && !matches!(error, HarnessError::Idle(_))
+                        {
+                            let _ = updates
+                                .send(Update::Item(Item::Notice(format!("interrupt: {error}"))))
+                                .await;
+                        }
+                        if let Some(cancel) = side_cancel.lock().as_ref() {
+                            cancel.cancel();
+                        }
                     }
                     Action::Quit => break,
                 }
             }
+            events.abort();
+            session.close().await;
         })
     };
 
     let result = crate::tui::run::run(app, updates_rx, actions).await;
-    action_router.abort();
     worker.abort();
     result.map_err(Into::into)
 }
 
-/// Route interruption out of band so it can reach a worker that is currently
-/// awaiting a model response or guest command. Other actions remain serialized
-/// through the single session worker.
-async fn route_actions(
-    mut incoming: mpsc::Receiver<Action>,
-    outgoing: mpsc::Sender<Action>,
-    active_cancel: Arc<Mutex<Option<CancelTx>>>,
+/// Turn the harness's passive event stream into terminal updates.
+///
+/// One-way by construction: an observer cannot change what the run does, so a
+/// slow or wedged terminal can never stall or alter an operation.
+async fn forward_events(
+    mut events: tokio::sync::broadcast::Receiver<crate::events::Event>,
+    updates: mpsc::Sender<Update>,
 ) {
-    while let Some(action) = incoming.recv().await {
-        if action == Action::Interrupt {
-            if let Some(cancel) = active_cancel.lock().as_ref() {
-                cancel.cancel();
+    loop {
+        let event = match events.recv().await {
+            Ok(event) => event,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(_) => break,
+        };
+        let update = match event.kind {
+            Kind::MessageUpdate { delta } => Some(Update::Delta(delta)),
+            Kind::MessageEnd { .. } => Some(Update::EndMessage),
+            Kind::ToolStart { tool_name, .. } => {
+                Some(Update::Working(Some(format!("Running {tool_name}"))))
             }
-            continue;
-        }
-        if outgoing.send(action).await.is_err() {
+            Kind::ToolEnd {
+                tool_name,
+                content,
+                is_error,
+                ..
+            } => Some(Update::Item(Item::Tool {
+                verb: "Ran".into(),
+                description: tool_name,
+                status: if is_error { Status::Failed } else { Status::Ok },
+                duration: None,
+                detail: (!content.trim().is_empty()).then(|| content.trim().to_string()),
+                outcome: is_error.then(|| "failed".to_string()),
+            })),
+            Kind::RetryScheduled {
+                attempt,
+                max_attempts,
+                ..
+            } => Some(Update::Working(Some(format!(
+                "Retrying ({attempt}/{max_attempts})"
+            )))),
+            Kind::RunEnd { outcome, error, .. } => match outcome {
+                Outcome::Failed => Some(Update::Item(Item::Notice(match error {
+                    Some(error) => format!("run failed: {}", error.message),
+                    None => "run failed".into(),
+                }))),
+                Outcome::Aborted => Some(Update::Item(Item::Notice("Interrupted".into()))),
+                _ => None,
+            },
+            Kind::CompactionEnd { outcome, .. } => match outcome {
+                Outcome::Completed => Some(Update::Item(Item::Notice(
+                    "compacted the conversation".into(),
+                ))),
+                Outcome::Failed => Some(Update::Item(Item::Notice("compaction failed".into()))),
+                _ => None,
+            },
+            Kind::HandlerError { hook, error } => {
+                Some(Update::Item(Item::Notice(format!("{hook}: {error}"))))
+            }
+            Kind::Fault { message } => Some(Update::Item(Item::Notice(format!(
+                "session fault: {message}"
+            )))),
+            _ => None,
+        };
+        if let Some(update) = update
+            && updates.send(update).await.is_err()
+        {
             break;
         }
     }
 }
 
+/// `/compact` as its own durable operation.
+async fn compact(harness: &Arc<Harness>, instructions: &str) -> Item {
+    let custom = (!instructions.is_empty()).then(|| instructions.to_string());
+    match harness.compact(MAIN_LANE, custom).await {
+        Ok(result) if result.outcome == Outcome::Completed => Item::Assistant("Compacted.".into()),
+        Ok(result) => Item::Notice(format!("compaction {}", result.outcome.as_str())),
+        Err(error) => Item::Notice(format!("compact: {error}")),
+    }
+}
+
+/// `/queue` — a prompt for the next run, durable the moment it is accepted.
+async fn queue(harness: &Arc<Harness>, text: &str) -> Item {
+    if text.is_empty() {
+        return Item::Notice("say what to queue: `/queue <message>`".into());
+    }
+    match harness.next_run(MAIN_LANE, text).await {
+        Ok(_) => Item::Assistant("Queued for the next run.".into()),
+        Err(error) => Item::Notice(format!("queue: {error}")),
+    }
+}
+
+/// The `!` escape: a command, in the microVM, right now.
 async fn run_command(
     sandbox: &Sandbox,
     command: &str,
@@ -639,28 +788,6 @@ async fn run_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn interrupts_bypass_the_busy_worker_and_cancel_the_active_run() {
-        let (incoming, incoming_rx) = mpsc::channel(2);
-        let (outgoing, mut outgoing_rx) = mpsc::channel(2);
-        let active = Arc::new(Mutex::new(None));
-        let (cancel_tx, mut cancel_rx) = channel();
-        *active.lock() = Some(cancel_tx);
-        let router = tokio::spawn(route_actions(incoming_rx, outgoing, active));
-
-        incoming.send(Action::Interrupt).await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(1), cancel_rx.cancelled())
-            .await
-            .expect("interrupt was delivered without waiting for the worker");
-
-        incoming.send(Action::Prompt("next".into())).await.unwrap();
-        assert_eq!(
-            outgoing_rx.recv().await,
-            Some(Action::Prompt("next".into()))
-        );
-        router.abort();
-    }
 
     #[test]
     fn channel_messages_carry_source_and_timestamp_metadata() {

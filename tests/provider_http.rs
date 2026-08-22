@@ -11,10 +11,10 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use reve::entry::Entry;
 use reve::model::{Model, Request, StopReason, ToolSchema};
 use reve::provider::HttpModel;
 use reve::provider::config::{Api, Compat, ModelSpec, Resolved};
-use reve::records::{Entry, MAIN_LANE};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -120,26 +120,20 @@ async fn a_chat_completion_streams_and_replays_tool_history() {
     let (base, request) = serve("200 OK", CHAT_STREAM).await;
     let model = model(Api::OpenaiCompletions, base);
     let context = vec![
-        Entry::message(
-            MAIN_LANE,
-            json!({
-                "role": "assistant",
-                "content": [{
-                    "type": "toolCall",
-                    "id": "call_1",
-                    "name": "read",
-                    "arguments": {"path": "AGENTS.md"},
-                }],
-            }),
-        ),
-        Entry::message(
-            MAIN_LANE,
-            json!({
-                "role": "toolResult",
-                "toolCallId": "call_1",
-                "content": [{"type": "text", "text": "file body"}],
-            }),
-        ),
+        Entry::message(json!({
+            "role": "assistant",
+            "content": [{
+                "type": "toolCall",
+                "id": "call_1",
+                "name": "read",
+                "arguments": {"path": "AGENTS.md"},
+            }],
+        })),
+        Entry::message(json!({
+            "role": "toolResult",
+            "toolCallId": "call_1",
+            "content": [{"type": "text", "text": "file body"}],
+        })),
     ];
     let tools = vec![ToolSchema {
         name: "read".into(),

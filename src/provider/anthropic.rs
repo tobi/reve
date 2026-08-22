@@ -172,6 +172,7 @@ impl StreamState {
             tool_calls: self.calls,
             stop_reason,
             usage: self.usage,
+            error_message: None,
         })
     }
 }
@@ -179,13 +180,7 @@ impl StreamState {
 /// Fields are reported piecemeal across events, so anything absent keeps its
 /// previous value instead of resetting to zero.
 fn read_usage(usage: &Value, previous: Usage) -> Usage {
-    let get = |key: &str, fallback: u32| {
-        usage
-            .get(key)
-            .and_then(Value::as_u64)
-            .map(|v| v as u32)
-            .unwrap_or(fallback)
-    };
+    let get = |key: &str, fallback: u64| usage.get(key).and_then(Value::as_u64).unwrap_or(fallback);
     let cache_read = get("cache_read_input_tokens", 0);
     Usage {
         input: get("input_tokens", previous.input),

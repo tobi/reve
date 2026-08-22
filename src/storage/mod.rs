@@ -1,62 +1,92 @@
-//! Session state: entries, records, lanes, facts, and one monotonic `seq`.
+//! Session storage: entries, registers, usage rows, one monotonic `seq`.
+//!
+//! Storage knows nothing about agents, lanes, or conversations. It commits
+//! transactions and answers a small fixed set of queries (`docs/harness.md`
+//! Part 1). The in-memory maps *are* the state; the JSONL file, when there is
+//! one, is the replay recipe for them.
 //!
 //! This type is deliberately *not* thread-safe and deliberately not shared.
-//! Exactly one task owns it (see [`crate::store`]), which is how reve gets the
-//! single-writer guarantee structurally instead of by convention.
+//! Exactly one task owns it (see [`crate::session`]), which is how reve gets
+//! the single-writer guarantee structurally instead of by convention.
 
 pub mod jsonl;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 use thiserror::Error;
 
-use crate::ids::{EntryId, RecordId};
-use crate::records::{Entry, Header, Line, MAIN_LANE, Record};
+use crate::entry::{
+    CommitResult, Entry, Header, Line, Namespace, Register, RegisterWrite, Transaction, Usage,
+    UsageRow, Write,
+};
+use crate::ids::EntryId;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     /// A malformed line that is *not* the last one. A crash can truncate the
-    /// tail; it cannot corrupt the middle, so this is real damage and we refuse
-    /// to open rather than silently drop history.
-    #[error("corrupt session at line {line}: {source}")]
-    Corrupt {
-        line: usize,
-        #[source]
-        source: serde_json::Error,
-    },
+    /// tail; it cannot corrupt the middle, so this is real damage and we
+    /// refuse to open rather than silently drop history.
+    #[error("corrupt session at line {line}: {reason}")]
+    Corrupt { line: usize, reason: String },
     #[error("unsupported session format version {0} (this build reads {1})")]
     Version(u32, u32),
-    #[error("no such entry {0}")]
-    NoSuchEntry(EntryId),
+    #[error("session storage version {0} is newer than this build ({1})")]
+    StorageVersion(u32, u32),
+    #[error("session {0} is open in another process")]
+    Locked(String),
+    /// Entries and usage rows are write-once; writing under an existing id is
+    /// corruption, not an update.
+    #[error("duplicate id {0}")]
+    DuplicateId(String),
+    #[error("entry {child} names a parent {parent} that does not exist")]
+    MissingParent { child: String, parent: String },
+    #[error("invalid transaction: {0}")]
+    Invalid(String),
 }
 
 pub type Result<T, E = StorageError> = std::result::Result<T, E>;
 
-/// Where a lane currently is in the tree.
-#[derive(Debug, Clone, Default)]
-pub struct LaneState {
-    pub leaf: Option<EntryId>,
-}
-
-/// Ordering for [`Storage::find_entries`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Ordering for scans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Order {
     OldestFirst,
+    #[default]
     NewestFirst,
+}
+
+/// Bounds of a branch scan (`docs/harness.md` §2.5).
+#[derive(Debug, Clone, Default)]
+pub struct BranchScan {
+    /// Where the scan starts; `None` is an empty branch.
+    pub start: Option<EntryId>,
+    /// Scan ends after the first entry of this type, inclusive.
+    pub stop_at_type: Option<String>,
+    pub stop_at_id: Option<EntryId>,
+    pub entry_type: Option<String>,
+    pub custom_type: Option<String>,
+    pub order: Order,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stats {
+    pub message_count: u64,
+    pub usage: Usage,
 }
 
 #[derive(Debug)]
 pub struct Storage {
     header: Header,
     seq: u64,
-    order: Vec<EntryId>,
     entries: HashMap<EntryId, Entry>,
-    records: Vec<Record>,
-    lanes: HashMap<String, LaneState>,
-    facts: Map<String, Value>,
+    entry_order: Vec<EntryId>,
+    registers: BTreeMap<(Namespace, String), Register>,
+    usage: Vec<UsageRow>,
+    usage_ids: HashSet<String>,
+    stats: Stats,
     sink: Option<jsonl::Sink>,
 }
 
@@ -66,27 +96,16 @@ impl Storage {
         Self::with_header(Header::new(id, None), None)
     }
 
-    pub(crate) fn with_sink(header: Header, sink: jsonl::Sink) -> Self {
-        Self::with_header(header, Some(sink))
-    }
-
-    /// Write the header line of a brand-new session file.
-    pub(crate) fn write_header(&mut self) -> Result<()> {
-        let header = self.header.clone();
-        self.write(&Line::Header(header))
-    }
-
-    fn with_header(header: Header, sink: Option<jsonl::Sink>) -> Self {
-        let mut lanes = HashMap::new();
-        lanes.insert(MAIN_LANE.to_string(), LaneState::default());
+    pub(crate) fn with_header(header: Header, sink: Option<jsonl::Sink>) -> Self {
         Self {
             header,
             seq: 0,
-            order: Vec::new(),
             entries: HashMap::new(),
-            records: Vec::new(),
-            lanes,
-            facts: Map::new(),
+            entry_order: Vec::new(),
+            registers: BTreeMap::new(),
+            usage: Vec::new(),
+            usage_ids: HashSet::new(),
+            stats: Stats::default(),
             sink,
         }
     }
@@ -99,183 +118,247 @@ impl Storage {
         self.seq
     }
 
-    fn next_seq(&mut self) -> u64 {
-        self.seq += 1;
-        self.seq
+    pub fn stats(&self) -> Stats {
+        self.stats
     }
 
-    // ── entries ──────────────────────────────────────────────────────────
+    // ── the write primitive ───────────────────────────────────────────────
 
-    /// Append an entry, chaining it to its lane's current leaf and advancing
-    /// that leaf. An explicit `parent_id` wins, which is how a branch is made.
-    pub fn append_entry(&mut self, mut entry: Entry) -> Result<EntryId> {
-        if entry.parent_id.is_none() {
-            entry.parent_id = self.leaf(&entry.lane);
+    /// Commit a transaction: all-or-none, strictly increasing `seq`.
+    ///
+    /// Validation happens against the state *with earlier writes of the same
+    /// transaction applied*, so an entry may name a parent created a line
+    /// earlier. Nothing is applied to the live maps until the whole
+    /// transaction is valid and — when there is a file — flushed.
+    pub fn commit(&mut self, tx: Transaction) -> Result<CommitResult> {
+        if tx.writes.is_empty() {
+            return Err(StorageError::Invalid("empty transaction".into()));
         }
-        entry.seq = self.next_seq();
-        let id = entry.id.clone();
+        let timestamp = crate::ids::now_ms();
+        let first_seq = self.seq + 1;
+        let mut seq = self.seq;
+        let mut writes = tx.writes;
 
-        self.write(&Line::Entry(entry.clone()))?;
-        self.lanes.entry(entry.lane.clone()).or_default().leaf = Some(id.clone());
-        self.order.push(id.clone());
-        self.entries.insert(id.clone(), entry);
-        Ok(id)
-    }
-
-    /// The durability rule's other half: appending a provisioned id twice is a
-    /// no-op rather than a duplicate. Recovery re-runs freely.
-    pub fn append_entry_if_missing(&mut self, entry: Entry) -> Result<EntryId> {
-        if self.entries.contains_key(&entry.id) {
-            return Ok(entry.id);
+        // Validate with in-transaction visibility.
+        let mut new_entries: HashSet<String> = HashSet::new();
+        let mut new_usage: HashSet<String> = HashSet::new();
+        for write in writes.iter_mut() {
+            seq += 1;
+            write.set_seq(seq);
+            match write {
+                Write::Entry(entry) => {
+                    entry.timestamp = timestamp;
+                    let id = entry.id.as_str();
+                    if self.entries.contains_key(&entry.id)
+                        || self.usage_ids.contains(id)
+                        || !new_entries.insert(id.to_string())
+                        || new_usage.contains(id)
+                    {
+                        return Err(StorageError::DuplicateId(id.to_string()));
+                    }
+                    if let Some(parent) = &entry.parent_id
+                        && !self.entries.contains_key(parent)
+                        && !new_entries.contains(parent.as_str())
+                    {
+                        return Err(StorageError::MissingParent {
+                            child: id.to_string(),
+                            parent: parent.to_string(),
+                        });
+                    }
+                    if entry.entry_type.is_empty() {
+                        return Err(StorageError::Invalid(format!("entry {id} has no type")));
+                    }
+                    if (entry.entry_type == "custom") != entry.custom_type.is_some() {
+                        return Err(StorageError::Invalid(format!(
+                            "entry {id}: customType is set exactly on custom entries"
+                        )));
+                    }
+                }
+                Write::Usage(row) => {
+                    let id = row.id.as_str();
+                    if self.usage_ids.contains(id)
+                        || self.entries.contains_key(&EntryId::from(id))
+                        || !new_usage.insert(id.to_string())
+                        || new_entries.contains(id)
+                    {
+                        return Err(StorageError::DuplicateId(id.to_string()));
+                    }
+                }
+                Write::Register(_) => {}
+            }
         }
-        self.append_entry(entry)
+
+        // Durable first, then visible.
+        if let Some(sink) = self.sink.as_mut() {
+            sink.append(&Line::commit(&writes))?;
+        }
+        for write in writes {
+            self.apply(write);
+        }
+        Ok(CommitResult {
+            first_seq,
+            last_seq: seq,
+            timestamp,
+        })
     }
+
+    /// Apply one already-validated write to the live maps. Shared by commit
+    /// and replay; assigns nothing.
+    fn apply(&mut self, write: Write) {
+        let seq = write.seq();
+        self.seq = self.seq.max(seq);
+        match write {
+            Write::Entry(entry) => {
+                if entry.entry_type == "message" {
+                    self.stats.message_count += 1;
+                }
+                self.entry_order.push(entry.id.clone());
+                self.entries.insert(entry.id.clone(), entry);
+            }
+            Write::Usage(row) => {
+                self.stats.usage.add(&row.usage);
+                self.usage_ids.insert(row.id.as_str().to_string());
+                self.usage.push(row);
+            }
+            Write::Register(RegisterWrite::Set {
+                seq,
+                namespace,
+                key,
+                value,
+            }) => {
+                self.registers.insert(
+                    (namespace, key.clone()),
+                    Register {
+                        namespace,
+                        key,
+                        value,
+                        seq,
+                    },
+                );
+            }
+            Write::Register(RegisterWrite::Delete { namespace, key, .. }) => {
+                self.registers.remove(&(namespace, key));
+            }
+        }
+    }
+
+    /// Replay one decoded line during open. Decoding, not recovery logic.
+    pub(crate) fn replay(&mut self, write: Write) {
+        self.apply(write);
+    }
+
+    // ── queries ──────────────────────────────────────────────────────────
 
     pub fn entry(&self, id: &EntryId) -> Option<&Entry> {
         self.entries.get(id)
     }
 
-    pub fn find_entries(&self, lane: Option<&str>, order: Order) -> Vec<&Entry> {
-        let mut found: Vec<&Entry> = self
-            .order
-            .iter()
-            .filter_map(|id| self.entries.get(id))
-            .filter(|e| lane.is_none_or(|l| e.lane == l))
-            .collect();
-        if order == Order::NewestFirst {
-            found.reverse();
-        }
-        found
+    pub fn entries(&self, ids: &[EntryId]) -> HashMap<EntryId, Entry> {
+        ids.iter()
+            .filter_map(|id| self.entries.get(id).map(|e| (id.clone(), e.clone())))
+            .collect()
     }
 
-    /// The conversation as the model sees it: leaf back to root, then reversed.
-    /// Entries on other branches are invisible here — that is the point.
-    pub fn path_entries(&self, lane: &str) -> Vec<&Entry> {
-        let mut path = Vec::new();
-        let mut cursor = self.lanes.get(lane).and_then(|l| l.leaf.clone());
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn register(&self, namespace: Namespace, key: &str) -> Option<&Register> {
+        self.registers.get(&(namespace, key.to_string()))
+    }
+
+    /// Indexed prefix listing over `(namespace, key)`.
+    pub fn list_registers(&self, namespace: Namespace, key_prefix: &str) -> Vec<&Register> {
+        self.registers
+            .range((namespace, key_prefix.to_string())..)
+            .take_while(|((ns, key), _)| *ns == namespace && key.starts_with(key_prefix))
+            .map(|(_, r)| r)
+            .collect()
+    }
+
+    pub fn register_count(&self) -> usize {
+        self.registers.len()
+    }
+
+    /// Take the path from `start` toward the root, order it, stop inclusively
+    /// at the first `stop_at` match, filter, limit.
+    pub fn scan_branch(&self, scan: &BranchScan) -> Vec<&Entry> {
+        let mut path: Vec<&Entry> = Vec::new();
+        let mut cursor = scan.start.clone();
         while let Some(id) = cursor {
             let Some(entry) = self.entries.get(&id) else {
                 break;
             };
             path.push(entry);
+            let stop_type = scan
+                .stop_at_type
+                .as_deref()
+                .is_some_and(|t| entry.entry_type == t);
+            let stop_id = scan.stop_at_id.as_ref().is_some_and(|s| *s == entry.id);
+            if stop_type || stop_id {
+                break;
+            }
             cursor = entry.parent_id.clone();
         }
-        path.reverse();
-        path
+        if scan.order == Order::OldestFirst {
+            path.reverse();
+        }
+        let filtered = path.into_iter().filter(|e| {
+            scan.entry_type.as_deref().is_none_or(|t| e.entry_type == t)
+                && scan
+                    .custom_type
+                    .as_deref()
+                    .is_none_or(|c| e.custom_type.as_deref() == Some(c))
+        });
+        match scan.limit {
+            Some(limit) => filtered.take(limit).collect(),
+            None => filtered.collect(),
+        }
     }
 
-    // ── records ──────────────────────────────────────────────────────────
-
-    pub fn append_record(&mut self, mut record: Record) -> Result<RecordId> {
-        record.seq = self.next_seq();
-        let id = record.id.clone();
-        self.write(&Line::Record(record.clone()))?;
-        self.records.push(record);
-        Ok(id)
-    }
-
-    pub fn find_records(&self, lane: Option<&str>) -> Vec<&Record> {
-        self.records
+    /// Session-wide inventory in sequence order.
+    pub fn scan_entries(&self, order: Order) -> Vec<&Entry> {
+        let mut all: Vec<&Entry> = self
+            .entry_order
             .iter()
-            .filter(|r| lane.is_none_or(|l| r.lane == l))
-            .collect()
-    }
-
-    // ── lanes and facts ──────────────────────────────────────────────────
-
-    pub fn lanes(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.lanes.keys().cloned().collect();
-        names.sort();
-        names
-    }
-
-    pub fn leaf(&self, lane: &str) -> Option<EntryId> {
-        self.lanes.get(lane).and_then(|l| l.leaf.clone())
-    }
-
-    /// Move a lane's leaf. Compaction uses this to swap in a summarised head
-    /// without rewriting a single historical entry.
-    pub fn set_leaf(&mut self, lane: &str, leaf: Option<EntryId>) -> Result<()> {
-        if let Some(id) = &leaf
-            && !self.entries.contains_key(id)
-        {
-            return Err(StorageError::NoSuchEntry(id.clone()));
+            .filter_map(|id| self.entries.get(id))
+            .collect();
+        if order == Order::NewestFirst {
+            all.reverse();
         }
-        let seq = self.next_seq();
-        let record = {
-            let mut r = Record::new(
-                lane,
-                "lane_leaf_set",
-                serde_json::json!({ "leafId": leaf.as_ref().map(|l| l.0.clone()) }),
-            );
-            r.seq = seq;
-            r
-        };
-        self.write(&Line::Record(record.clone()))?;
-        self.records.push(record);
-        self.lanes.entry(lane.to_string()).or_default().leaf = leaf;
-        Ok(())
+        all
     }
 
-    pub fn fact(&self, key: &str) -> Option<&Value> {
-        self.facts.get(key)
+    pub fn scan_usage(&self, from_seq: u64) -> Vec<&UsageRow> {
+        self.usage.iter().filter(|r| r.seq >= from_seq).collect()
     }
 
-    pub fn set_fact(&mut self, key: impl Into<String>, value: Value) -> Result<()> {
-        let key = key.into();
-        let seq = self.next_seq();
-        let mut record = Record::new(
-            MAIN_LANE,
-            "fact_set",
-            serde_json::json!({ "key": key, "value": value }),
-        );
-        record.seq = seq;
-        self.write(&Line::Record(record.clone()))?;
-        self.records.push(record);
-        self.facts.insert(key, value);
-        Ok(())
+    pub fn usage_count(&self) -> usize {
+        self.usage.len()
     }
 
-    fn write(&mut self, line: &Line) -> Result<()> {
-        if let Some(sink) = self.sink.as_mut() {
-            sink.append(line)?;
-        }
-        Ok(())
+    /// Every live register, for snapshot compaction and debugging.
+    pub fn all_registers(&self) -> impl Iterator<Item = &Register> {
+        self.registers.values()
     }
 
-    /// Replay a line during load. Unlike the append path this assigns nothing:
-    /// seq, parent, and leaf all come from the file.
-    pub(crate) fn replay_line(&mut self, line: Line) {
-        match line {
-            Line::Header(header) => self.header = header,
-            Line::Entry(entry) => {
-                self.seq = self.seq.max(entry.seq);
-                self.lanes.entry(entry.lane.clone()).or_default().leaf = Some(entry.id.clone());
-                self.order.push(entry.id.clone());
-                self.entries.insert(entry.id.clone(), entry);
-            }
-            Line::Record(record) => {
-                self.seq = self.seq.max(record.seq);
-                self.lanes.entry(record.lane.clone()).or_default();
-                match record.record_type.as_str() {
-                    "lane_leaf_set" => {
-                        let leaf = record
-                            .get("leafId")
-                            .and_then(|v| v.as_str())
-                            .map(EntryId::from);
-                        self.lanes.entry(record.lane.clone()).or_default().leaf = leaf;
-                    }
-                    "fact_set" => {
-                        if let Some(key) = record.str("key") {
-                            let value = record.get("value").cloned().unwrap_or(Value::Null);
-                            self.facts.insert(key.to_string(), value);
-                        }
-                    }
-                    _ => {}
-                }
-                self.records.push(record);
-            }
-        }
+    pub fn all_usage(&self) -> &[UsageRow] {
+        &self.usage
+    }
+
+    /// Typed read of a register value.
+    pub fn register_value<T: serde::de::DeserializeOwned>(
+        &self,
+        namespace: Namespace,
+        key: &str,
+    ) -> Option<(T, u64)> {
+        let register = self.register(namespace, key)?;
+        let value: T = serde_json::from_value(register.value.clone()).ok()?;
+        Some((value, register.seq))
+    }
+
+    pub fn register_json(&self, namespace: Namespace, key: &str) -> Option<&Value> {
+        self.register(namespace, key).map(|r| &r.value)
     }
 }
 
@@ -285,128 +368,209 @@ mod tests {
     use serde_json::json;
 
     fn user(text: &str) -> Entry {
-        Entry::message(MAIN_LANE, json!({"role": "user", "content": text}))
+        Entry::message(json!({"role": "user", "content": text}))
+    }
+
+    fn tx(writes: Vec<Write>) -> Transaction {
+        Transaction { writes }
     }
 
     #[test]
-    fn entries_chain_into_a_tree_and_advance_the_leaf() {
+    fn a_transaction_assigns_strictly_increasing_seq_across_all_kinds() {
         let mut s = Storage::memory("s1");
-        let a = s.append_entry(user("one")).unwrap();
-        let b = s.append_entry(user("two")).unwrap();
-        assert_eq!(s.leaf(MAIN_LANE), Some(b.clone()));
-        assert_eq!(s.entry(&b).unwrap().parent_id, Some(a.clone()));
-        assert_eq!(s.entry(&a).unwrap().parent_id, None);
-        let path: Vec<_> = s
-            .path_entries(MAIN_LANE)
-            .iter()
-            .map(|e| e.id.clone())
-            .collect();
-        assert_eq!(path, vec![a, b], "path runs oldest -> newest");
-    }
-
-    #[test]
-    fn seq_is_shared_and_monotonic_across_entries_and_records() {
-        let mut s = Storage::memory("s1");
-        s.append_entry(user("one")).unwrap();
-        s.append_record(Record::new(MAIN_LANE, "operation_started", json!({})))
+        let e = user("one");
+        let result = s
+            .commit(tx(vec![
+                Write::entry(e.clone()),
+                Write::set(Namespace::LaneLeaf, "main", e.id.as_str()),
+                Write::usage(UsageRow::new(
+                    crate::ids::UsageId::new(),
+                    Usage::default(),
+                    None,
+                )),
+            ]))
             .unwrap();
-        s.append_entry(user("two")).unwrap();
+        assert_eq!((result.first_seq, result.last_seq), (1, 3));
         assert_eq!(s.seq(), 3);
-        let seqs: Vec<u64> = s
-            .find_entries(None, Order::OldestFirst)
-            .iter()
-            .map(|e| e.seq)
-            .collect();
-        assert_eq!(seqs, vec![1, 3]);
+        assert_eq!(s.register(Namespace::LaneLeaf, "main").unwrap().seq, 2);
+        assert_eq!(s.entry(&e.id).unwrap().seq, 1);
     }
 
     #[test]
-    fn a_branch_keeps_the_other_side_out_of_the_path() {
+    fn a_failing_transaction_applies_nothing() {
         let mut s = Storage::memory("s1");
-        let a = s.append_entry(user("root")).unwrap();
-        s.append_entry(user("main line")).unwrap();
-        // Branch from `a` rather than the current leaf.
-        let mut side = user("side line");
-        side.parent_id = Some(a.clone());
-        let side_id = s.append_entry(side).unwrap();
-        assert_eq!(s.leaf(MAIN_LANE), Some(side_id.clone()));
-        let path: Vec<_> = s
-            .path_entries(MAIN_LANE)
+        let a = user("a");
+        s.commit(tx(vec![Write::entry(a.clone())])).unwrap();
+        let orphan = user("orphan").with_parent(Some(EntryId::from("nope")));
+        let err = s
+            .commit(tx(vec![
+                Write::set(Namespace::FactName, "", "should not land"),
+                Write::entry(orphan),
+            ]))
+            .unwrap_err();
+        assert!(matches!(err, StorageError::MissingParent { .. }), "{err}");
+        assert!(s.register(Namespace::FactName, "").is_none(), "all-or-none");
+        assert_eq!(s.seq(), 1, "seq is not consumed by a rejected transaction");
+    }
+
+    #[test]
+    fn entries_and_usage_share_one_write_once_id_namespace() {
+        let mut s = Storage::memory("s1");
+        let e = user("x");
+        s.commit(tx(vec![Write::entry(e.clone())])).unwrap();
+        let dup = s.commit(tx(vec![Write::entry(e.clone())])).unwrap_err();
+        assert!(matches!(dup, StorageError::DuplicateId(_)), "{dup}");
+        let clash = s
+            .commit(tx(vec![Write::usage(UsageRow::new(
+                crate::ids::UsageId::from(e.id.as_str()),
+                Usage::default(),
+                None,
+            ))]))
+            .unwrap_err();
+        assert!(matches!(clash, StorageError::DuplicateId(_)), "{clash}");
+    }
+
+    #[test]
+    fn an_entry_may_name_a_parent_created_earlier_in_the_same_transaction() {
+        let mut s = Storage::memory("s1");
+        let a = user("a");
+        let b = user("b").with_parent(Some(a.id.clone()));
+        s.commit(tx(vec![Write::entry(a.clone()), Write::entry(b.clone())]))
+            .unwrap();
+        assert_eq!(s.entry(&b.id).unwrap().parent_id, Some(a.id));
+    }
+
+    #[test]
+    fn registers_set_delete_and_recreate_without_history() {
+        let mut s = Storage::memory("s1");
+        s.commit(tx(vec![Write::set(Namespace::FactName, "", "one")]))
+            .unwrap();
+        s.commit(tx(vec![Write::set(Namespace::FactName, "", "two")]))
+            .unwrap();
+        assert_eq!(s.register(Namespace::FactName, "").unwrap().value, "two");
+        assert_eq!(s.register_count(), 1, "overwrite keeps no history");
+        s.commit(tx(vec![Write::delete(Namespace::FactName, "")]))
+            .unwrap();
+        assert!(s.register(Namespace::FactName, "").is_none());
+        // Deleting an absent key is a legal no-op.
+        s.commit(tx(vec![Write::delete(Namespace::FactName, "")]))
+            .unwrap();
+        s.commit(tx(vec![Write::set(
+            Namespace::FactCustom,
+            "k",
+            Value::Null,
+        )]))
+        .unwrap();
+        assert_eq!(
+            s.register(Namespace::FactCustom, "k").unwrap().value,
+            Value::Null,
+            "JSON null is a value, not a deletion"
+        );
+    }
+
+    #[test]
+    fn prefix_listing_is_scoped_to_one_namespace() {
+        let mut s = Storage::memory("s1");
+        s.commit(tx(vec![
+            Write::set(Namespace::OpToolArgs, "op1:s1:0", json!({})),
+            Write::set(Namespace::OpToolArgs, "op1:s1:1", json!({})),
+            Write::set(Namespace::OpToolArgs, "op2:s1:0", json!({})),
+            Write::set(Namespace::OpPreparation, "op1:t1", json!({})),
+        ]))
+        .unwrap();
+        assert_eq!(s.list_registers(Namespace::OpToolArgs, "op1:").len(), 2);
+        assert_eq!(s.list_registers(Namespace::OpToolArgs, "").len(), 3);
+        assert_eq!(s.list_registers(Namespace::OpPreparation, "op1").len(), 1);
+    }
+
+    #[test]
+    fn a_branch_scan_stops_inclusively_at_a_compaction() {
+        let mut s = Storage::memory("s1");
+        let a = user("a");
+        let b = user("b").with_parent(Some(a.id.clone()));
+        let c = Entry::compaction("sum", vec![], 10, false).with_parent(Some(b.id.clone()));
+        let d = user("d").with_parent(Some(c.id.clone()));
+        for e in [&a, &b, &c, &d] {
+            s.commit(tx(vec![Write::entry(e.clone())])).unwrap();
+        }
+        let scan = BranchScan {
+            start: Some(d.id.clone()),
+            stop_at_type: Some("compaction".into()),
+            order: Order::OldestFirst,
+            ..Default::default()
+        };
+        let ids: Vec<_> = s.scan_branch(&scan).iter().map(|e| e.id.clone()).collect();
+        assert_eq!(ids, vec![c.id.clone(), d.id.clone()]);
+
+        // A filter applies after the stop.
+        let only_messages = BranchScan {
+            entry_type: Some("message".into()),
+            ..scan.clone()
+        };
+        let ids: Vec<_> = s
+            .scan_branch(&only_messages)
             .iter()
             .map(|e| e.id.clone())
             .collect();
-        assert_eq!(path, vec![a, side_id], "the abandoned branch is invisible");
-        assert_eq!(
-            s.find_entries(None, Order::OldestFirst).len(),
-            3,
-            "but nothing was deleted"
-        );
+        assert_eq!(ids, vec![d.id.clone()]);
+
+        // No stop: the whole path.
+        let whole = BranchScan {
+            start: Some(d.id.clone()),
+            ..Default::default()
+        };
+        assert_eq!(s.scan_branch(&whole).len(), 4);
     }
 
     #[test]
-    fn provisioned_ids_can_be_appended_twice_without_duplicating() {
+    fn stats_equal_the_ledger_sum_after_every_commit() {
         let mut s = Storage::memory("s1");
-        let entry = user("result");
-        let id = entry.id.clone();
-        s.append_entry_if_missing(entry.clone()).unwrap();
-        s.append_entry_if_missing(entry).unwrap();
-        assert_eq!(
-            s.find_entries(None, Order::OldestFirst).len(),
-            1,
-            "recovery is idempotent"
-        );
-        assert_eq!(s.leaf(MAIN_LANE), Some(id));
-    }
-
-    #[test]
-    fn deleting_every_record_leaves_a_valid_tree() {
-        let mut s = Storage::memory("s1");
-        s.append_entry(user("one")).unwrap();
-        s.append_record(Record::new(MAIN_LANE, "tool_started", json!({})))
+        for i in 0..3u64 {
+            s.commit(tx(vec![
+                Write::entry(user("m")),
+                Write::usage(UsageRow::new(
+                    crate::ids::UsageId::new(),
+                    Usage {
+                        input: 10 * (i + 1),
+                        output: 1,
+                        cached_input: 0,
+                    },
+                    None,
+                )),
+            ]))
             .unwrap();
-        s.append_entry(user("two")).unwrap();
-        // Every entry still chains to a root without consulting any record.
-        for entry in s.find_entries(None, Order::OldestFirst) {
-            let mut cursor = entry.parent_id.clone();
-            let mut hops = 0;
-            while let Some(id) = cursor {
-                cursor = s.entry(&id).expect("parent must exist").parent_id.clone();
-                hops += 1;
-                assert!(hops < 100, "parent chain must terminate");
-            }
+            let sum = s.scan_usage(0).iter().fold(Usage::default(), |mut acc, r| {
+                acc.add(&r.usage);
+                acc
+            });
+            assert_eq!(s.stats().usage, sum);
+            assert_eq!(s.stats().message_count, i + 1);
         }
     }
 
     #[test]
-    fn setting_a_leaf_to_an_unknown_entry_is_refused() {
+    fn deleting_every_register_leaves_a_valid_tree() {
         let mut s = Storage::memory("s1");
-        let err = s
-            .set_leaf(MAIN_LANE, Some(EntryId::from("e_nope")))
-            .unwrap_err();
-        assert!(matches!(err, StorageError::NoSuchEntry(_)), "got {err}");
-    }
-
-    #[test]
-    fn lanes_are_independent() {
-        let mut s = Storage::memory("s1");
-        s.append_entry(user("main")).unwrap();
-        let hb = s
-            .append_entry(Entry::message("heartbeat", json!({"role": "user"})))
-            .unwrap();
-        assert_eq!(s.leaf("heartbeat"), Some(hb));
-        assert_eq!(
-            s.path_entries("heartbeat").len(),
-            1,
-            "lanes do not share a chain"
-        );
-        assert_eq!(s.lanes(), vec!["heartbeat".to_string(), "main".to_string()]);
-    }
-
-    #[test]
-    fn facts_survive_as_records() {
-        let mut s = Storage::memory("s1");
-        s.set_fact("name", json!("parity")).unwrap();
-        assert_eq!(s.fact("name").unwrap(), "parity");
-        assert_eq!(s.find_records(None).len(), 1);
+        let a = user("a");
+        let b = user("b").with_parent(Some(a.id.clone()));
+        s.commit(tx(vec![
+            Write::entry(a),
+            Write::set(Namespace::OpState, "op", json!({"phase": "x"})),
+            Write::entry(b),
+        ]))
+        .unwrap();
+        let keys: Vec<_> = s
+            .all_registers()
+            .map(|r| (r.namespace, r.key.clone()))
+            .collect();
+        for (ns, key) in keys {
+            s.commit(tx(vec![Write::delete(ns, key)])).unwrap();
+        }
+        for entry in s.scan_entries(Order::OldestFirst) {
+            let mut cursor = entry.parent_id.clone();
+            while let Some(id) = cursor {
+                cursor = s.entry(&id).expect("parent must exist").parent_id.clone();
+            }
+        }
     }
 }

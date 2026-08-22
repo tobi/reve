@@ -1,32 +1,66 @@
 //! Crash-site recovery, against a really-killed process.
 //!
 //! Nothing here is simulated. A child process opens a real JSONL session,
-//! records a tool intent, and is SIGKILLed while the tool is in flight. Then
-//! this process reopens the file and has to reduce what it finds.
+//! commits a tool intent, and is SIGKILLed while the tool is in flight. Then
+//! this process reopens the file and has to continue the operation — with an
+//! effectful tool that panics if recovery is ever tempted to re-run it.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use reve::ids::EntryId;
-use reve::lane::{Tools, recover};
-use reve::model::BoxFuture;
-use reve::records::{MAIN_LANE, Replay};
-use reve::storage::{Order, Storage};
-use serde_json::{Map, Value};
+use reve::entry::{MAIN_LANE, Namespace};
+use reve::harness::{Harness, HarnessConfig};
+use reve::hooks::Hooks;
+use reve::model::{Assistant, BoxFuture, ScriptedModel, ToolSchema};
+use reve::sandbox::tokio_util_lite::CancelRx;
+use reve::session::Session;
+use reve::state::{
+    LaneConfiguration, ModelRef, OperationState, Outcome, Replay, RetryPolicy, RunPhase,
+    RunSettings, ToolCallState,
+};
+use reve::storage::Storage;
+use reve::tools::Tools;
+use serde_json::{Map, Value, json};
 
-struct NeverReplay;
+/// A tool set whose invocation is a test failure, or a counted re-run.
+struct RecoveryTools {
+    replay: Replay,
+    calls: Arc<AtomicUsize>,
+    reply: Option<&'static str>,
+}
 
-impl Tools for NeverReplay {
-    fn replay(&self, _name: &str) -> Replay {
-        Replay::Never
+impl Tools for RecoveryTools {
+    fn replay(&self, _name: &str) -> Option<Replay> {
+        Some(self.replay)
     }
+
+    fn schemas(&self) -> Vec<ToolSchema> {
+        vec![ToolSchema {
+            name: "hang".into(),
+            description: "blocks forever".into(),
+            schema: json!({"type": "object", "properties": {}}),
+        }]
+    }
+
     fn invoke<'a>(
         &'a self,
         name: &'a str,
-        _arguments: Map<String, Value>,
+        arguments: Map<String, Value>,
+        _cancel: Option<CancelRx>,
     ) -> BoxFuture<'a, Result<String, String>> {
-        panic!("an effectful tool must never be re-run during recovery (got {name})")
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let reply = self.reply.unwrap_or_else(|| {
+            panic!("an effectful tool must never be re-run during recovery (got {name})")
+        });
+        assert_eq!(
+            arguments.get("marker").and_then(Value::as_str),
+            Some("persisted"),
+            "a re-run uses the arguments the intent persisted"
+        );
+        Box::pin(async move { Ok(reply.to_string()) })
     }
 }
 
@@ -51,8 +85,8 @@ fn wait_for(path: &Path, limit: Duration) -> bool {
     false
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_killed_process_leaves_an_operation_recovery_can_finish() {
+/// Run the child until its tool is in flight, then SIGKILL it.
+fn crash(session: &Path, ready: &Path, replay: &str) {
     let bin = crash_child_bin();
     if !bin.exists() {
         // `cargo test` builds bins before integration tests; if that changes,
@@ -62,24 +96,18 @@ async fn a_killed_process_leaves_an_operation_recovery_can_finish() {
             bin.display()
         );
     }
-
-    let dir = tempfile::tempdir().unwrap();
-    let session = dir.path().join("session.jsonl");
-    let ready = dir.path().join("ready");
-
     let mut child = Command::new(&bin)
-        .arg(&session)
-        .arg(&ready)
+        .arg(session)
+        .arg(ready)
+        .arg(replay)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn the crash child");
-
     assert!(
-        wait_for(&ready, Duration::from_secs(30)),
+        wait_for(ready, Duration::from_secs(60)),
         "child never reached the tool"
     );
-
     // Kill it outright. No unwinding, no flush on the way out — whatever is on
     // disk is what a real crash would have left.
     child.kill().expect("kill the child");
@@ -88,67 +116,166 @@ async fn a_killed_process_leaves_an_operation_recovery_can_finish() {
         !status.success(),
         "the child must have died, not exited cleanly"
     );
+}
 
-    // ── what the crash left ──────────────────────────────────────────────
-    let mut storage = Storage::open(&session, "crash", None).expect("the session still opens");
-    let records = storage.find_records(Some(MAIN_LANE));
-    let intent = records
-        .iter()
-        .find(|r| r.record_type == "tool_started")
-        .expect("the intent was flushed before the effect");
-    let promised = EntryId::from(
-        intent
-            .str("resultEntryId")
-            .expect("intent names its result"),
-    );
-    assert!(
-        !records
-            .iter()
-            .any(|r| r.record_type == "operation_finished"),
-        "the operation is open"
-    );
-    assert!(
-        storage.entry(&promised).is_none(),
-        "and its promised result never landed — this is the ambiguous-looking case"
-    );
+fn harness(session: &Session, tools: Arc<dyn Tools>, cursor: PathBuf) -> Arc<Harness> {
+    Harness::new(
+        session.clone(),
+        HarnessConfig {
+            model: Arc::new(ScriptedModel::new(
+                vec![Assistant::text("carrying on")],
+                cursor,
+            )),
+            tools,
+            hooks: Hooks::new(),
+            system_prompt: Arc::new(|| "you are a crash test".to_string()),
+            settings: RunSettings::default(),
+            retry: RetryPolicy::default(),
+            configuration: LaneConfiguration {
+                model: ModelRef {
+                    provider: "test".into(),
+                    model_id: "scripted".into(),
+                },
+                thinking_level: "off".into(),
+                active_tool_names: vec!["hang".into()],
+            },
+            event_capacity: 16,
+        },
+    )
+}
 
-    // ── the reduction ────────────────────────────────────────────────────
-    let reports = recover(&mut storage, MAIN_LANE, &NeverReplay)
+/// The state the crash left: an open operation whose tool call is past its
+/// intent commit and has no result.
+async fn assert_interrupted_tool(session: &Session) {
+    let op = session
+        .lane_state(MAIN_LANE)
         .await
-        .unwrap();
-    assert_eq!(reports.len(), 1, "exactly one interrupted operation");
-    assert_eq!(reports[0].reconciled, vec!["hang".to_string()]);
-
-    let result = storage
-        .entry(&promised)
-        .expect("recovery produced the promised entry");
-    assert_eq!(result.role(), Some("toolResult"));
-    let text = serde_json::to_string(&result.payload).unwrap();
-    assert!(text.contains("Interrupted"), "{text}");
-    assert!(text.contains("\"recovered\":true"), "{text}");
+        .unwrap()
+        .expect("the lane exists")
+        .0
+        .current_operation_id
+        .expect("the operation is still open");
+    let (state, _) = session
+        .register::<OperationState>(Namespace::OpState, op.as_str())
+        .await
+        .unwrap()
+        .expect("the program counter survived");
+    let OperationState::Run(run) = state else {
+        panic!("expected a run");
+    };
+    let RunPhase::Tools { batch } = run.phase else {
+        panic!("expected the tools phase, got {:?}", run.phase);
+    };
+    let call = batch.calls.first().expect("one call");
     assert!(
-        storage
-            .find_records(Some(MAIN_LANE))
-            .iter()
-            .any(|r| r.record_type == "operation_finished"),
-        "and the operation is closed"
+        matches!(call, ToolCallState::EffectPending { .. }),
+        "the intent was flushed before the effect: {call:?}"
+    );
+    assert!(
+        session
+            .entry(call.result_entry_id().clone())
+            .await
+            .unwrap()
+            .is_none(),
+        "and its promised result never landed — this is the ambiguous case"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_killed_effectful_tool_is_reported_interrupted_never_re_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    crash(&path, &dir.path().join("ready"), "never");
+
+    let session = Session::spawn(Storage::open(&path, "crash", None).expect("the session opens"));
+    assert_interrupted_tool(&session).await;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tools = Arc::new(RecoveryTools {
+        replay: Replay::Never,
+        calls: calls.clone(),
+        reply: None,
+    });
+    let harness = harness(&session, tools, path.with_extension("resume-cursor"));
+    let result = harness
+        .resume(MAIN_LANE)
+        .await
+        .unwrap()
+        .expect("there was something to resume");
+    assert_eq!(result.outcome, Outcome::Completed);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let transcript = session.transcript(MAIN_LANE).await.unwrap();
+    let result_entry = transcript
+        .iter()
+        .find(|e| {
+            e.message_value()
+                .and_then(|m| m.get("role"))
+                .and_then(Value::as_str)
+                == Some("toolResult")
+        })
+        .expect("recovery produced the promised result entry");
+    let text = serde_json::to_string(&result_entry.payload).unwrap();
+    assert!(text.contains("Interrupted"), "{text}");
+    assert!(
+        text.contains("interrupted"),
+        "it says it is synthetic: {text}"
     );
 
-    // ── it survives a restart, and re-running is a no-op ─────────────────
-    drop(storage);
-    let mut reopened = Storage::open(&session, "crash", None).expect("reopen after recovery");
+    // The operation is closed and stays closed across a reopen.
+    assert!(harness.resume(MAIN_LANE).await.unwrap().is_none());
+    session.close().await;
+    let reopened = Session::spawn(Storage::open(&path, "crash", None).expect("reopen"));
     assert!(
-        reopened.entry(&promised).is_some(),
+        reopened
+            .lane_state(MAIN_LANE)
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .current_operation_id
+            .is_none(),
         "the recovery is durable"
     );
-    let before = reopened.find_entries(None, Order::OldestFirst).len();
-    let again = recover(&mut reopened, MAIN_LANE, &NeverReplay)
-        .await
-        .unwrap();
-    assert!(again.is_empty(), "nothing is left open");
-    assert_eq!(
-        reopened.find_entries(None, Order::OldestFirst).len(),
-        before,
-        "and recovery is idempotent"
+    let entries = reopened.transcript(MAIN_LANE).await.unwrap().len();
+    assert_eq!(entries, 4, "user, call, synthetic result, reply");
+    reopened.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_killed_replay_safe_tool_is_re_executed_from_its_persisted_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    crash(&path, &dir.path().join("ready"), "safe");
+
+    let session = Session::spawn(Storage::open(&path, "crash", None).expect("the session opens"));
+    assert_interrupted_tool(&session).await;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tools = Arc::new(RecoveryTools {
+        replay: Replay::Safe,
+        calls: calls.clone(),
+        reply: Some("read it again"),
+    });
+    let harness = harness(&session, tools, path.with_extension("resume-cursor"));
+    let result = harness.resume(MAIN_LANE).await.unwrap().expect("suspended");
+    assert_eq!(result.outcome, Outcome::Completed);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "re-executed exactly once");
+
+    let transcript = session.transcript(MAIN_LANE).await.unwrap();
+    let text = serde_json::to_string(&transcript[2].payload).unwrap();
+    assert!(text.contains("read it again"), "{text}");
+    session.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_process_cannot_open_a_live_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    let _held = Storage::open(&path, "held", None).expect("first open wins");
+    let contended = Storage::open(&path, "contended", None);
+    assert!(
+        contended.is_err(),
+        "one writer per session, enforced by the filesystem"
     );
 }

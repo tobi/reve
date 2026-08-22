@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use microsandbox::size::SizeExt;
 use microsandbox::{Sandbox as MsbSandbox, SandboxModificationBuilder, SecretSource};
 use microsandbox_network::policy::{NetworkPolicy, Rule};
 use serde::{Deserialize, Serialize};
@@ -34,7 +35,22 @@ pub enum SandboxError {
 
 pub type Result<T, E = SandboxError> = std::result::Result<T, E>;
 
-/// A debian image with the tools an agent reaches for on its first turn.
+/// The default guest: an Arch image that already contains the toolchain an
+/// agent reaches for, with mise pinned to absolute paths under `/opt` so the
+/// shims work whatever `HOME` ends up being.
+///
+/// Baking the toolchain into the image rather than installing it on first boot
+/// is the difference between a cold start of seconds and one of minutes, and it
+/// removes the failure mode where the agent's first turn depends on a package
+/// mirror being up. It is also why [`Policy::provision`] defaults to `false`:
+/// there is nothing left to provision.
+pub const DEFAULT_IMAGE: &str = "ghcr.io/tobi/wrap:latest";
+
+/// The image ships a full Rust, Go, Node, and Python toolchain, so the
+/// writable rootfs layer has to be big enough for a real build tree.
+pub const DEFAULT_ROOT_DISK_MIB: u32 = 16 * 1024;
+
+/// Packages for a bare image, if an agent points `sandbox.lua` at one.
 pub const APT_PACKAGES: &[&str] = &[
     "ca-certificates",
     "curl",
@@ -56,8 +72,16 @@ pub const NPM_TOOLS: &[&str] = &["@ast-grep/cli"];
 
 const PROVISION_MARKER: &str = "/var/lib/reve/provisioned";
 
-const GIT_CREDENTIAL_SETUP: &str = "if command -v git >/dev/null && command -v gh >/dev/null; \
-then git config --system credential.https://github.com.helper '!gh auth git-credential'; fi";
+/// Teach git to read the token straight from the environment.
+///
+/// The old form shelled out to `gh auth git-credential`, which the default
+/// image does not contain. A store-free helper is better anyway: the token is
+/// already in the guest environment as a microsandbox-resolved secret, so this
+/// writes no credential file and leaves nothing behind on the disk.
+const GIT_CREDENTIAL_SETUP: &str = "if command -v git >/dev/null; then \
+git config --system credential.https://github.com.helper \
+'!f() { test \"$1\" = get && printf \"username=x-access-token\\npassword=%s\\n\" \
+\"$GITHUB_TOKEN\"; }; f'; fi";
 
 /// A host environment reference whose value is resolved only while the VM runs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,6 +101,9 @@ pub struct Secret {
 #[serde(rename_all = "camelCase")]
 pub struct Policy {
     pub image: String,
+    /// Size of the writable rootfs layer, in MiB.
+    #[serde(default = "default_root_disk")]
+    pub root_disk: u32,
     pub cpus: u8,
     pub memory: u32,
     pub workdir: String,
@@ -96,12 +123,15 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            image: "debian:trixie-slim".into(),
+            image: DEFAULT_IMAGE.into(),
+            root_disk: DEFAULT_ROOT_DISK_MIB,
             cpus: 2,
             memory: 2048,
             workdir: "/workspace".into(),
             mount_workspace: true,
-            provision: true,
+            // The default image is already provisioned. An agent that points
+            // at a bare image turns this back on in `sandbox.lua`.
+            provision: false,
             packages: APT_PACKAGES.iter().map(|s| s.to_string()).collect(),
             mise: MISE_TOOLS.iter().map(|s| s.to_string()).collect(),
             npm: NPM_TOOLS.iter().map(|s| s.to_string()).collect(),
@@ -115,6 +145,10 @@ impl Default for Policy {
             name: None,
         }
     }
+}
+
+fn default_root_disk() -> u32 {
+    DEFAULT_ROOT_DISK_MIB
 }
 
 impl Policy {
@@ -800,6 +834,7 @@ fn format_missing_secret_warning(secret: &Secret) -> String {
 async fn build(policy: &Policy, name: &str, host_workspace: &Path) -> Result<MsbSandbox> {
     let mut builder = MsbSandbox::builder(name.to_string())
         .image(policy.image.clone())
+        .root_disk(policy.root_disk.mib())
         .cpus(policy.cpus)
         .memory(policy.memory)
         .workdir(policy.workdir.clone())
@@ -1031,9 +1066,30 @@ mod tests {
     }
 
     #[test]
-    fn git_uses_the_guest_github_cli_as_its_credential_helper() {
+    fn git_reads_its_token_from_the_environment_not_a_credential_store() {
         assert!(GIT_CREDENTIAL_SETUP.contains("credential.https://github.com.helper"));
-        assert!(GIT_CREDENTIAL_SETUP.contains("gh auth git-credential"));
+        assert!(
+            GIT_CREDENTIAL_SETUP.contains("$GITHUB_TOKEN"),
+            "the default image has no gh, so the token comes from the environment"
+        );
+        assert!(
+            !GIT_CREDENTIAL_SETUP.contains("store"),
+            "and nothing writes it to disk"
+        );
+    }
+
+    #[test]
+    fn the_default_policy_boots_a_preprovisioned_guest() {
+        let policy = Policy::default();
+        assert_eq!(policy.image, DEFAULT_IMAGE);
+        assert!(
+            !policy.provision,
+            "the image already has the toolchain; installing it again is minutes of nothing"
+        );
+        assert!(
+            policy.root_disk >= 8 * 1024,
+            "a rust build tree does not fit in a default rootfs"
+        );
     }
 
     #[tokio::test]

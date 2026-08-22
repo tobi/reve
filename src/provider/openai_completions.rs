@@ -127,12 +127,13 @@ impl StreamState {
             tool_calls,
             stop_reason,
             usage: self.usage,
+            error_message: None,
         })
     }
 }
 
 fn read_usage(usage: &Value) -> Usage {
-    let get = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0) as u32;
+    let get = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
     Usage {
         input: get("prompt_tokens"),
         output: get("completion_tokens"),
@@ -141,7 +142,7 @@ fn read_usage(usage: &Value) -> Usage {
             .and_then(|details| details.get("cached_tokens"))
             .or_else(|| usage.get("prompt_cache_hit_tokens"))
             .and_then(Value::as_u64)
-            .unwrap_or(0) as u32,
+            .unwrap_or(0),
     }
 }
 

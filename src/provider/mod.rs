@@ -17,8 +17,8 @@ pub mod sse;
 
 use futures::StreamExt;
 
+use crate::entry::Entry;
 use crate::model::{Assistant, BoxFuture, Deltas, Model, ModelError, Request, Result, ToolSchema};
-use crate::records::Entry;
 use config::{Api, Resolved};
 use serde_json::{Value, json};
 
@@ -78,7 +78,7 @@ impl Model for HttpModel {
                     request.tools,
                 ),
                 Api::Fake => {
-                    return Err(ModelError("the fake provider has no endpoint".into()));
+                    return Err(ModelError::terminal("the fake provider has no endpoint"));
                 }
             };
 
@@ -132,7 +132,7 @@ impl Model for HttpModel {
                     }
                 }
                 response.ok_or_else(|| {
-                    ModelError(format!(
+                    ModelError::retryable(format!(
                         "{} model {} ({}): {}",
                         self.resolved.provider,
                         self.resolved.model.id,
@@ -145,10 +145,15 @@ impl Model for HttpModel {
             let status = response.status();
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
-                return Err(ModelError(format!(
+                let message = format!(
                     "{} returned {status} for {}: {body}",
                     self.resolved.provider, self.resolved.model.id
-                )));
+                );
+                return Err(if is_retryable(status) {
+                    ModelError::retryable(message)
+                } else {
+                    ModelError::terminal(message)
+                });
             }
 
             let mut decoder = sse::Decoder::new();
@@ -157,7 +162,8 @@ impl Model for HttpModel {
             let mut claude = anthropic::StreamState::new();
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| ModelError(format!("stream ended early: {e}")))?;
+                let chunk =
+                    chunk.map_err(|e| ModelError::retryable(format!("stream ended early: {e}")))?;
                 let text = String::from_utf8_lossy(&chunk);
                 for event in decoder.push(&text) {
                     let delta = match self.resolved.api {
@@ -178,7 +184,7 @@ impl Model for HttpModel {
                 Api::AnthropicMessages => claude.finish(),
                 Api::Fake => Err("the fake provider has no endpoint".into()),
             }
-            .map_err(ModelError)
+            .map_err(ModelError::terminal)
         })
     }
 }
@@ -392,13 +398,9 @@ fn is_retryable(status: reqwest::StatusCode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::records::MAIN_LANE;
 
     fn entry(role: &str, text: &str) -> Entry {
-        Entry::message(
-            MAIN_LANE,
-            json!({"role": role, "content": [{"type": "text", "text": text}]}),
-        )
+        Entry::message(json!({"role": role, "content": [{"type": "text", "text": text}]}))
     }
 
     #[test]
@@ -427,27 +429,21 @@ mod tests {
 
     #[test]
     fn tool_calls_are_replayed_before_their_results() {
-        let call = Entry::message(
-            MAIN_LANE,
-            json!({
-                "role": "assistant",
-                "content": [{
-                    "type": "toolCall",
-                    "id": "call_1",
-                    "name": "read",
-                    "arguments": {"path": "AGENTS.md"},
-                }],
-                "stopReason": "toolUse",
-            }),
-        );
-        let result = Entry::message(
-            MAIN_LANE,
-            json!({
-                "role": "toolResult",
-                "toolCallId": "call_1",
-                "content": [{"type": "text", "text": "ok"}],
-            }),
-        );
+        let call = Entry::message(json!({
+            "role": "assistant",
+            "content": [{
+                "type": "toolCall",
+                "id": "call_1",
+                "name": "read",
+                "arguments": {"path": "AGENTS.md"},
+            }],
+            "stopReason": "toolUse",
+        }));
+        let result = Entry::message(json!({
+            "role": "toolResult",
+            "toolCallId": "call_1",
+            "content": [{"type": "text", "text": "ok"}],
+        }));
         let context = vec![call, result];
 
         let openai = openai_input(&context);
@@ -480,18 +476,15 @@ mod tests {
 
     #[test]
     fn chat_history_closes_a_tool_call_interrupted_before_its_result() {
-        let call = Entry::message(
-            MAIN_LANE,
-            json!({
-                "role": "assistant",
-                "content": [{
-                    "type": "toolCall",
-                    "id": "call_lost",
-                    "name": "bash",
-                    "arguments": {"command": "sleep 30"},
-                }],
-            }),
-        );
+        let call = Entry::message(json!({
+            "role": "assistant",
+            "content": [{
+                "type": "toolCall",
+                "id": "call_lost",
+                "name": "bash",
+                "arguments": {"command": "sleep 30"},
+            }],
+        }));
         let chat = openai_messages(&[call]);
         assert_eq!(chat.len(), 2);
         assert_eq!(chat[1]["role"], "tool");
@@ -501,13 +494,13 @@ mod tests {
 
     #[test]
     fn plain_string_content_is_accepted_as_well_as_parts() {
-        let entry = Entry::message(MAIN_LANE, json!({"role": "user", "content": "flat"}));
+        let entry = Entry::message(json!({"role": "user", "content": "flat"}));
         assert_eq!(openai_input(&[entry])[0]["content"], "flat");
     }
 
     #[test]
     fn entries_that_are_not_messages_are_skipped() {
-        let custom = Entry::custom(MAIN_LANE, "bash_execution", json!({"command": "ls"}));
+        let custom = Entry::custom("bash_execution", Some(json!({"command": "ls"})));
         assert!(openai_input(std::slice::from_ref(&custom)).is_empty());
         assert!(openai_messages(std::slice::from_ref(&custom)).is_empty());
         assert!(anthropic_messages(&[custom]).is_empty());

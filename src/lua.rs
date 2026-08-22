@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use crate::records::Replay;
 use crate::sandbox::{ExecOptions, Policy, Sandbox, Secret};
+use crate::state::Replay;
 
 #[derive(Debug, Error)]
 pub enum LuaError {
@@ -155,14 +155,47 @@ pub struct Runtime {
     pub tools: Vec<ToolDef>,
 }
 
+/// Everything Lua's standard library offers that reaches the host as a
+/// *command* or as native code. Removed before a single line of agent script
+/// runs, so the invariant is structural rather than a review convention.
+///
+/// This is not a defence against the agent author — they are trusted, and they
+/// could edit the Rust. It is a defence against the shape of the system: with
+/// `os.execute` in scope, "the microVM is the only way to run anything" is a
+/// claim you have to keep re-checking. Without it, `ctx.sh` is the only door.
+const HOST_COMMAND_PATH: &[(&str, &str)] = &[
+    // Runs a command through the host's shell.
+    ("os", "execute"),
+    // Same, with a pipe attached.
+    ("io", "popen"),
+    // Ends the host process out from under the session owner.
+    ("os", "exit"),
+    // Loads a native library, which can call system() itself.
+    ("package", "loadlib"),
+];
+
 impl Runtime {
     pub fn new() -> Result<Self> {
+        let lua = Lua::new();
+        Self::close_the_host_door(&lua)?;
         Ok(Self {
-            lua: Lua::new(),
+            lua,
             agent: AgentConfig::default(),
             policy: Policy::default(),
             tools: Vec::new(),
         })
+    }
+
+    /// Delete the host command path from the VM's globals.
+    fn close_the_host_door(lua: &Lua) -> Result<()> {
+        let globals = lua.globals();
+        for (module, function) in HOST_COMMAND_PATH {
+            // A module that is not loaded at all is the outcome we wanted.
+            if let Ok(table) = globals.get::<Table>(*module) {
+                table.set(*function, LuaValue::Nil)?;
+            }
+        }
+        Ok(())
     }
 
     /// Load `agent.lua`, if the agent has one.
@@ -403,6 +436,9 @@ fn policy_from_table(table: &Table) -> Result<Policy> {
     if let Some(v) = table.get::<Option<u32>>("memory")? {
         policy.memory = v;
     }
+    if let Some(v) = table.get::<Option<u32>>("root_disk")? {
+        policy.root_disk = v;
+    }
     if let Some(v) = table.get::<Option<String>>("workdir")? {
         policy.workdir = v;
     }
@@ -506,6 +542,37 @@ mod tests {
     }
 
     #[test]
+    fn the_host_command_path_is_gone_before_any_script_runs() {
+        let runtime = Runtime::new().unwrap();
+        for (module, function) in HOST_COMMAND_PATH {
+            let probe = format!("return {module} ~= nil and {module}.{function} ~= nil");
+            let present: bool = runtime.lua.load(&probe).eval().unwrap();
+            assert!(!present, "{module}.{function} is still reachable");
+        }
+    }
+
+    #[test]
+    fn a_tool_that_tries_to_shell_out_on_the_host_fails_to_load() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "tools/escape.lua",
+            r#"
+            os.execute("touch /tmp/reve-escaped")
+            "#,
+        );
+        let mut runtime = Runtime::new().unwrap();
+        let error = runtime
+            .load_tools(&dir.path().join("tools"))
+            .expect_err("must not run");
+        assert!(
+            error.to_string().contains("call a nil value"),
+            "the failure should be the missing door, not something else: {error}"
+        );
+        assert!(!Path::new("/tmp/reve-escaped").exists());
+    }
+
+    #[test]
     fn agent_lua_configures_the_model() {
         let dir = tempfile::tempdir().unwrap();
         let path = write(
@@ -576,7 +643,11 @@ mod tests {
         let mut rt = Runtime::new().unwrap();
         rt.load_sandbox(&path).unwrap();
         assert!(rt.policy.mount_workspace, "the workspace is still mounted");
-        assert!(rt.policy.provision, "and provisioning is still on");
+        assert_eq!(
+            rt.policy.root_disk,
+            crate::sandbox::DEFAULT_ROOT_DISK_MIB,
+            "and the rootfs is still big enough to build in"
+        );
     }
 
     #[test]
@@ -586,13 +657,16 @@ mod tests {
             dir.path(),
             "sandbox.lua",
             r#"
-            sandbox { mount_workspace = false, provision = false }
+            sandbox { mount_workspace = false, provision = true }
         "#,
         );
         let mut rt = Runtime::new().unwrap();
         rt.load_sandbox(&path).unwrap();
-        assert!(!rt.policy.mount_workspace);
-        assert!(!rt.policy.provision);
+        assert!(!rt.policy.mount_workspace, "an explicit false is honoured");
+        assert!(
+            rt.policy.provision,
+            "and so is an explicit true, against a default of false"
+        );
     }
 
     #[test]
