@@ -206,7 +206,7 @@ impl Toolbox {
         if self.runtime.tool(name).is_some() {
             let text = self
                 .runtime
-                .call_tool(name, args, self.sandbox.clone())
+                .call_tool_cancelled(name, args, self.sandbox.clone(), cancel)
                 .await
                 .map_err(|e| e.to_string())?;
             return Ok(self.present_output(&text).await);
@@ -282,27 +282,34 @@ impl Toolbox {
             }
             "ls" => {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-                self.shell(&format!("ls -la {}", quote(path))).await?
+                self.shell(&format!("ls -la {}", quote(path)), cancel)
+                    .await?
             }
             "glob" => {
                 let pattern = string(&args, "pattern")?;
                 // fd is provisioned; the find fallback keeps a bare image usable.
-                self.shell(&format!(
-                    "fd --hidden --glob {p} 2>/dev/null || find . -name {p} 2>/dev/null",
-                    p = quote(&pattern)
-                ))
+                self.shell(
+                    &format!(
+                        "fd --hidden --glob {p} 2>/dev/null || find . -name {p} 2>/dev/null",
+                        p = quote(&pattern)
+                    ),
+                    cancel,
+                )
                 .await?
             }
             "grep" => {
                 let pattern = string(&args, "pattern")?;
                 let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-                self.shell(&format!(
-                    "rg -n --no-heading {} {} 2>/dev/null || grep -rn {} {} 2>/dev/null",
-                    quote(&pattern),
-                    quote(path),
-                    quote(&pattern),
-                    quote(path)
-                ))
+                self.shell(
+                    &format!(
+                        "rg -n --no-heading {} {} 2>/dev/null || grep -rn {} {} 2>/dev/null",
+                        quote(&pattern),
+                        quote(path),
+                        quote(&pattern),
+                        quote(path)
+                    ),
+                    cancel,
+                )
                 .await?
             }
             other => return Err(format!("no tool named {other:?}")),
@@ -316,10 +323,14 @@ impl Toolbox {
         Ok(self.present_output(text).await)
     }
 
-    async fn shell(&self, command: &str) -> Result<String, String> {
+    async fn shell(
+        &self,
+        command: &str,
+        cancel: Option<crate::sandbox::tokio_util_lite::CancelRx>,
+    ) -> Result<String, String> {
         let out = self
             .sandbox
-            .exec(command, ExecOptions::default(), None)
+            .exec(command, ExecOptions::default(), cancel)
             .await
             .map_err(|e| e.to_string())?;
         let text = if out.stdout.trim().is_empty() {

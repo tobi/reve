@@ -250,6 +250,19 @@ impl Runtime {
         args: Map<String, Value>,
         sandbox: Arc<Sandbox>,
     ) -> Result<String> {
+        self.call_tool_cancelled(name, args, sandbox, None).await
+    }
+
+    /// Run a Lua tool while allowing each `ctx.sh` guest command to be
+    /// interrupted. Lua itself is trusted launch code; cancellation applies to
+    /// the sandbox effects it awaits.
+    pub async fn call_tool_cancelled(
+        &self,
+        name: &str,
+        args: Map<String, Value>,
+        sandbox: Arc<Sandbox>,
+        cancel: Option<crate::sandbox::tokio_util_lite::CancelRx>,
+    ) -> Result<String> {
         let def = self
             .tool(name)
             .ok_or_else(|| invalid("tool call", format!("no tool named {name:?}")))?;
@@ -257,11 +270,13 @@ impl Runtime {
 
         let ctx = self.lua.create_table()?;
         let sh_sandbox = sandbox.clone();
+        let sh_cancel = cancel.clone();
         let sh = self.lua.create_async_function(move |_, command: String| {
             let sandbox = sh_sandbox.clone();
+            let cancel = sh_cancel.clone();
             async move {
                 let output = sandbox
-                    .exec(&command, ExecOptions::default(), None)
+                    .exec(&command, ExecOptions::default(), cancel)
                     .await
                     .map_err(|e| mlua::Error::external(e.to_string()))?;
                 // Tools want the text. The exit code is still reachable, but

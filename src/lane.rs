@@ -29,12 +29,6 @@ use crate::records::{Entry, Outcome, Record, Replay};
 use crate::sandbox::tokio_util_lite::CancelRx;
 use crate::storage::Storage;
 
-/// How many assistant turns one run may take before we stop.
-///
-/// A model that keeps calling tools without converging is a bug, and an agent
-/// that loops forever costs money and trust.
-pub const MAX_ATTEMPTS: u32 = 24;
-
 #[derive(Debug, thiserror::Error)]
 pub enum LaneError {
     #[error(transparent)]
@@ -111,7 +105,7 @@ impl Lane<'_> {
         self.run_with(prompt, cancel, "", &[], &|_| {}).await
     }
 
-    /// Run one operation to completion, abort, or the retry cap.
+    /// Run one operation to completion or an explicit abort.
     pub async fn run_with(
         &mut self,
         prompt: &str,
@@ -142,9 +136,6 @@ impl Lane<'_> {
                 break Outcome::Aborted;
             }
             attempts += 1;
-            if attempts > MAX_ATTEMPTS {
-                break Outcome::Failed;
-            }
             self.record(
                 "task_attempt",
                 serde_json::json!({
@@ -164,13 +155,23 @@ impl Lane<'_> {
                 system,
                 tools: schemas,
             };
-            let assistant = match self
-                .model
-                .respond(request, &|delta| {
-                    on_event(RunEvent::AssistantDelta(delta.to_string()));
-                })
-                .await
-            {
+            let on_delta = |delta: &str| {
+                on_event(RunEvent::AssistantDelta(delta.to_string()));
+            };
+            let response = self.model.respond(request, &on_delta);
+            let response = if let Some(cancel) = cancel.as_mut() {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => None,
+                    response = response => Some(response),
+                }
+            } else {
+                Some(response.await)
+            };
+            let Some(response) = response else {
+                break Outcome::Aborted;
+            };
+            let assistant = match response {
                 Ok(assistant) => assistant,
                 Err(e) => {
                     self.record(
@@ -231,12 +232,23 @@ impl Lane<'_> {
                     Ok(text) => text,
                     Err(message) => format!("tool {} failed: {message}", call.name),
                 };
+                let interrupted = cancelled(&mut cancel);
+                let text = if interrupted {
+                    interrupted_text()
+                } else {
+                    text
+                };
                 on_event(RunEvent::ToolFinished {
                     name: call.name.clone(),
-                    success: !text.starts_with("tool ") || !text.contains(" failed:"),
+                    success: !interrupted
+                        && (!text.starts_with("tool ") || !text.contains(" failed:")),
                     text: text.clone(),
                 });
-                self.append_result(&result_id, call, text, false)?;
+                self.append_result(&result_id, call, text, interrupted)?;
+                if interrupted {
+                    aborted = true;
+                    break;
+                }
             }
             if aborted {
                 break Outcome::Aborted;
@@ -545,6 +557,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_agentic_run_has_no_fixed_turn_limit() {
+        let mut turns = (0..30)
+            .map(|_| Assistant::call("probe", serde_json::json!({})))
+            .collect::<Vec<_>>();
+        turns.push(Assistant::text("done"));
+        let (_d, model) = scripted(turns);
+        let tools = TestTools::new(Replay::Safe);
+        let mut storage = Storage::memory("s1");
+
+        let report = Lane {
+            name: MAIN_LANE.into(),
+            storage: &mut storage,
+            model: &model,
+            tools: &tools,
+        }
+        .run("keep going", None)
+        .await
+        .unwrap();
+
+        assert_eq!(report.outcome, Outcome::Completed);
+        assert_eq!(report.attempts, 31);
+        assert_eq!(tools.calls().len(), 30);
+    }
+
+    #[tokio::test]
     async fn every_model_response_emits_its_own_turn_boundary() {
         let (_d, model) = scripted(vec![
             Assistant::call("probe", serde_json::json!({})),
@@ -679,6 +716,56 @@ mod tests {
                 Ok(Assistant::call("slow", serde_json::json!({})))
             })
         }
+    }
+
+    struct BlockingModel {
+        started: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl Model for BlockingModel {
+        fn respond<'a>(
+            &'a self,
+            _request: crate::model::Request<'a>,
+            _on_text: crate::model::Deltas<'a>,
+        ) -> crate::model::BoxFuture<'a, crate::model::Result<Assistant>> {
+            Box::pin(async move {
+                self.started.notify_one();
+                std::future::pending().await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn aborting_cancels_a_model_response_that_has_not_finished() {
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let model = BlockingModel {
+            started: started.clone(),
+        };
+        let tools = TestTools::new(Replay::Never);
+        let mut storage = Storage::memory("s1");
+        let (tx, rx) = crate::sandbox::tokio_util_lite::channel();
+        tokio::spawn(async move {
+            started.notified().await;
+            tx.cancel();
+        });
+
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            Lane {
+                name: MAIN_LANE.into(),
+                storage: &mut storage,
+                model: &model,
+                tools: &tools,
+            }
+            .run("go", Some(rx)),
+        )
+        .await
+        .expect("interrupt should not wait for the model")
+        .unwrap();
+
+        assert_eq!(report.outcome, Outcome::Aborted);
+        assert_eq!(report.attempts, 1);
+        assert!(kinds(&storage).contains(&"record:operation_finished".to_string()));
     }
 
     #[tokio::test]

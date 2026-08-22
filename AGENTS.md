@@ -1,9 +1,18 @@
 # reve
 
 A durable coding agent. The core is a Rust crate; the scripting surface an agent author
-touches — configuration, project tools, sandbox policy — is Lua. The durable-harness
-design it follows is documented in `PLAN.md`, which maps it onto Rust modules and records
-what is built and what is pending.
+touches — configuration, project tools, sandbox policy — is Lua.
+
+## Read first
+
+- **`docs/harness.md`** — the durable-harness specification Reve implements (vendored from
+  Pi's `packages/agent/docs/harness.md`; the upstream `harness-v2.md` link it replaced is
+  dead). It is the authority on storage shape, the operation state machine, recovery,
+  abort, queues, hooks, and events. When this crate and that document disagree, the
+  document wins unless `docs/architecture.md` records a deliberate cut.
+- **`docs/architecture.md`** — how the specification maps onto Rust modules, which parts are
+  built, which are deliberately cut, and where each invariant is tested. Update it in the
+  same change as the code it describes.
 
 ## Rules
 

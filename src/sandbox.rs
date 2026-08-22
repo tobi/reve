@@ -779,13 +779,21 @@ async fn install_secret_definitions(
 }
 
 fn missing_secret_warning(secret: &Secret) -> Option<String> {
-    std::env::var_os(&secret.source).is_none().then(|| {
-        format!(
-            "{} is unset; authenticated access for {} is disabled",
-            secret.source,
-            secret.hosts.join(", ")
-        )
-    })
+    std::env::var_os(&secret.source)
+        .is_none()
+        .then(|| format_missing_secret_warning(secret))
+}
+
+fn format_missing_secret_warning(secret: &Secret) -> String {
+    let mut warning = format!(
+        "{} is unset; authenticated access for {} is disabled",
+        secret.source,
+        secret.hosts.join(", ")
+    );
+    if secret.source == "GITHUB_TOKEN" {
+        warning.push_str("\nexport GITHUB_TOKEN=\"$(gh auth token)\"");
+    }
+    warning
 }
 
 /// Turn a [`Policy`] into a booted VM.
@@ -1005,6 +1013,20 @@ mod tests {
             Some(
                 "REVE_TEST_MISSING_GITHUB_TOKEN_9D2B is unset; authenticated access for github.com, api.github.com is disabled"
             )
+        );
+    }
+
+    #[test]
+    fn an_unset_github_token_warning_explains_how_to_export_it() {
+        let secret = Secret {
+            env: "GITHUB_TOKEN".into(),
+            source: "GITHUB_TOKEN".into(),
+            placeholder: Some("reve-github-token".into()),
+            hosts: vec!["github.com".into(), "api.github.com".into()],
+        };
+        assert_eq!(
+            format_missing_secret_warning(&secret),
+            "GITHUB_TOKEN is unset; authenticated access for github.com, api.github.com is disabled\nexport GITHUB_TOKEN=\"$(gh auth token)\""
         );
     }
 

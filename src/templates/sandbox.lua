@@ -33,7 +33,7 @@ sandbox {
   -- A credential the VM may use without ever holding it: the guest sees only
   -- the placeholder and the proxy substitutes the real value for these hosts.
   -- `gh` keeps its token in the OS keyring, so export it first:
-  --   export GITHUB_TOKEN="$(gh auth token --hostname github.com)"
+  --   export GITHUB_TOKEN="$(gh auth token)"
   secrets = {
     {
       env = "GITHUB_TOKEN",

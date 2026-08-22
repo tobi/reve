@@ -361,12 +361,16 @@ impl App {
                 }
             }
             KeyCode::Esc => {
-                // Escape dismisses the list before it interrupts anything —
-                // otherwise closing a menu would abort the run behind it.
+                // While work is visible, Escape must always mean what the
+                // status line promises. Completion can be reopened after the
+                // run; requiring a hidden first press made interruption feel
+                // intermittent.
+                if self.busy() {
+                    self.interrupt_armed = true;
+                    return Some(Action::Interrupt);
+                }
                 if self.completion.is_open() {
                     self.completion = Completion::default();
-                } else if self.busy() {
-                    return Some(Action::Interrupt);
                 }
             }
             KeyCode::Down => {
@@ -869,6 +873,22 @@ mod tests {
         );
         a.apply(Update::Working(Some("Working".into())));
         assert_eq!(a.handle_key(key(KeyCode::Esc)), Some(Action::Interrupt));
+        assert!(a.interrupt_armed);
+    }
+
+    #[test]
+    fn escape_interrupts_busy_work_even_when_completion_is_open() {
+        let mut a = app();
+        a.set_commands(vec![Command::new("help", "show help")]);
+        typed(&mut a, "/h");
+        assert!(a.completion.is_open());
+        a.apply(Update::Working(Some("Working".into())));
+
+        assert_eq!(a.handle_key(key(KeyCode::Esc)), Some(Action::Interrupt));
+        assert!(
+            a.completion.is_open(),
+            "the key was not consumed by the menu"
+        );
     }
 
     #[test]

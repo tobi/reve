@@ -35,7 +35,8 @@ git diff --check
 
 ## Design constraints
 
-Please read `AGENTS.md` and `PLAN.md` before changing architecture. In particular:
+Please read `AGENTS.md`, `docs/harness.md` (the canonical durable-harness specification), and
+`docs/architecture.md` (how it maps onto this crate) before changing architecture. In particular:
 
 - Reve has no host-shell, local-sandbox, CLI, or FFI fallback. If the microVM cannot boot,
   startup fails closed.

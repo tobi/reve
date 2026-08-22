@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use crate::lane::{Lane, RunEvent, recover};
@@ -30,7 +31,14 @@ use crate::tui::item::{Item, Status};
 /// Run the terminal until the user leaves.
 pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> {
     let (updates, updates_rx) = mpsc::channel(256);
-    let (actions, mut actions_rx) = mpsc::channel(64);
+    let (actions, actions_rx) = mpsc::channel(64);
+    let (worker_actions, mut worker_actions_rx) = mpsc::channel(64);
+    let active_cancel = Arc::new(Mutex::new(None));
+    let action_router = tokio::spawn(route_actions(
+        actions_rx,
+        worker_actions,
+        active_cancel.clone(),
+    ));
 
     let location = project
         .root
@@ -81,6 +89,7 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
     let worker = {
         let updates = updates.clone();
         let project = Arc::new(project);
+        let active_cancel = active_cancel.clone();
         tokio::spawn(async move {
             // The first request of a session has a cold prefix by definition,
             // so warning about it would be noise every single launch.
@@ -101,15 +110,8 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
                 }
             };
             let _ = recover(&mut storage, MAIN_LANE, &toolbox).await;
-            // Held so an Interrupt can reach the command that is running.
-            let mut cancel: Option<CancelTx> = None;
-            while let Some(action) = actions_rx.recv().await {
+            while let Some(action) = worker_actions_rx.recv().await {
                 match action {
-                    Action::Interrupt => {
-                        if let Some(tx) = &cancel {
-                            tx.cancel();
-                        }
-                    }
                     action @ (Action::Prompt(_)
                     | Action::Steer(_)
                     | Action::FollowUp(_)
@@ -122,7 +124,7 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
                             _ => unreachable!(),
                         };
                         let (tx, rx) = channel();
-                        cancel.replace(tx);
+                        *active_cancel.lock() = Some(tx);
                         if echo_user {
                             let _ = updates.send(Update::Item(Item::User(text.clone()))).await;
                         }
@@ -146,7 +148,7 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
                         } else if let Some(command) = text.strip_prefix('!') {
                             Some(run_command(&sandbox, command.trim(), rx).await)
                         } else if let Some(rest) = text.strip_prefix('/') {
-                            dispatch(&project, &sandbox, rest).await
+                            dispatch(&project, &sandbox, rest, rx).await
                         } else {
                             match &model {
                                 Ok(model) => {
@@ -222,7 +224,10 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
                             .send(Update::Files(file_candidates(&project.workspace())))
                             .await;
                         let _ = updates.send(Update::Working(None)).await;
-                        cancel.take();
+                        active_cancel.lock().take();
+                    }
+                    Action::Interrupt => {
+                        unreachable!("interrupts are handled by the action router")
                     }
                     Action::Quit => break,
                 }
@@ -231,8 +236,30 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
     };
 
     let result = crate::tui::run::run(app, updates_rx, actions).await;
+    action_router.abort();
     worker.abort();
     result.map_err(Into::into)
+}
+
+/// Route interruption out of band so it can reach a worker that is currently
+/// awaiting a model response or guest command. Other actions remain serialized
+/// through the single session worker.
+async fn route_actions(
+    mut incoming: mpsc::Receiver<Action>,
+    outgoing: mpsc::Sender<Action>,
+    active_cancel: Arc<Mutex<Option<CancelTx>>>,
+) {
+    while let Some(action) = incoming.recv().await {
+        if action == Action::Interrupt {
+            if let Some(cancel) = active_cancel.lock().as_ref() {
+                cancel.cancel();
+            }
+            continue;
+        }
+        if outgoing.send(action).await.is_err() {
+            break;
+        }
+    }
 }
 
 async fn run_command(
@@ -275,7 +302,12 @@ async fn run_command(
 ///
 /// Built-ins first, then the agent's own Lua tools — so `tools/deploy.lua`
 /// really is `/deploy`, with no registration step.
-async fn dispatch(project: &Arc<Project>, sandbox: &Arc<Sandbox>, rest: &str) -> Option<Item> {
+async fn dispatch(
+    project: &Arc<Project>,
+    sandbox: &Arc<Sandbox>,
+    rest: &str,
+    cancel: crate::sandbox::tokio_util_lite::CancelRx,
+) -> Option<Item> {
     let (name, argument) = match rest.split_once(' ') {
         Some((name, argument)) => (name, argument.trim()),
         None => (rest, ""),
@@ -359,7 +391,7 @@ async fn dispatch(project: &Arc<Project>, sandbox: &Arc<Sandbox>, rest: &str) ->
         "quit" => return None,
         // Anything else is a tool, or nothing.
         other if project.runtime.tool(other).is_some() => {
-            return Some(run_tool(project, sandbox, other).await);
+            return Some(run_tool(project, sandbox, other, cancel).await);
         }
         other => {
             return Some(Item::Notice(format!(
@@ -510,12 +542,25 @@ fn system_prompt(project: &Project) -> String {
             .join("\n");
         parts.push(format!("# Available skills\n\n{catalog}"));
     }
-    parts.push(
-        "You are running inside a microVM. The workspace is mounted at /workspace and is \
-         the working directory; paths are relative to it. Every tool runs in that VM."
-            .to_string(),
-    );
+    parts.push(environment_prompt(&project.runtime.policy));
     parts.join("\n\n")
+}
+
+fn environment_prompt(policy: &crate::sandbox::Policy) -> String {
+    let hosts = policy.egress_hosts();
+    let internet = if hosts.is_empty() {
+        "You have no internet access.".to_string()
+    } else {
+        format!("You have internet access to {}.", hosts.join(", "))
+    };
+    format!(
+        "<env>\n\
+         You are running inside a microVM. The workspace is mounted at /workspace and is the \
+         working directory; paths are relative to it. Every tool runs in that VM.\n\
+         mise is installed. Use it to install missing language runtimes and development tools.\n\
+         {internet}\n\
+         </env>"
+    )
 }
 
 fn channel_prompt(message: &crate::channels::Message) -> String {
@@ -546,20 +591,35 @@ fn escape_xml(text: &str, attribute: bool) -> String {
     escaped
 }
 
-async fn run_tool(project: &Project, sandbox: &Arc<Sandbox>, name: &str) -> Item {
+async fn run_tool(
+    project: &Project,
+    sandbox: &Arc<Sandbox>,
+    name: &str,
+    cancel: crate::sandbox::tokio_util_lite::CancelRx,
+) -> Item {
     let started = Instant::now();
-    match project
+    let result = project
         .runtime
-        .call_tool(name, serde_json::Map::new(), sandbox.clone())
-        .await
-    {
+        .call_tool_cancelled(
+            name,
+            serde_json::Map::new(),
+            sandbox.clone(),
+            Some(cancel.clone()),
+        )
+        .await;
+    let interrupted = cancel.is_cancelled();
+    match result {
         Ok(text) => Item::Tool {
             verb: "Ran tool".into(),
             description: name.to_string(),
-            status: Status::Ok,
+            status: if interrupted {
+                Status::Failed
+            } else {
+                Status::Ok
+            },
             duration: Some(started.elapsed()),
             detail: (!text.trim().is_empty()).then(|| text.trim().to_string()),
-            outcome: None,
+            outcome: interrupted.then(|| "interrupted".to_string()),
         },
         Err(e) => Item::Tool {
             verb: "Ran tool".into(),
@@ -567,7 +627,11 @@ async fn run_tool(project: &Project, sandbox: &Arc<Sandbox>, name: &str) -> Item
             status: Status::Failed,
             duration: Some(started.elapsed()),
             detail: None,
-            outcome: Some(e.to_string()),
+            outcome: Some(if interrupted {
+                "interrupted".to_string()
+            } else {
+                e.to_string()
+            }),
         },
     }
 }
@@ -575,6 +639,28 @@ async fn run_tool(project: &Project, sandbox: &Arc<Sandbox>, name: &str) -> Item
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn interrupts_bypass_the_busy_worker_and_cancel_the_active_run() {
+        let (incoming, incoming_rx) = mpsc::channel(2);
+        let (outgoing, mut outgoing_rx) = mpsc::channel(2);
+        let active = Arc::new(Mutex::new(None));
+        let (cancel_tx, mut cancel_rx) = channel();
+        *active.lock() = Some(cancel_tx);
+        let router = tokio::spawn(route_actions(incoming_rx, outgoing, active));
+
+        incoming.send(Action::Interrupt).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancel_rx.cancelled())
+            .await
+            .expect("interrupt was delivered without waiting for the worker");
+
+        incoming.send(Action::Prompt("next".into())).await.unwrap();
+        assert_eq!(
+            outgoing_rx.recv().await,
+            Some(Action::Prompt("next".into()))
+        );
+        router.abort();
+    }
 
     #[test]
     fn channel_messages_carry_source_and_timestamp_metadata() {
@@ -589,6 +675,30 @@ mod tests {
              &lt;ship &amp; \"go\"&gt;\n\
              </message>"
         );
+    }
+
+    #[test]
+    fn environment_prompt_names_mise_and_the_exact_egress_hosts() {
+        let policy = crate::sandbox::Policy {
+            allow_hosts: vec![
+                "registry.npmjs.org".into(),
+                "github.com".into(),
+                "github.com".into(),
+            ],
+            ..Default::default()
+        };
+        let prompt = environment_prompt(&policy);
+
+        assert!(prompt.starts_with("<env>\n"));
+        assert!(prompt.ends_with("\n</env>"));
+        assert!(prompt.contains("mise is installed"));
+        assert!(prompt.contains("You have internet access to github.com, registry.npmjs.org."));
+    }
+
+    #[test]
+    fn environment_prompt_says_when_egress_is_disabled() {
+        let prompt = environment_prompt(&crate::sandbox::Policy::default());
+        assert!(prompt.contains("You have no internet access."));
     }
 
     #[test]
