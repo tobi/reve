@@ -7,7 +7,33 @@
 #
 # `compat` holds the differences between endpoints that all claim to speak the
 # same protocol, so the adapters stay free of per-provider conditionals.
+#
+# `models:` is the short list this agent is configured for -- it is not meant to
+# be every model an upstream serves. After startup reve asks each provider whose
+# API key is actually set what its full catalogue is (`GET {baseUrl}/models`,
+# cached for a day) and offers that to `/model` completion, so you never have to
+# remember whether the slug was `xai/grok-4.6` or `x-ai/grok-4.6`. Discovery is a
+# completion aid only: it never edits this file and never blocks the agent.
 providers:
+  # The default. One key, most models, and the ids are namespaced -- which is
+  # why the reference below has two slashes in it: the provider is `openrouter`
+  # and the model id is `x-ai/grok-4.6`.
+  openrouter:
+    baseUrl: https://openrouter.ai/api/v1
+    api: openai-responses
+    apiKey: $OPENROUTER_API_KEY
+    models:
+      - id: x-ai/grok-4.6
+        reasoning: true
+        contextWindow: 500000
+        maxTokens: 8192
+    compat:
+      # OpenRouter keeps no conversation state for you.
+      supportsStore: false
+      supportsDeveloperRole: false
+      supportsReasoningEffort: true
+      maxTokensField: max_output_tokens
+
   openai:
     baseUrl: https://api.openai.com/v1
     api: openai-responses
@@ -45,8 +71,8 @@ providers:
   # compat block below is for: no `store`, no `developer` role, no reasoning
   # effort, and the token cap is spelled `max_tokens`.
   #
-  # `models:` must list the ids explicitly — asking the endpoint what it serves
-  # is not implemented yet, so an empty list would leave nothing to select.
+  # `models:` must list the ids you want to *run*. Discovery fills in the
+  # completion list, but the agent only runs what is named here.
   #
   # llamacpp:
   #   baseUrl: $LLAMA_CPP_BASE

@@ -25,6 +25,7 @@ use crate::model::{Assistant, BoxFuture, Deltas, Model, ModelError, Request};
 use crate::project::Project;
 use crate::provider::HttpModel;
 use crate::provider::config::Models;
+use crate::provider::discovery::{self, Discovered};
 use crate::sandbox::tokio_util_lite::{CancelTx, channel};
 use crate::sandbox::{ExecOptions, Sandbox};
 use crate::session::Session;
@@ -103,9 +104,34 @@ pub async fn run(project: Project, sandbox: Arc<Sandbox>) -> anyhow::Result<()> 
     }
     let _ = updates.send(Update::Item(Item::Assistant(banner))).await;
 
+    // Ask the upstreams what they serve, after startup and off the critical
+    // path. Only providers whose key is set are contacted, the answer is cached
+    // for a day, and nothing here can delay or fail the agent -- the worst case
+    // is that `/model` completes only the models already in models.yml.
+    let project = Arc::new(project);
+    {
+        let updates = updates.clone();
+        let root = project.root.clone();
+        let project_for_commands = project.clone();
+        tokio::spawn(async move {
+            let Ok(models) = Models::load(&root.join("models.yml")) else {
+                return;
+            };
+            let catalogue = discovery::catalogue(&root, &models).await;
+            if catalogue.models.is_empty() {
+                return;
+            }
+            let _ = updates
+                .send(Update::Commands(commands_with(
+                    &project_for_commands,
+                    &catalogue.models,
+                )))
+                .await;
+        });
+    }
+
     let worker = {
         let updates = updates.clone();
-        let project = Arc::new(project);
         tokio::spawn(async move {
             let toolbox = Arc::new(Toolbox::new(sandbox.clone(), project.runtime_arc()));
             let session_path = project
@@ -483,27 +509,57 @@ async fn dispatch(
             .map(|c| format!("- `/{}` — {}", c.name, c.description))
             .collect::<Vec<_>>()
             .join("\n"),
-        "models" => {
-            let models = Models::load(&project.root.join("models.yml"));
-            match models {
-                Ok(models) => {
-                    let current = project.runtime.agent.model.clone().unwrap_or_default();
-                    models
-                        .catalog()
-                        .iter()
-                        .map(|id| {
-                            if *id == current {
-                                format!("- **{id}** (current)")
-                            } else {
-                                format!("- {id}")
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
+        "models" => match Models::load(&project.root.join("models.yml")) {
+            Ok(models) => {
+                let current = project.runtime.agent.model.clone().unwrap_or_default();
+                let configured = models.catalog();
+                let mut out = vec!["**Configured** (models.yml)".to_string()];
+                out.extend(configured.iter().map(|id| {
+                    if *id == current {
+                        format!("- **{id}** (current)")
+                    } else {
+                        format!("- {id}")
+                    }
+                }));
+                // Whatever the upstreams said, from the cache written after
+                // startup. `refresh` asks again now.
+                let catalogue = if argument == "refresh" {
+                    let fresh = discovery::fetch(&models, &|var| std::env::var(var).ok()).await;
+                    fresh.write(&discovery::cache_path(&project.root));
+                    fresh
+                } else {
+                    discovery::catalogue(&project.root, &models).await
+                };
+                let extra: Vec<&Discovered> = catalogue
+                    .models
+                    .iter()
+                    .filter(|m| !configured.contains(&m.reference))
+                    .collect();
+                if !extra.is_empty() {
+                    out.push(format!("\n**Discovered** ({} more)", extra.len()));
+                    out.extend(extra.iter().take(40).map(|m| match m.context_window {
+                        Some(window) => format!("- {} — {}k context", m.reference, window / 1000),
+                        None => format!("- {}", m.reference),
+                    }));
+                    if extra.len() > 40 {
+                        out.push(format!("- …and {} more", extra.len() - 40));
+                    }
                 }
-                Err(e) => format!("could not read models.yml: {e}"),
+                for (provider, why) in &catalogue.failures {
+                    out.push(format!(
+                        "\n`{provider}` has a key but did not answer: {why}"
+                    ));
+                }
+                if extra.is_empty() && catalogue.failures.is_empty() {
+                    out.push(
+                        "\nNothing discovered: no provider in models.yml has its API key set."
+                            .into(),
+                    );
+                }
+                out.join("\n")
             }
-        }
+            Err(e) => format!("could not read models.yml: {e}"),
+        },
         "model" => {
             if argument.is_empty() {
                 format!(
@@ -572,23 +628,47 @@ async fn dispatch(
 /// The list is assembled from live state rather than hardcoded, so it cannot
 /// offer a tool the agent did not declare or a model it is not configured for.
 fn commands_for(project: &Project) -> Vec<Command> {
-    let models: Vec<Candidate> = Models::load(&project.root.join("models.yml"))
-        .map(|models| {
-            models
-                .catalog()
-                .into_iter()
-                .map(|id| Candidate {
-                    value: id,
-                    detail: String::new(),
-                })
-                .collect()
-        })
+    commands_with(project, &[])
+}
+
+/// As [`commands_for`], plus whatever the upstreams said they serve.
+///
+/// The configured models come first and are always present: discovery is an
+/// addition to the list you chose, never a replacement for it, and an agent with
+/// no network still completes its own model.
+fn commands_with(project: &Project, discovered: &[Discovered]) -> Vec<Command> {
+    let configured = Models::load(&project.root.join("models.yml"))
+        .map(|models| models.catalog())
         .unwrap_or_default();
+    let mut models: Vec<Candidate> = configured
+        .iter()
+        .map(|id| Candidate {
+            value: id.clone(),
+            detail: "configured".into(),
+        })
+        .collect();
+    for model in discovered {
+        if configured.contains(&model.reference) {
+            continue;
+        }
+        models.push(Candidate {
+            value: model.reference.clone(),
+            detail: match model.context_window {
+                Some(window) => format!("{}k", window / 1000),
+                None => String::new(),
+            },
+        });
+    }
 
     let mut commands = vec![
         Command::new("help", "what these commands do"),
         Command::new("model", "show or switch the model").with_arguments(models),
-        Command::new("models", "list the configured models"),
+        Command::new("models", "list configured and discovered models").with_arguments(vec![
+            Candidate {
+                value: "refresh".into(),
+                detail: "ask the upstreams again".into(),
+            },
+        ]),
         Command::new("sandbox", "describe the microVM and its egress policy"),
         Command::new("compact", "summarize old conversation context"),
         Command::new("queue", "send a message after the current run"),

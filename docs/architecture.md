@@ -49,7 +49,8 @@ src/
   events.rs           the passive event stream
   compaction.rs       threshold arithmetic, tail selection, summary request
   model.rs            Model trait, streaming callback, ScriptedModel, StopReason
-  provider/           models.yml, SSE decoder, OpenAI + Anthropic adapters
+  provider/           models.yml, SSE decoder, OpenAI + Anthropic adapters,
+                      post-startup model discovery (cached, best effort)
   sandbox.rs          mandatory microsandbox VM, deny-by-default egress
   lua.rs              agent.lua, sandbox.lua, tools/*.lua; host door closed
   tools.rs            the Tools trait plus seven built-ins, replay declarations
@@ -183,6 +184,8 @@ Every row names a real test. A claim with no test says so instead of appearing c
 | Lua cannot execute a command on the host | `lua::tests::{the_host_command_path_is_gone_before_any_script_runs, a_tool_that_tries_to_shell_out_on_the_host_fails_to_load}` |
 | The default guest is pre-provisioned, and git reads its token from the environment | `sandbox::tests::{the_default_policy_boots_a_preprovisioned_guest, git_reads_its_token_from_the_environment_not_a_credential_store}` |
 | An unmentioned Lua flag keeps its default | `lua::tests::an_unmentioned_flag_keeps_its_default` |
+| Model discovery contacts only upstreams whose key is set, and never fails the agent | `provider::discovery::tests::{only_upstreams_that_have_a_key_are_probed, an_unreachable_upstream_is_recorded_not_fatal, a_missing_or_corrupt_cache_is_simply_absent}` |
+| A namespaced model id survives discovery intact (`openrouter/x-ai/grok-4.6`) | `provider::discovery::tests::the_openrouter_shape_yields_a_pasteable_reference` |
 | Deny-by-default egress | `tests/microvm.rs` (opt-in, real VM) |
 
 **Not covered yet.** Standalone `compact()` and `navigate()` have no end-to-end test — the

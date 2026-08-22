@@ -11,6 +11,7 @@
 
 pub mod anthropic;
 pub mod config;
+pub mod discovery;
 pub mod openai_completions;
 pub mod openai_responses;
 pub mod sse;

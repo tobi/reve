@@ -48,6 +48,9 @@ pub enum Update {
     /// `Some(label)` while a run is in flight.
     Working(Option<String>),
     Subagents(Vec<Subagent>),
+    /// A fresh slash-command registry. Sent again once model discovery has
+    /// answered, so `/model` can complete ids nobody typed into models.yml.
+    Commands(Vec<Command>),
     /// Current workspace-relative file candidates.
     Files(Vec<Candidate>),
     Received(crate::channels::Message),
@@ -268,6 +271,7 @@ impl App {
                 }
             }
             Update::Subagents(agents) => self.subagents = agents,
+            Update::Commands(commands) => self.set_commands(commands),
             Update::Files(files) => self.set_files(files),
             Update::Delta(text) => {
                 self.stream.push(&text);

@@ -2,6 +2,6 @@
 -- configuration. Both are read from this directory and nowhere else.
 
 agent {
-  model = "openai/gpt-5.6-luna",
+  model = "openrouter/x-ai/grok-4.6",
   thinking = "low",
 }
